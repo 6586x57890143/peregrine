@@ -151,7 +151,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # Skip cleanly rather than fail when the VPS secrets are not configured.
+      # Without this the job fails on every single push to main until someone
+      # adds them, which means a permanently red pipeline, which means people
+      # stop reading the red. A deploy that is not configured has not gone
+      # wrong, so it should not report as though it has.
+      #
+      # The check lives in a step rather than the job's `if:` because the
+      # secrets context is not available in a job-level conditional; only
+      # github, needs, vars and inputs are.
+      - name: Check VPS is configured
+        id: vps
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          if [ -n "$VPS_HOST" ] && [ -n "$VPS_SSH_KEY" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping deploy: VPS_HOST and/or VPS_SSH_KEY are not set in this repository's secrets. The image was still built and pushed to GHCR."
+          fi
+
       - name: Copy prod compose file to VPS
+        if: steps.vps.outputs.configured == 'true'
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.VPS_HOST }}
@@ -160,6 +184,7 @@ jobs:
           source: "docker-compose.prod.yml"
           target: "/home/deploy/peregrine"
       - name: Pull image and restart on VPS
+        if: steps.vps.outputs.configured == 'true'
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.VPS_HOST }}
