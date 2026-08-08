@@ -1,20 +1,40 @@
-package main
+// Package legacy holds peregrine's original single-file implementation while it
+// is taken apart one subsystem at a time (SPEC.md section 9). It is a holding
+// pen, not a design.
+//
+// Every later milestone moves one subsystem out of here into a real package, so
+// this package only ever shrinks, and M13 deletes it. It exists at all because
+// two main packages cannot share code: turning cmd/bot into the entrypoint
+// required the 3,200 lines it was calling to live somewhere importable, and
+// moving them verbatim was the only way to keep `go build ./...` green at every
+// commit while ending at merlin's layout.
+//
+// Nothing new goes in here. The M1 move was deliberately verbatim so the diff
+// read as a rename, which means every defect catalogued in SPEC.md section 8 is
+// still present and still sits at the line it was found at. Fix them where the
+// milestone table says to fix them, in the package that takes ownership.
+//
+// The one exception to "verbatim" is the entrypoint itself: main() became
+// Run(ctx), its six log.Fatal calls became returned errors, and the signal wait
+// became a ctx wait. That was not cosmetic. log.Fatal calls os.Exit, which skips
+// every deferred function, so the old startup path could fail after opening the
+// corpus and never close it, leaving the bbolt flock held until the process was
+// reaped. There is now no os.Exit anywhere in this package.
+package legacy
 
 import (
+	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"log"
 	"math"
 	"math/rand"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/6586x57890143/peregrine/clustering"
@@ -225,27 +245,34 @@ var randgen *rand.Rand // Declare a global random number generator
 // lastWordGameTime tracks the last time a word game was posted in interval mode.
 var lastWordGameTime time.Time
 
-func main() {
-	cleanDB := flag.Bool("clean-db", false, "Run a one-time database cleanup of spammy keys.")
-	flag.Parse()
-
-	if *cleanDB {
-		performDatabaseCleanup()
-		return
-	}
-
+// Run is what used to be main(). It blocks until ctx is cancelled, then shuts
+// down and returns.
+//
+// It returns an error rather than calling log.Fatal so that the deferred
+// db.Close below actually runs on a startup failure. Under log.Fatal it did not:
+// os.Exit skips defers, so failing between bbolt.Open and dg.Open left the
+// exclusive flock on markov.db held by a dying process, and the next start would
+// then block for the full five-second Open timeout for no visible reason.
+//
+// The signature grows in later milestones: M2 adds a *config.Config, M3 replaces
+// the goroutine soup below with core.Registry and RunLoop. It deliberately takes
+// no logger: every log call in this package is the stdlib log package, and
+// cmd/bot routes those through the slog handler with slog.SetDefault, so the
+// output is structured without 200 call-site edits in a milestone whose whole
+// point was to be reviewable as a rename.
+func Run(ctx context.Context) error {
 	randgen = rand.New(rand.NewSource(time.Now().UnixNano())) // Initialize the global random number generator
 	lastWordGameTime = time.Now()                             // Initialize with current time on startup
 
 	BotToken = os.Getenv("DISCORD_BOT_TOKEN")
 	if BotToken == "" {
-		log.Fatal("[ERR] DISCORD_BOT_TOKEN environment variable not set")
+		return fmt.Errorf("DISCORD_BOT_TOKEN environment variable not set")
 	}
 
 	var err error
 	db, err = bbolt.Open(dbPath(), 0600, &bbolt.Options{Timeout: 5 * time.Second})
 	if err != nil {
-		log.Fatal("[ERR] Failed to open DB:", err)
+		return fmt.Errorf("open corpus at %s: %w", dbPath(), err)
 	}
 	// M3 replaces this with an explicit, ordered close that runs after every
 	// user of the store has stopped. Today a message still in flight during
@@ -262,12 +289,12 @@ func main() {
 		}
 		return nil
 	}); err != nil {
-		log.Fatal("[ERR] Failed to create buckets:", err)
+		return fmt.Errorf("create buckets: %w", err)
 	}
 
 	dg, err := discordgo.New("Bot " + BotToken)
 	if err != nil {
-		log.Fatal("[ERR] Failed to create Discord session:", err)
+		return fmt.Errorf("create discord session: %w", err)
 	}
 	dg.Identify.Intents = discordgo.IntentsGuildMessages | discordgo.IntentsMessageContent
 
@@ -334,14 +361,18 @@ func main() {
 
 	user, err := dg.User("@me")
 	if err != nil {
-		log.Fatal("[ERR] Failed to get bot user:", err)
+		return fmt.Errorf("get bot user: %w", err)
 	}
 	botID = user.ID
 	log.Printf("[INFO] Bot ID: %s", botID)
 
 	dg.AddHandler(messageCreate)
 	if err := dg.Open(); err != nil {
-		log.Fatal("[ERR] Failed to open Discord session:", err)
+		// The overwhelmingly common cause is the Message Content privileged
+		// intent not being ticked in the Developer Portal, which Discord reports
+		// as "disallowed intents". Worth knowing because under restart:
+		// unless-stopped it presents as a silent crash loop.
+		return fmt.Errorf("open discord session (is the Message Content intent enabled?): %w", err)
 	}
 	log.Println("[INFO] Bot running")
 
@@ -509,17 +540,25 @@ func main() {
 		}
 	}()
 
-	// Wait for a shutdown signal
-	sc := make(chan os.Signal, 1)
-	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
-	<-sc
+	// Wait for shutdown. The signal handling moved to cmd/bot, which owns the
+	// signal.NotifyContext, so this is now the same wait whether the trigger was
+	// SIGTERM from Docker, Ctrl-C, or a caller cancelling ctx in a test.
+	<-ctx.Done()
 
 	log.Println("[INFO] Caught shutdown signal, shutting down gracefully...")
 
-	// Signal all goroutines to stop
+	// stopSignal is still the internal broadcast, because roughly a dozen
+	// functions take it as a <-chan struct{} parameter and converting them all
+	// to ctx is M3's job, not a rename's. Closing it here is what translates the
+	// one cancellation cmd/bot knows about into the one every goroutine below is
+	// selecting on.
 	close(stopSignal)
 
-	// Wait for all goroutines to finish their work
+	// Wait for all goroutines to finish their work. Still unbounded and still
+	// racy: messageCreate calls wg.Add on this same WaitGroup, so an Add that
+	// lands after the counter hits zero panics, and in-flight handlers keep using
+	// db and dg after this returns (SPEC.md section 8, finding 4). M3 replaces it
+	// with a bounded dispatcher and a 10-second drain.
 	wg.Wait()
 	log.Println("[INFO] All goroutines finished.")
 
@@ -536,6 +575,7 @@ func main() {
 	}
 
 	log.Println("[INFO] Shutdown complete.")
+	return nil
 }
 
 // learnOrUpdateName finds the canonical name for a user and updates aliases.

@@ -52,7 +52,21 @@ Import rules, stated because each has already nearly been violated:
 - `core` never imports `plugins`. Plugins import `core`; registration happens only in `cmd/bot`.
 - `dbtest` is not a `_test.go` file (so any package's tests can import it) and is imported by nothing outside `_test.go` files (so it never enters the binary).
 
-**Sequencing.** Everything is `package main` today, and two `main` packages cannot share code, so M1 moves the root files verbatim into `internal/legacy` with `main()` renamed to `Run(ctx, cfg)`. Every later milestone moves one subsystem *out* of `legacy`, which shrinks monotonically and is deleted in M13. This is the only ordering that keeps `go build ./...` green at every commit while still ending at the target layout.
+**Sequencing.** Everything was `package main`, and two `main` packages cannot share code, so M1 moved the root files verbatim into `internal/legacy` with `main()` renamed to `Run(ctx)`. Every later milestone moves one subsystem *out* of `legacy`, which shrinks monotonically and is deleted in M13. This is the only ordering that keeps `go build ./...` green at every commit while still ending at the target layout.
+
+As shipped in M1:
+
+```
+cmd/bot/main.go          main, runGuarded, run. Flags, slog, godotenv, signal context
+internal/legacy/         legacy.go (was main.go), filter.go, cleanup.go. Unchanged
+clustering/              still at the root; moves under internal/ in M8
+wordgames/               still at the root; moves under internal/ in M11
+voicenotes/              still at the root; moves under internal/ in M12
+```
+
+The three root subpackages keep their paths deliberately. Relocating them is a one-line import change with no risk, which is exactly why it should ride along with the milestone that actually rewrites each one, rather than producing a diff that touches them twice.
+
+`legacy.Run` takes only a `ctx` and no logger, which differs from what this section said before M1 landed. Every log call in the package is the stdlib `log` package, and `cmd/bot` routes those into the slog handler with `slog.SetDefault`, so the output is structured without editing 200 call sites inside a milestone whose entire value was being reviewable as a rename. `slog.SetLogLoggerLevel` must be called before `SetDefault`, or bridged records ignore the handler's level. The signature grows a `*config.Config` in M2.
 
 ---
 
@@ -224,7 +238,9 @@ These are the product. None are stripped. Each becomes a plugin with its bugs fi
 
 ## 7. Lifecycle
 
-The per-message handler calls `wg.Add(1)` on the same WaitGroup the shutdown path waits on, which panics when an `Add` races a `Wait` at zero, and lets handlers keep using the database after it closes. There is no `context.Context` anywhere.
+The per-message handler calls `wg.Add(1)` on the same WaitGroup the shutdown path waits on, which panics when an `Add` races a `Wait` at zero, and lets handlers keep using the database after it closes.
+
+M1 changed only the outer edge of this. There is now exactly one `context.Context`: `cmd/bot` owns a `signal.NotifyContext`, and `legacy.Run` waits on `ctx.Done()` and then closes `stopSignal`, which stays the internal broadcast because roughly a dozen functions take it as a `<-chan struct{}` parameter. So cancellation has a single source and a test can drive a shutdown without a signal, but the race, the unbounded fan-out and the wrong close order are all still exactly as described below. M3 is what actually fixes them.
 
 Target: `core.Dispatcher` owns a bounded worker pool reading a buffered channel. The gateway handler does nothing but reject bots, snapshot the event into an immutable value (which also stops it mutating discordgo's struct) and enqueue non-blocking. Non-blocking is deliberate: discordgo dispatches each event on its own goroutine, so blocking would grow goroutines without bound, and dropping with a counter is the honest semantics for best-effort chat. The drop count surfaces in the status line so a persistently full queue is visible rather than inferred.
 
@@ -297,7 +313,7 @@ Small, mergeable PRs. `go build ./...`, `go vet ./...`, `golangci-lint run`, `go
 | # | Milestone | Deliverable | Status |
 |---|---|---|---|
 | 0 | Repo hygiene, docs, full CI/CD | `.gitignore` before `git init`; `.dockerignore`; module path; `go mod tidy`; the six punctuation fixes; rune-safe truncation; embedded dictionary; `PEREGRINE_DB_PATH`; `bbolt.Open` timeout; lint green from day one; Dockerfile, both compose files, `.env.example`, `blocklist.example.txt`; `ci.yml` with all six jobs; dependabot; docs; delete `copilot-instructions.md` | **done** |
-| 1 | `cmd/bot` and `internal/legacy` | Verbatim move, `main()` becomes `Run(ctx, cfg)`, merlin's `main`/`runGuarded`/`run` split, `slog`, `godotenv`, `signal.NotifyContext` | |
+| 1 | `cmd/bot` and `internal/legacy` | Verbatim move, `main()` becomes `Run(ctx)`, `performDatabaseCleanup` becomes `CleanDatabase() error`, merlin's `main`/`runGuarded`/`run` split, `slog` bridged over the stdlib `log`, `godotenv`, `signal.NotifyContext`, no `os.Exit` left in `legacy`, Dockerfile builds `./cmd/bot` | **done** |
 | 2 | `internal/config` | Every constant and hardcoded value becomes an env var defaulting to today's value; the two dead knobs deleted; autonomous-post misconfiguration becomes a startup error | |
 | 3 | `internal/core` lifecycle | `Service`/`Registry`/`Deps` and `WatchReady` ported; `IntentsGuilds` added; bounded `Dispatcher`; `RunLoop`; ordered shutdown; `ctx` throughout. Closes 3, 4, 7 | |
 | 4 | `internal/text` and `internal/filter` | Pure moves, regexes hoisted, slur list becomes an ordered slice, per-call interner replaces the global. Closes 2, 16, 22 | |
