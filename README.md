@@ -71,7 +71,17 @@ Required repository secrets, which do **not** carry over from merlin and must be
 | `VPS_HOST` | Deploy target hostname |
 | `VPS_SSH_KEY` | Private key for the `deploy` user |
 
-On the VPS, `/home/deploy/peregrine` needs `.env` and a `backups/` directory. The compose file and the tag files are written by CI.
+And one repository **variable**:
+
+| Variable | Purpose |
+|---|---|
+| `DEPLOY_ENABLED` | Must be exactly `true` for the deploy steps to run. Anything else, including unset, skips them |
+
+**`DEPLOY_ENABLED` is currently unset, on purpose, so merges to `main` build and push an image but do not start the bot.** The deploy runs `docker compose up -d`, so without this gate every merge would start it, silently reversing the decision to keep a bot with no output filter out of a live channel until the M5 safety gate lands. A `docker compose stop` done by hand does not survive the next merge; the variable does. It defaults to holding rather than deploying because an unset variable should not be the thing that puts an unmoderated bot into a real server. Set it to `true` when M5 is in.
+
+A skipped deploy reports as **green with a notice**, not red, since a deployment that was deliberately held has not gone wrong.
+
+On the VPS, `/home/deploy/peregrine` needs `.env` (mode `0600`, since it holds a token equivalent to full control of the bot) and a `backups/` directory. The compose file and the tag files are written by CI.
 
 ### Runbook
 
