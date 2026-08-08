@@ -19,6 +19,7 @@ import (
 	"go.etcd.io/bbolt"
 
 	"github.com/6586x57890143/peregrine/internal/config"
+	"github.com/6586x57890143/peregrine/internal/safety"
 )
 
 // Service is the interface every feature module implements. Services are
@@ -64,6 +65,16 @@ type Deps struct {
 	// Dispatcher is the only way a gateway handler should do work. See its own
 	// documentation for why a handler must not spawn its own goroutine.
 	Dispatcher *Dispatcher
+
+	// Gate decides what may be learned and what may be sent. Never nil: cmd/bot
+	// treats a failed blocklist load as fatal, because an empty ruleset is
+	// indistinguishable from a working one until the bot has already posted
+	// something the operator has to answer for.
+	//
+	// It lives in Deps rather than being passed to one service because both
+	// directions need it and M10's discordguard will own the emit side, so every
+	// service that sends anything reaches it the same way.
+	Gate *safety.Gate
 }
 
 // Registry owns service lifecycle: Init, Start, and reverse-order Shutdown.
