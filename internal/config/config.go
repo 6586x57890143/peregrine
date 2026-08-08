@@ -55,6 +55,18 @@ type Config struct {
 	IngestLookback   time.Duration // PEREGRINE_INGEST_LOOKBACK
 	IngestBatchDelay time.Duration // PEREGRINE_INGEST_BATCH_DELAY
 
+	// Runtime. The worker pool that every incoming message goes through, replacing
+	// an unbounded goroutine per message that shared a WaitGroup with the shutdown
+	// path. A full queue drops and counts rather than blocking, because
+	// best-effort chat is the honest semantics and an unbounded queue is only a
+	// slower crash.
+	//
+	// Workers is capped low on purpose: bbolt serializes every write transaction
+	// process-wide, so past a handful of workers the extra concurrency buys
+	// contention rather than throughput.
+	MessageWorkers int // PEREGRINE_MESSAGE_WORKERS
+	MessageQueue   int // PEREGRINE_MESSAGE_QUEUE
+
 	// Housekeeping loops.
 	StatusTick       time.Duration // PEREGRINE_STATUS_TICK
 	EnableClustering bool          // PEREGRINE_ENABLE_CLUSTERING
@@ -123,8 +135,6 @@ var deferredVars = map[string]string{
 	"PEREGRINE_ROAST_CHANCE":               "M7",
 	"PEREGRINE_IMAGE_MAX_PER_AUTHOR":       "M11",
 	"PEREGRINE_IGNORE_CHANNELS":            "M10",
-	"PEREGRINE_MESSAGE_WORKERS":            "M3",
-	"PEREGRINE_MESSAGE_QUEUE":              "M3",
 	"PEREGRINE_INGEST_GUILD_CONCURRENCY":   "M9",
 	"PEREGRINE_INGEST_CHANNEL_CONCURRENCY": "M9",
 	"PEREGRINE_WHISPER_MODEL":              "M12",
@@ -166,6 +176,9 @@ func Load() (*Config, error) {
 		IngestTick:       l.dur("PEREGRINE_INGEST_TICK", 10*time.Minute, time.Minute, 24*time.Hour),
 		IngestLookback:   l.dur("PEREGRINE_INGEST_LOOKBACK", 24*time.Hour, time.Minute, 30*24*time.Hour),
 		IngestBatchDelay: l.dur("PEREGRINE_INGEST_BATCH_DELAY", 500*time.Millisecond, 0, time.Minute),
+
+		MessageWorkers: l.intVal("PEREGRINE_MESSAGE_WORKERS", 4, 1, 64),
+		MessageQueue:   l.intVal("PEREGRINE_MESSAGE_QUEUE", 256, 1, 100_000),
 
 		StatusTick:       l.dur("PEREGRINE_STATUS_TICK", 5*time.Minute, time.Minute, 24*time.Hour),
 		EnableClustering: l.boolVal("PEREGRINE_ENABLE_CLUSTERING", true),

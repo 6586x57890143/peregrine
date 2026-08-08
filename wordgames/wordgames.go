@@ -5,7 +5,7 @@ import (
 	"embed"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"sort"
 	"strings"
@@ -24,7 +24,6 @@ import (
 //
 //go:embed dictionary.txt
 var embeddedDictionary embed.FS
-
 
 // ScrambleGame holds the state of a single word scramble puzzle.
 type ScrambleGame struct {
@@ -50,11 +49,16 @@ type Leaderboard struct {
 }
 
 var wordList []string
-var gameRand *rand.Rand
 
-func init() {
-	gameRand = rand.New(rand.NewSource(time.Now().UnixNano()))
-}
+// There is deliberately no package-level *rand.Rand here.
+//
+// There used to be one, seeded in init and used by NewScrambleGame and scramble,
+// both of which are reached from the per-message handler. A *rand.Rand is not
+// safe for concurrent use, so two players triggering a game at once was a data
+// race on the generator's internal state. It is the same bug as the one in the
+// old main package (SPEC.md section 8, finding 3) and it is fixed the same way:
+// math/rand/v2's top-level functions are goroutine-safe and auto-seeded, so there
+// is no shared generator to race rather than a locked one.
 
 // LoadDictionary loads the word list. With an empty path it reads the embedded
 // dictionary, which is the normal case and cannot fail at runtime. A non-empty
@@ -92,7 +96,7 @@ func LoadDictionary(path string) error {
 // scramble shuffles the letters of a word.
 func scramble(word string) string {
 	runes := []rune(word)
-	gameRand.Shuffle(len(runes), func(i, j int) {
+	rand.Shuffle(len(runes), func(i, j int) {
 		runes[i], runes[j] = runes[j], runes[i]
 	})
 	// Ensure the scrambled word is not the same as the original
@@ -107,7 +111,7 @@ func NewScrambleGame() (*ScrambleGame, error) {
 	if len(wordList) == 0 {
 		return nil, fmt.Errorf("word dictionary is not loaded")
 	}
-	word := wordList[gameRand.Intn(len(wordList))]
+	word := wordList[rand.IntN(len(wordList))]
 	return &ScrambleGame{
 		OriginalWord:  word,
 		ScrambledWord: scramble(word),
