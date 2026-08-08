@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `peregrine` is a Markov-chain Discord engagement bot (Go 1.24, `discordgo` v0.29, `bbolt` v1.4). It learns from channel messages and replies in the server's own voice. Full design doc: [`SPEC.md`](./SPEC.md). Read it before any non-trivial change, especially §4 (safety and threat model) and §5 (the generation pipeline). The bot lives in a meme-heavy server and exists to cause engagement, fun and chaos, so **output that lands matters more than output that is grammatical**, and several things that look like bugs are deliberate register. The things that are actually bugs are catalogued in §8.
 
-**The repository is mid-restructure.** It is being taken from a single 3,200-line `package main` to merlin's `cmd/` plus `internal/` layout, one subsystem per milestone (`SPEC.md` §9). Until that finishes, most code still lives in `main.go` at the root, and a comment saying "M6 replaces this" means exactly that. Do not treat the current shape as the intended shape.
+**The repository is mid-restructure.** It is being taken from a single 3,200-line `package main` to merlin's `cmd/` plus `internal/` layout, one subsystem per milestone (`SPEC.md` §9). The entrypoint is now `cmd/bot`, and everything it calls still lives in `internal/legacy/legacy.go`, which is the old `main.go` moved verbatim. A comment saying "M6 replaces this" means exactly that. Do not treat the current shape as the intended shape, and in particular do not add anything new to `internal/legacy`: it is a holding pen that only shrinks.
 
 ## Commands
 
@@ -29,21 +29,33 @@ em=$'\342\200\224' ell=$'\342\200\246' ldq=$'\342\200\234' rdq=$'\342\200\235'
 grep -rnI --exclude-dir=.git -e "$em" -e "$ell" -e "$ldq" -e "$rdq" .
 ```
 
-**One exception, and it is load-bearing:** `tokenRegex` in `main.go` contains a literal right single quote inside its character class so the tokenizer can handle curly-apostrophe contractions. The CI check deliberately does not scan for that character. Do not "clean it up": removing it silently changes what the bot learns.
+**One exception, and it is load-bearing:** `tokenRegex` in `internal/legacy/legacy.go` contains a literal right single quote inside its character class so the tokenizer can handle curly-apostrophe contractions. The CI check deliberately does not scan for that character. Do not "clean it up": removing it silently changes what the bot learns.
 
 Local run:
 ```sh
 cp .env.example .env      # DISCORD_BOT_TOKEN is the only variable required today
-go run .
+go run ./cmd/bot
 docker compose up --build # or in a container
 ```
 
 Maintenance modes, which operate on the corpus and never touch Discord:
 ```sh
-go run . -clean-db        # remove spammy and slur-bearing keys
+go run ./cmd/bot -clean-db   # remove spammy and slur-bearing keys
 ```
 
 ## Architecture
+
+### The entrypoint, and why `internal/legacy` exists
+
+`cmd/bot/main.go` is thin on purpose and mirrors merlin's: `main` builds the logger and loads `.env`, `runGuarded` turns a panic into a logged fatal instead of a bare stderr trace, and `run` parses flags, creates the signal context, and calls `legacy.Run(ctx)`. Nothing else belongs there. Build it as `./cmd/bot`, not `.`; the root is no longer a main package.
+
+`internal/legacy` holds the old `main.go`, `filter.go` and `cleanup.go` unchanged. It exists because **two `main` packages cannot share code**: making `cmd/bot` the entrypoint required the 3,200 lines it calls to live somewhere importable, and moving them verbatim was the only sequencing that keeps `go build ./...` green at every commit while ending at merlin's layout. Each later milestone moves one subsystem *out*, so the package only shrinks; M13 deletes it. Add nothing to it.
+
+Two behaviors changed in that move, and both are about `log.Fatal`. `main()` became `Run(ctx) error`, so its six `log.Fatal` calls are returned errors, and `performDatabaseCleanup` became `CleanDatabase() error` for the same reason. `log.Fatal` calls `os.Exit`, which **skips every deferred function**, so any startup failure after `bbolt.Open` left the exclusive flock on `markov.db` held by a dying process, and the operator's natural next attempt then failed on the five-second `Open` timeout instead of on the original problem. There is now no `os.Exit` anywhere in `internal/legacy`.
+
+Logging is bridged rather than converted. `cmd/bot` calls `slog.SetDefault`, which routes the stdlib `log` package through the slog handler, so `internal/legacy`'s ~200 `log.Printf` calls emit structured records without 200 call-site edits. `slog.SetLogLoggerLevel` must be called **before** `SetDefault` or every bridged record arrives at Info regardless of the handler's level. Convert call sites when their subsystem moves out, not before.
+
+`stopSignal` is still the internal shutdown broadcast, because a dozen functions take it as a `<-chan struct{}` parameter. `Run` waits on `ctx.Done()` and then closes it, which is what translates the one cancellation `cmd/bot` owns into the one every goroutine selects on. M3 replaces both with a real lifecycle.
 
 ### bbolt, and why the Dockerfile can be merlin's verbatim
 
@@ -66,7 +78,7 @@ The dictionary load used to be `log.Fatalf`, so a missing 64 KB word list killed
 
 ### Discord calls are logged, never discarded
 
-`sendMessage`, `editMessage` and `deleteMessage` in `main.go` wrap the `discordgo` calls. Every one of these used to discard its error, so a send Discord refused (missing permission, rate limit, channel deleted mid-flight) was indistinguishable from one that succeeded: the bot appeared to ignore people at random with nothing in the log. They are deliberately thin because M10 replaces them with `internal/discordguard`, which owns the same logging plus mention suppression and the outbound safety gate at a single chokepoint. Add new sends through these helpers, not through `s.ChannelMessage*` directly.
+`sendMessage`, `editMessage` and `deleteMessage` in `internal/legacy/legacy.go` wrap the `discordgo` calls. Every one of these used to discard its error, so a send Discord refused (missing permission, rate limit, channel deleted mid-flight) was indistinguishable from one that succeeded: the bot appeared to ignore people at random with nothing in the log. They are deliberately thin because M10 replaces them with `internal/discordguard`, which owns the same logging plus mention suppression and the outbound safety gate at a single chokepoint. Add new sends through these helpers, not through `s.ChannelMessage*` directly.
 
 ### Nothing the bot posts may ping
 

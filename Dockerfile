@@ -6,7 +6,11 @@ RUN go mod download
 COPY . .
 ARG TARGETOS
 ARG TARGETARCH
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/peregrine .
+# ./cmd/bot, not `.`: since M1 the root package is not a main package. Building
+# `.` here fails the build outright rather than producing a broken image, which
+# is the good outcome, but the error ("no Go files in /src") reads like a broken
+# build context rather than a stale path.
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/peregrine ./cmd/bot
 # bbolt needs a directory it can create a file in and write to. A fresh named
 # volume inherits the ownership and mode of the image path it is mounted over,
 # the distroless base has no /data, and it has no shell to mkdir one at
