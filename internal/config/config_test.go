@@ -74,7 +74,7 @@ func TestLoadDefaults(t *testing.T) {
 		{"AutonomousSkipChance", cfg.AutonomousSkipChance, 0.90},
 		{"WordGameMode", cfg.WordGameMode, WordGameModeInterval},
 		{"WordGameInterval", cfg.WordGameInterval, 2 * time.Minute},
-		{"EnableClustering", cfg.EnableClustering, true},
+		{"EnableClustering", cfg.EnableClustering, false},
 		{"EnableImageRepost", cfg.EnableImageRepost, true},
 		{"EnableAutonomousPost", cfg.EnableAutonomousPost, false},
 		{"EnableWordGames", cfg.EnableWordGames, false},

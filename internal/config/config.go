@@ -180,8 +180,26 @@ func Load() (*Config, error) {
 		MessageWorkers: l.intVal("PEREGRINE_MESSAGE_WORKERS", 4, 1, 64),
 		MessageQueue:   l.intVal("PEREGRINE_MESSAGE_QUEUE", 256, 1, 100_000),
 
-		StatusTick:       l.dur("PEREGRINE_STATUS_TICK", 5*time.Minute, time.Minute, 24*time.Hour),
-		EnableClustering: l.boolVal("PEREGRINE_ENABLE_CLUSTERING", true),
+		StatusTick: l.dur("PEREGRINE_STATUS_TICK", 5*time.Minute, time.Minute, 24*time.Hour),
+
+		// Defaults to FALSE as of M4, which is a change from the value the code
+		// previously had, and the reason is that the pass currently cannot affect
+		// output at all.
+		//
+		// Clustering writes its members string-keyed and the generation path reads
+		// them into a map[int]float32, so every unmarshal fails and both consumers
+		// silently skip the cluster (SPEC.md section 8, finding 27). So the pass
+		// walks the whole corpus every 24 hours inside a write transaction, against
+		// bbolt's single writer, ends in a destructive bucket rebuild, and produces
+		// data nothing can read. Leaving that on by default once it is known to be a
+		// no-op is not defensible; the observable behavior is unchanged because the
+		// output was never readable.
+		//
+		// M8 fixes the codec and re-enables this default, after M7's golden samples
+		// exist to judge whether the clusters actually improve output. Turning it on
+		// before then would add a seed branch firing at weight 50 inside a scorer
+		// that is not yet normalized, with no way to evaluate the result.
+		EnableClustering: l.boolVal("PEREGRINE_ENABLE_CLUSTERING", false),
 		ClusteringTick:   l.dur("PEREGRINE_CLUSTERING_TICK", 24*time.Hour, time.Minute, 30*24*time.Hour),
 		LeaderboardTick:  l.dur("PEREGRINE_LEADERBOARD_CHECK_TICK", time.Hour, time.Minute, 24*time.Hour),
 
