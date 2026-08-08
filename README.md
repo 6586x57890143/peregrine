@@ -8,7 +8,9 @@ Sibling project to [merlin](../merlin), whose deployment conventions this repo f
 
 Mid-restructure. The bot works and runs, but it is being taken from a single 3,200-line `main.go` to a proper package layout one subsystem at a time, with a catalogue of known defects being closed along the way. See `SPEC.md` §8 for the defect list and §9 for the milestone order.
 
-**Milestones 0 through 5 are complete:** repo hygiene and CI/CD, the `cmd/bot` entrypoint, `internal/config`, the `internal/core` lifecycle, `internal/text` plus `internal/filter`, and `internal/safety`. The entrypoint, configuration, process lifecycle, tokenizer, filters and both safety gates are real; the corpus layout and the generation engine are not yet. What is left sits in `internal/legacy`, which each later milestone empties one subsystem at a time.
+**Milestones 0 through 5 are complete, and 6a:** repo hygiene and CI/CD, the `cmd/bot` entrypoint, `internal/config`, the `internal/core` lifecycle, `internal/text` plus `internal/filter`, `internal/safety`, and the storage layer (`internal/corpus`, `internal/storage`, `internal/dbtest`, `internal/maintenance`).
+
+The storage layer is built and tested but the bot does not use it yet: M6b rewires `internal/legacy` onto it, and until then legacy still holds a raw bbolt handle, so the nested-transaction deadlock is fixed in design and not yet in the running bot. The generation engine is M7.
 
 All three crash bugs are now closed: the shutdown WaitGroup race that could panic on exit (M3), the `*rand.Rand` shared across every message goroutine (M3), and the global vocabulary map written concurrently, which was a Go runtime *fatal error* rather than a recoverable panic (M4).
 

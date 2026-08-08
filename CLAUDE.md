@@ -83,6 +83,26 @@ So the pass runs a full similarity walk over the corpus every 24 hours, inside a
 
 The codec fix is small and deliberately deferred to M8, because turning the path on adds a seed branch firing at weight 50 inside a scorer that is not yet normalized, and M7's golden samples are what can judge whether it helps. The general lesson is worth keeping: an unmarshal guarded by `err == nil` with no `else` is indistinguishable from one that works, and only round-tripping the two real types tells you which you have.
 
+### The storage seam, and why it is a seam rather than a fix
+
+`internal/storage` is the only package that knows a bucket exists. Everything above it gets a `*storage.Reader` or `*storage.Writer`, handed to a callback and bound to one transaction.
+
+That shape exists to make the worst bug in the review **unwritable**. Generation used to run inside a `db.View` and call helpers that each opened their own `db.View`; bbolt holds `mmaplock.RLock` for a read transaction's whole life and takes the write lock to grow the mmap, and Go's `RWMutex` queues new readers behind a waiting writer, so outer-read plus waiting-writer plus inner-read is a deadlock with no timeout and no recovery. **`Reader` has no method that starts a transaction**, so a consumer cannot nest one even by accident. A `Writer` embeds `Reader`, which is why nesting is never necessary: a write path can read its own writes.
+
+**The key layout is composite, not map-valued.** `<prefix> 0x00 <next>` to a fixed 12 bytes (count `uint64`, distinct authors `uint32`). The old layout put a JSON `map[string]int` of every successor in the *value* of each prefix key, so learning one occurrence of "the cat" rewrote every successor "the" had ever had. `0x00` is asserted, not assumed: it sorts below space, so `Seek("the\x00")` cannot wander into `"the cat\x00"` keys, and a NUL inside a token would produce a key that stores and retrieves fine under a prefix the caller did not mean.
+
+**An empty prefix is refused by the writer.** The old ingestion loop descended to order 1, where the prefix is empty, so the entire vocabulary accumulated into one key that nothing ever read. Refusing it in `LearnNgram` rather than only avoiding it in the caller means a new caller cannot reintroduce it.
+
+**Presence sets store one byte, not zero.** This was a real bug, found by three failing tests. bbolt's `Bucket.Get` returns nil both for a missing key and for a key stored with an empty value, so `Get(k) == nil` could not tell them apart: every presence check reported absent, and both the distinct-author count and the Kneser-Ney predecessor count silently counted occurrences instead of distinct things. 500 repetitions by one person reported 500 distinct authors.
+
+**Snowflakes are stored as fixed-width big-endian.** Discord IDs are 64-bit integers whose high bits are a timestamp, so numeric order is chronological order. Stored as decimal *strings* they were not: a 17-digit ID sorted before an 18-digit one, so history eviction removed entries essentially at random. Fixed-width bytes make a cursor's `First()` genuinely the oldest.
+
+**Trims use counters, never `Bucket.Stats()`.** `Stats()` walks every page, and the old trims called it in the *loop condition*, making eviction quadratic in pages. Counters live in the `meta` bucket and are updated in the same transaction as the insert, so they cannot drift.
+
+**`schema_version` refuses a corpus it does not understand.** There is no migration from the pre-M6 layout and there will not be one: converting means rewriting the whole corpus, and the corpus is re-derivable from Discord history. `Open` distinguishes a new file from an old one by looking for data, and refuses the latter with an explanation.
+
+`internal/dbtest` gives tests a real corpus in `t.TempDir()`. There is **no skip path** and there is not meant to be one: unlike merlin's Postgres harness this one cannot be unavailable, so "these tests silently skipped" is not a failure mode it can have.
+
 ### Lifecycle: what starts, in what order, and what stops first
 
 `cmd/bot` owns the process: config, logger, corpus, session, dispatcher, registry, shutdown. `internal/core` owns the mechanisms. Nothing in `core` imports a feature package and nothing may: services import `core`, and registration happens only in `cmd/bot`.
