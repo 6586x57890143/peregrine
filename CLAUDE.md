@@ -57,6 +57,19 @@ Logging is bridged rather than converted. `cmd/bot` calls `slog.SetDefault`, whi
 
 `stopSignal` is still the internal shutdown broadcast, because a dozen functions take it as a `<-chan struct{}` parameter. `Run` waits on `ctx.Done()` and then closes it, which is what translates the one cancellation `cmd/bot` owns into the one every goroutine selects on. M3 replaces both with a real lifecycle.
 
+### Configuration is environment variables, validated once, all at once
+
+`internal/config` turns the environment into one `*Config` that `cmd/bot` hands to `legacy.Run`. There is no `config.yaml` and there should not be: merlin needs one because its settings are per guild and edited live from Discord, whereas peregrine's are per process and change on a deploy, which is what an env var already models.
+
+Four rules, each from a specific failure mode:
+
+- **Every field in `Config` is read by code that exists.** A knob wired to nothing is worse than no knob: an operator tunes it during an incident, nothing happens, and the bot gets blamed for ignoring configuration. This is why `ContextWindow` and `CoherencyBalance` were deleted rather than promoted, and why `Creativity` stayed a constant (see the trap below). Variables that later milestones will read live in `.env.example` and in the `deferredVars` map, not in the struct, and startup **warns** naming each one you have set plus its milestone. `TestDeferredVarsAreNotAlsoLive` fails if an entry outlives its milestone.
+- **`Load` reports every problem, not the first.** A container that fails on one bad variable per restart makes a six-variable mistake take six deploys. `cmd/bot` unpacks the `errors.Join` into one log record each, because slog quotes a multi-line value and a joined error otherwise arrives as one line full of literal `\n`.
+- **A value that does not parse is a startup error, never a fallback to the default.** Especially booleans: `PEREGRINE_ENABLE_X=ture` reading as "off" is indistinguishable from the feature being broken, and that exact shape is how autonomous posting stayed dark. Accepted forms are `1/true/yes/on` and `0/false/no/off`, case-insensitive.
+- **The token is not required by `Load`.** `-clean-db` operates on the corpus and never touches Discord, so requiring a credential to clean a poisoned corpus would be backwards. `cfg.RequireToken()` is the bot path's check.
+
+`PEREGRINE_BOOTSTRAP_ADMIN_USER_ID` replaces a user ID that was hardcoded in the source as the only authorization check in the codebase. It **fails closed**: empty refuses everyone, and getting that direction wrong on an empty string is how a missing variable turns an operator command into a public one.
+
 ### bbolt, and why the Dockerfile can be merlin's verbatim
 
 The corpus is [bbolt](https://github.com/etcd-io/bbolt): an embedded, single-file, pure-Go B-tree key/value store. Pure Go is the load-bearing property. It means `CGO_ENABLED=0` produces a fully static binary, which means the image can be `gcr.io/distroless/static-debian12:nonroot` with no shell, no package manager and no libc, exactly like merlin's, **while still owning a database**. Merlin needs a whole Postgres service and a connect-retry loop; peregrine needs a volume. Do not introduce a cgo dependency without understanding that it costs the entire deployment story.
@@ -90,7 +103,7 @@ Read `SPEC.md` §5 for the full specification. The parts most worth knowing befo
 
 **It is currently less random than it looks.** Candidate scores start as raw n-gram counts and are multiplied by an unbounded topic-gravity term and roughly a dozen more ad-hoc factors, with no normalization anywhere, then raised to a power. Scores therefore span orders of magnitude and one candidate almost always dominates: the sampler is effectively argmax with noise. For a chaos bot that is the worst available failure mode, and it hides well because the output still varies a little. M7 normalizes to a real probability, moves every heuristic to an **additive logit in log space**, and puts temperature and top-k/top-p on top so that chaos is a dial that moves.
 
-**`Creativity` is a trap.** It is applied as an exponent of `1/(Creativity+0.01)`, so at its 0.75 default the exponent is 1.316, which *sharpens* the distribution. Raising it toward 1 can only ever approach an exponent of 1.0 and never pass it, so the knob cannot reach the interesting half of its own range. It becomes `PEREGRINE_TEMPERATURE` with the arithmetic corrected.
+**`Creativity` is a trap, and it is deliberately still a constant.** It is applied as an exponent of `1/(Creativity+0.01)`, so at its 0.75 default the exponent is 1.316, which *sharpens* the distribution. Raising it toward 1 can only ever approach an exponent of 1.0 and never pass it, so the knob cannot reach the interesting half of its own range. M2 promoted every other tuning constant to an environment variable and left this one alone on purpose: exposing a dial whose arithmetic contradicts its name invites tuning something broken. It becomes `PEREGRINE_TEMPERATURE` in M7, in the same change that normalizes the scoring so the dial actually moves. Do not add a `PEREGRINE_CREATIVITY`.
 
 **Backoff carries no weight.** The prefix-shrink loop tries the longest prefix, then shorter ones, and takes the first non-empty result, so a 4-gram continuation and a bigram continuation are scored on the same scale. M7 replaces this with **interpolated Kneser-Ney**, which is the right model for a corpus this sparse: a server's chat is on the order of 10^5 to 10^6 tokens, so at `MaxNGram=5` nearly every 4-gram has count 1.
 
