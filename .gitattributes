@@ -1,0 +1,27 @@
+# Normalize to LF in the repository, regardless of the contributor's platform.
+# This is not cosmetic: development happens on Windows, where core.autocrlf
+# converts checkouts to CRLF, and several files here are consumed by Linux
+# shells. A CRLF in the deploy script inside .github/workflows or in anything
+# the image runs surfaces as `command not found` with an invisible carriage
+# return in the name, which is a memorable afternoon.
+* text=auto eol=lf
+
+# Explicit for the files where it matters most.
+*.go        text eol=lf
+*.yml       text eol=lf
+*.md        text eol=lf
+*.txt       text eol=lf
+Dockerfile  text eol=lf
+.env.example text eol=lf
+.gitignore  text eol=lf
+.dockerignore text eol=lf
+
+# Binary, so git never tries to diff or convert them. None are committed today
+# (they are gitignored for size), but the ignore file and this one are separate
+# mechanisms and a future exception should not silently corrupt a model.
+*.bin       binary
+*.db        binary
+*.exe       binary
+*.dll       binary
+*.ogg       binary
+*.wav       binary

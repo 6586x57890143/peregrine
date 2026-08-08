@@ -1,0 +1,197 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    # No service containers here, unlike merlin's equivalent job. Merlin needs a
+    # postgres:16-alpine service and a TEST_DATABASE_URL because its storage
+    # layer talks to a real server, and its test harness skips itself when that
+    # is unreachable. Peregrine's corpus is bbolt: an embedded, pure-Go,
+    # single-file library, so its database tests create a file in t.TempDir().
+    # That means there is nothing to health-check, nothing to wait for, and
+    # crucially no t.Skip anywhere: the harness cannot be unavailable, so the
+    # database tests run identically on a contributor's laptop and here. The
+    # "these tests silently skipped and nobody noticed" failure mode that
+    # motivated merlin's service container cannot occur.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+
+      - name: go test (race + cover)
+        run: go test ./... -race -cover -covermode=atomic
+
+      - name: govulncheck
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version-file: go.mod
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    # Scoped per-job rather than inheriting the workflow defaults: on a
+    # pull_request event gitleaks scans the PR's commits via
+    # GET /repos/{owner}/{repo}/pulls/{n}/commits, which needs
+    # pull-requests: read. Without it the job dies with a 403 "Resource not
+    # accessible by integration" and reports a red secret-scan that has nothing
+    # to do with any secret. Declaring the job's own permissions also drops the
+    # packages: write it inherited and never used.
+    #
+    # This job matters more here than in most repos: a Discord bot token is a
+    # single string that grants full control of the bot, and the whole point of
+    # keeping the corpus and the blocklist out of git is undermined if a token
+    # lands in a diff.
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  prose:
+    runs-on: ubuntu-latest
+    # Em dashes, ellipsis characters and curly quotes are the punctuation nobody
+    # types on a keyboard, so they read as machine written wherever they appear:
+    # command responses, docs, code comments. Peregrine had six such sites,
+    # including two in user-visible leaderboard output. Cheap enough to run on
+    # its own job so a prose failure reports separately from a compile failure.
+    #
+    # Unlike merlin's version there is no --exclude for the design document.
+    # Merlin exempts its spec.MD as pre-existing hand-written history; SPEC.md
+    # here was written under this rule, so it obeys it.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: No generated-text punctuation
+        run: |
+          # Patterns are written as UTF-8 byte escapes, not literal characters,
+          # so this file does not trip its own check. Octal rather than
+          # $'\uXXXX' because \u needs bash 4.2+ and silently passes the six
+          # literal characters backslash-u-2-0-1-4 through as the pattern on
+          # shells without it, which matches nothing real and quietly disarms
+          # the guard. -I skips binaries.
+          #
+          # Note the check deliberately does NOT cover the right single quote:
+          # the tokenizer regex in main.go contains one as a literal character
+          # class member so it can tokenize curly-apostrophe contractions, and
+          # "cleaning" it would silently change what the bot learns.
+          em=$'\342\200\224' ell=$'\342\200\246'
+          ldq=$'\342\200\234' rdq=$'\342\200\235'
+          if grep -rnI --exclude-dir=.git \
+               -e "$em" -e "$ell" -e "$ldq" -e "$rdq" . ; then
+            echo "::error::Found em dashes, ellipsis characters or curly quotes at the locations above. Use plain punctuation: a colon, comma, full stop, or parentheses, whichever the sentence actually wants."
+            exit 1
+          fi
+
+  docker-build:
+    runs-on: ubuntu-latest
+    # This job is why .dockerignore is a milestone-0 deliverable rather than a
+    # nicety. The working tree is around 692 MB, almost all of it the whisper
+    # model and a bundled ffmpeg; without the ignore file every build here ships
+    # all of it into the builder context.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v4
+      - name: Build image (no push)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          tags: peregrine:ci
+
+  push-image:
+    needs: [lint-test, secret-scan, docker-build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/6586x57890143/peregrine:latest
+            ghcr.io/6586x57890143/peregrine:${{ github.sha }}
+
+  deploy:
+    needs: push-image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Copy prod compose file to VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: deploy
+          key: ${{ secrets.VPS_SSH_KEY }}
+          source: "docker-compose.prod.yml"
+          target: "/home/deploy/peregrine"
+      - name: Pull image and restart on VPS
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: deploy
+          key: ${{ secrets.VPS_SSH_KEY }}
+          envs: GHCR_TOKEN,GHCR_USER,IMAGE_TAG
+          script: |
+            set -e
+            cd /home/deploy/peregrine
+            mkdir -p backups
+
+            # Record the tag being deployed before deploying it, and keep the
+            # one it replaces. Rolling back is then reading a file, not digging
+            # through GHCR or CI logs to work out what was running.
+            if [ -f deployed-tag.env ]; then
+              cp deployed-tag.env previous-tag.env
+            fi
+            echo "PEREGRINE_IMAGE_TAG=$IMAGE_TAG" > deployed-tag.env
+
+            set -a
+            . ./deployed-tag.env
+            set +a
+
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            docker compose -f docker-compose.prod.yml pull
+            docker compose -f docker-compose.prod.yml up -d --remove-orphans
+            # Prune dangling layers only. A bare `docker image prune -f` on a
+            # host that has just retagged images can remove the previous
+            # release, which is the one thing a rollback needs to still exist.
+            docker image prune -f --filter "until=168h"
+            docker logout ghcr.io
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+          IMAGE_TAG: ${{ github.sha }}

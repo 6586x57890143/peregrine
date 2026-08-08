@@ -1,0 +1,44 @@
+# Merlin has no .dockerignore and does not need one. Peregrine does: the repo
+# working tree is around 692 MB, almost all of it the whisper model and the
+# bundled ffmpeg binary, and `COPY . .` would push every byte of that into the
+# builder layer on every build. CI builds the image twice (docker-build and
+# push-image) for two architectures, so without this file that is roughly
+# 2.7 GB of pointless context per run.
+#
+# The build only needs Go sources, go.mod and go.sum. Everything else here is
+# excluded on purpose.
+
+.git
+.github
+.claude
+.gitignore
+
+# Secrets and runtime data must never enter an image layer, even transiently:
+# a layer is a permanent, distributable copy.
+.env
+blocklist.txt
+markov.db
+markov.db.lock
+*.db.tmp
+backups/
+
+# The transcription assets, which is the 692 MB.
+voicenotes/models/
+voicenotes/bin/
+voicenotes/audio/
+
+# Build output from a host build, which would otherwise shadow the one the
+# builder stage produces.
+/bin/
+/dist/
+peregrine
+peregrine.exe
+
+*.log
+
+# Docs are excluded from the build context but deliberately NOT from the prose
+# CI job, which runs against the checkout rather than the image.
+*.md
+LICENSE
+docker-compose*.yml
+Dockerfile
