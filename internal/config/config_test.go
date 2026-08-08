@@ -16,6 +16,7 @@ func clearEnv(t *testing.T) {
 	keys := []string{
 		"DISCORD_BOT_TOKEN", "PEREGRINE_BOOTSTRAP_ADMIN_USER_ID", "LOG_LEVEL",
 		"PEREGRINE_DB_PATH", "PEREGRINE_MAX_HISTORY", "PEREGRINE_MAX_NGRAM",
+		"PEREGRINE_BLOCKLIST_PATH", "PEREGRINE_PAUSE_ALL_WRITES",
 		"PEREGRINE_PROMPT_RELEVANCE_BOOST", "PEREGRINE_SELF_MENTION_PATTERN",
 		"PEREGRINE_INGEST_TICK", "PEREGRINE_INGEST_LOOKBACK", "PEREGRINE_INGEST_BATCH_DELAY",
 		"PEREGRINE_STATUS_TICK", "PEREGRINE_ENABLE_CLUSTERING", "PEREGRINE_CLUSTERING_TICK",
@@ -75,6 +76,12 @@ func TestLoadDefaults(t *testing.T) {
 		{"WordGameMode", cfg.WordGameMode, WordGameModeInterval},
 		{"WordGameInterval", cfg.WordGameInterval, 2 * time.Minute},
 		{"EnableClustering", cfg.EnableClustering, false},
+		// Both safety defaults are permissive-looking and are checked here so that
+		// changing either is a visible decision. An unset blocklist path is allowed
+		// (cmd/bot warns loudly), and writes are not paused by default because the
+		// pause is an incident lever, not a posture.
+		{"BlocklistPath", cfg.BlocklistPath, ""},
+		{"PauseAllWrites", cfg.PauseAllWrites, false},
 		{"EnableImageRepost", cfg.EnableImageRepost, true},
 		{"EnableAutonomousPost", cfg.EnableAutonomousPost, false},
 		{"EnableWordGames", cfg.EnableWordGames, false},
@@ -277,7 +284,7 @@ func TestDeferredSet(t *testing.T) {
 	}
 
 	t.Setenv("PEREGRINE_TOP_K", "40")
-	t.Setenv("PEREGRINE_BLOCKLIST_PATH", "/blocklist.txt")
+	t.Setenv("PEREGRINE_KN_RAW_MIX", "0.25")
 
 	got := DeferredSet()
 	if len(got) != 2 {
@@ -285,7 +292,7 @@ func TestDeferredSet(t *testing.T) {
 	}
 	// Sorted, so the log line is stable rather than reordering per run on Go's
 	// randomized map iteration.
-	if got[0] != "PEREGRINE_BLOCKLIST_PATH (M5)" || got[1] != "PEREGRINE_TOP_K (M7)" {
+	if got[0] != "PEREGRINE_KN_RAW_MIX (M7)" || got[1] != "PEREGRINE_TOP_K (M7)" {
 		t.Errorf("DeferredSet = %v, want sorted entries carrying their milestone", got)
 	}
 }

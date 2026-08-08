@@ -19,24 +19,36 @@ This bot's threat model assumes users are actively hostile and are trying to mak
 - **Republishing:** getting the bot to post attacker-supplied media under its own name.
 - Token or credential exposure, container escape, and anything that lets a non-operator run maintenance modes or read the corpus.
 
-## Known and accepted, as of milestone 0
+## Known and accepted, as of milestone 5
 
-The repository is mid-restructure and some of the model above is specified but not yet implemented. These are tracked, not secret, and are not useful as reports:
+The repository is mid-restructure and some of the model above is specified but not yet implemented. These are tracked, not secret, and are not useful as reports.
 
-- **The safety gate is not in yet (M5).** Moderation is bypassable today: the historical backfill path learns messages the live filter blocked, unfiltered, minutes later (`SPEC.md` §4 A1). The illegal-content pattern list is also still a placeholder (A4).
-- **There is no outbound content gate yet (A2).** Anything in the corpus can be emitted verbatim.
-- **Nothing suppresses mentions yet (finding 8).** Replies ping the replied-to author.
-- **Author-diversity eligibility is not in yet (M7).** Repetition alone still teaches the bot.
+**Closed in M5:**
 
-Do not deploy this to a hostile channel before M5. This is enforced rather than merely advised: the CI deploy steps are gated on a `DEPLOY_ENABLED` repository variable that is deliberately unset, so merges to `main` build and push an image but do not start the bot. Set it to `true` only once the safety gate is in.
+- The backfill bypass (`SPEC.md` §4 A1). `CheckLearn` is inside `learnMessage`, so all four callers and any fifth are covered by construction, and a test parses the package to fail if that call ever moves to the call sites.
+- The absent outbound gate (A2). `CheckEmit` runs at the generation exit; a rejection produces silence, not a fallback.
+- Laundering on the learning path (A5). The verdict type has no field for rewritten text, so it cannot be expressed.
+- Normalizer evasion (A5). Matching happens on a case-folded, NFKD-decomposed form with combining marks and format characters stripped, confusables and leet folded, whitespace collapsed, spaced single-letter runs joined and repeats capped.
+
+**Still open, and worth reporting only if you find a bypass rather than restating these:**
+
+- **`CheckEmit` covers the generation exit, not all thirteen send sites.** M10 moves it into `internal/discordguard` so coverage is structural.
+- **Nothing suppresses mentions (finding 8).** Replies ping the replied-to author, and a learned user mention pings that person forever.
+- **Author-diversity eligibility is not in (A6, M7).** Repetition alone still teaches the bot, so poisoning is still cheap.
+- **The illegal-content pattern content is the operator's (A4).** The mechanism and the alerting path exist; the patterns are deliberately not in this repository, and a deployment with no `illegal` rules is warned about at startup rather than silently accepted.
+- **Image reposting is still an unattributed republishing channel (A7, M11).** No per-author cap and no deleted-message rule yet.
+
+Do not deploy this to a hostile channel yet. This is enforced rather than merely advised: the CI deploy steps are gated on a `DEPLOY_ENABLED` repository variable that is deliberately unset, so merges to `main` build and push an image but do not start the bot. The remaining blockers for flipping it are mention suppression (M10) and author diversity (M7).
 
 ## Operator controls
 
 If the bot is actively saying something harmful:
 
-1. Set `PEREGRINE_PAUSE_ALL_WRITES=1` in `.env` on the host and restart the container. This refuses every outbound message process-wide while leaving reads alone.
-2. Add the offending pattern to `blocklist.txt` and restart. The blocklist is a mounted file precisely so this needs no rebuild and no deploy.
+1. Set `PEREGRINE_PAUSE_ALL_WRITES=1` in `.env` on the host and restart the container. This refuses every outbound message process-wide while leaving reading and learning alone: during an incident the output is the problem, and stopping ingestion would also stop the bot noticing what is being said to it. It logs the fact at startup, so a silent bot is never a mystery.
+2. Add the offending pattern to `blocklist.txt` and restart. The blocklist is a mounted file precisely so this needs no rebuild and no deploy. Write the pattern in its **plain** form: matching happens against a normalized version of the text, so you do not need to enumerate leet spellings, spacing tricks or homoglyphs, and the loader reports every bad line with its line number rather than failing on the first.
 3. Use `-clean-db` to remove the learned content, and a per-author purge (M6) to remove one actor's contributions without discarding the corpus.
+
+A pattern added in step 2 takes effect on **both** directions: it stops the phrase being learned again and stops it being emitted. Adding it does not remove what is already in the corpus, which is what step 3 is for.
 
 The pause lever currently requires SSH and a restart, which is slow during exactly the incident it exists for. A Discord-reachable equivalent is an open decision (`SPEC.md` §10).
 

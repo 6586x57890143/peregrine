@@ -39,6 +39,7 @@ import (
 	"github.com/6586x57890143/peregrine/clustering"
 	"github.com/6586x57890143/peregrine/internal/config"
 	"github.com/6586x57890143/peregrine/internal/core"
+	"github.com/6586x57890143/peregrine/internal/safety"
 	"github.com/6586x57890143/peregrine/internal/text"
 	"github.com/6586x57890143/peregrine/voicenotes"
 	"github.com/6586x57890143/peregrine/wordgames"
@@ -164,6 +165,32 @@ type WeeklyStat struct {
 var db *bbolt.DB
 var dg *discordgo.Session
 var dispatcher *core.Dispatcher
+
+// gate is the safety gate. Assigned by Service.Init and never nil afterwards,
+// because cmd/bot treats a failed blocklist load as fatal: an empty ruleset is
+// indistinguishable from a working one right up until the bot posts something the
+// operator has to answer for.
+var gate *safety.Gate
+
+// botMentionPattern strips the bot's own mention from a message before learning it,
+// so the corpus does not fill with the bot's user ID.
+//
+// Cached because it used to be regexp.MustCompile'd inside learnMessage, which
+// means once per message per caller, with botID interpolated into the pattern every
+// time (SPEC.md section 8, finding 16). botID is fixed for the life of the process,
+// so one compile is enough.
+var (
+	botMentionOnce  sync.Once
+	botMentionCache *regexp.Regexp
+)
+
+func botMentionPattern(botID string) *regexp.Regexp {
+	botMentionOnce.Do(func() {
+		botMentionCache = regexp.MustCompile(fmt.Sprintf(`(?i)<@!?%s>|@peregrine`, regexp.QuoteMeta(botID)))
+	})
+	return botMentionCache
+}
+
 var botID string
 
 var transcriptionQueue chan TranscriptionJob // A queue for voice transcription jobs
@@ -324,6 +351,7 @@ func (s *Service) Init(deps core.Deps) error {
 	cfg = deps.Config
 	db = deps.Store
 	dispatcher = deps.Dispatcher
+	gate = deps.Gate
 	dg = deps.Session
 
 	lastWordGameTime = time.Now() // Initialize with current time on startup
@@ -978,13 +1006,32 @@ func getNextMap(prefix string) (map[string]int, error) {
 
 // learnMessage ingests and learns from a single message.
 func learnMessage(tx *bbolt.Tx, msg, msgID, botID string, author MentionedUser, mentionedUsers []MentionedUser) error {
-	// ... (message cleaning logic is the same)
-	msg = regexp.MustCompile(fmt.Sprintf(`(?i)<@!?%s>|@peregrine`, botID)).ReplaceAllString(msg, "")
+	msg = botMentionPattern(botID).ReplaceAllString(msg, "")
 	msg = strings.TrimSpace(msg)
 	if msg == "" {
 		return nil
 	}
-	if isSpammyContent(msg) {
+
+	// THE LEARNING GATE. This is inside learnMessage, not at any of its callers,
+	// and that placement is the whole point.
+	//
+	// This function has four callers and until M5 only ONE of them filtered: the
+	// live message handler. The historical backfill, self-learning and voice
+	// transcripts all passed content straight through. Since the backfill re-read
+	// the trailing 24 hours every ten minutes, a message the live path blocked was
+	// learned anyway, unfiltered, minutes later, which defeated the live filter
+	// entirely. That was the highest-value finding in the review (SPEC.md section 4,
+	// A1).
+	//
+	// A check at one of four call sites is not a check. Here, a fifth caller is
+	// covered without anyone remembering to cover it, which is the difference
+	// between fixing a bug and making it unwritable. Do not hoist this to the call
+	// sites for performance: the normalizer is cheap and the corpus is forever.
+	//
+	// The verdict is to DROP THE MESSAGE WHOLE. Never launder: a rewritten message
+	// is still learned, with its structure intact and a harmless token in the
+	// offending word's grammatical position.
+	if v := gate.CheckLearn(msg); !v.Allowed {
 		return nil
 	}
 
@@ -2259,10 +2306,30 @@ func generateSentenceWithContext(s *discordgo.Session, prompt string, isRoast bo
 	isAboutName := len(recognizedNames) > 0
 	final = applyEdgyStyle(final, isAboutName)
 
-	// Check if the generated output is spammy before returning.
-	if isSpammyContent(final) {
-		log.Printf("[FILTER] Generated message was blocked as spam: %q", final)
-		return "", nil // Return an empty string to prevent sending.
+	// THE EMIT GATE.
+	//
+	// This is not redundant with the learning gate, and that is the architectural
+	// point rather than caution. A Markov chain composes novel sequences from
+	// n-grams that were learned separately, so fragments which were each innocuous
+	// can join into something the operator has to answer for. No amount of input
+	// filtering prevents that: input filtering lowers the rate, only an output gate
+	// bounds the result (SPEC.md section 4, A3). Removing either gate because the
+	// other exists would be wrong.
+	//
+	// Until M5 the only check here tested length, character repetition and character
+	// class. There was no slur check and no illegal-content check on output at all,
+	// so anything in the corpus could come back out verbatim (A2).
+	//
+	// On rejection the bot RETURNS EMPTY AND STAYS SILENT rather than substituting a
+	// fallback. Silence is always safe; a fallback is a new output that has to be
+	// reasoned about, and in a bot that already replies selectively an unexplained
+	// silence is indistinguishable from it choosing not to answer.
+	//
+	// This sits at the single exit from generation, which covers it for now. M10
+	// moves it into internal/discordguard so that all thirteen send sites are
+	// covered structurally rather than this one being the only path that generates.
+	if v := gate.CheckEmit(final); !v.Allowed {
+		return "", nil
 	}
 
 	return final, nil
@@ -2507,17 +2574,30 @@ func handleMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 	start := time.Now()
 	log.Printf("[MSG] from %s: %q", m.Author.Username, m.Content)
 
-	// CRITICAL: Block spam and illegal content first.
-	if isSpammyContent(m.Content) {
-		log.Printf("[FILTER] Spammy message from %s blocked, no processing will occur.", m.Author.Username)
-		return // Silently drop the message.
-	}
-	if filterIllegalContent(m.Content) {
+	// Reject early, so the bot neither replies to nor reacts to a message it will
+	// not learn from either. This is a convenience, not the protection: the
+	// protection is CheckLearn inside learnMessage, which every path reaches. If
+	// this block were deleted the corpus would still be safe; the bot would just
+	// waste work replying to spam.
+	if v := gate.CheckLearn(m.Content); !v.Allowed {
+		log.Printf("[FILTER] Message from %s dropped, no processing will occur: %s", m.Author.Username, v.Reason)
 		return
 	}
 
-	// Apply the slur filter (replacement).
-	m.Content = filterSlurs(m.Content)
+	// There used to be a `m.Content = filterSlurs(m.Content)` here, and removing it
+	// is load-bearing rather than tidying.
+	//
+	// It replaced matches in place, which had two effects. The message was learned
+	// anyway, with its structure intact and a harmless token sitting in the slur's
+	// grammatical position, so the bot had been taught the sentence and merely said
+	// "ninja" where the slur went (SPEC.md section 4, A5). And now that CheckLearn
+	// exists, laundering here would be strictly worse than useless: the gate would
+	// receive the already-cleaned text, find nothing, and allow it. The launder
+	// would defeat the gate.
+	//
+	// The verdict on the learning path is to drop the whole message, and it is made
+	// above and again inside learnMessage. Replacement remains available in
+	// internal/filter for display paths that want it; nothing on this path does.
 
 	// Add message to conversation memory
 	globalConvMemory.AddMessage(m.Content)

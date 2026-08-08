@@ -45,6 +45,18 @@ type Config struct {
 	DBPath     string // PEREGRINE_DB_PATH
 	MaxHistory int    // PEREGRINE_MAX_HISTORY
 
+	// Safety. BlocklistPath is validated here only as a string; the file itself is
+	// loaded in cmd/bot, where a failure is fatal. It is deliberately allowed to be
+	// empty, because a developer running against a scratch corpus should not need to
+	// invent a slur list first, and the built-in baseline in internal/filter still
+	// applies. An empty value logs a prominent warning rather than passing silently.
+	BlocklistPath string // PEREGRINE_BLOCKLIST_PATH
+
+	// PauseAllWrites refuses every outbound message process-wide while leaving
+	// reading and learning alone. The host-level lever for when the bot is actively
+	// saying something awful and waiting for a deploy is not acceptable.
+	PauseAllWrites bool // PEREGRINE_PAUSE_ALL_WRITES
+
 	// Generation.
 	MaxNGram             int     // PEREGRINE_MAX_NGRAM
 	PromptRelevanceBoost float64 // PEREGRINE_PROMPT_RELEVANCE_BOOST
@@ -121,8 +133,6 @@ var deferredVars = map[string]string{
 	"PEREGRINE_BACKUP_DIR":                 "M13",
 	"PEREGRINE_BACKUP_TICK":                "M13",
 	"PEREGRINE_BACKUP_KEEP":                "M13",
-	"PEREGRINE_BLOCKLIST_PATH":             "M5",
-	"PEREGRINE_PAUSE_ALL_WRITES":           "M5",
 	"PEREGRINE_MIN_DISTINCT_AUTHORS":       "M7",
 	"PEREGRINE_TEMPERATURE":                "M7",
 	"PEREGRINE_TOP_K":                      "M7",
@@ -163,6 +173,9 @@ func Load() (*Config, error) {
 		// bbolt.Open fails.
 		DBPath:     l.str("PEREGRINE_DB_PATH", "markov.db"),
 		MaxHistory: l.intVal("PEREGRINE_MAX_HISTORY", 10000, 100, 10_000_000),
+
+		BlocklistPath:  l.str("PEREGRINE_BLOCKLIST_PATH", ""),
+		PauseAllWrites: l.boolVal("PEREGRINE_PAUSE_ALL_WRITES", false),
 
 		// Minimum 2. Order 1 makes the prefix empty, and an empty prefix is one
 		// bbolt key holding a map of the entire vocabulary, rewritten once per
