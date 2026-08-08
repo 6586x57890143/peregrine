@@ -28,7 +28,7 @@ The repository is mid-restructure and some of the model above is specified but n
 - **Nothing suppresses mentions yet (finding 8).** Replies ping the replied-to author.
 - **Author-diversity eligibility is not in yet (M7).** Repetition alone still teaches the bot.
 
-Do not deploy this to a hostile channel before M5. `README.md` says the same thing.
+Do not deploy this to a hostile channel before M5. This is enforced rather than merely advised: the CI deploy steps are gated on a `DEPLOY_ENABLED` repository variable that is deliberately unset, so merges to `main` build and push an image but do not start the bot. Set it to `true` only once the safety gate is in.
 
 ## Operator controls
 
