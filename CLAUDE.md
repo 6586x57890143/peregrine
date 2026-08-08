@@ -57,6 +57,36 @@ Logging is bridged rather than converted. `cmd/bot` calls `slog.SetDefault`, whi
 
 `stopSignal` is still the internal shutdown broadcast, because a dozen functions take it as a `<-chan struct{}` parameter. `Run` waits on `ctx.Done()` and then closes it, which is what translates the one cancellation `cmd/bot` owns into the one every goroutine selects on. M3 replaces both with a real lifecycle.
 
+### Lifecycle: what starts, in what order, and what stops first
+
+`cmd/bot` owns the process: config, logger, corpus, session, dispatcher, registry, shutdown. `internal/core` owns the mechanisms. Nothing in `core` imports a feature package and nothing may: services import `core`, and registration happens only in `cmd/bot`.
+
+**Startup order is not arbitrary.** Open the corpus, build the session, `registry.InitAll()`, arm `WatchReady`, `session.Open()`, wait for READY, start the dispatcher, `registry.StartAll()`. Two of those placements are load-bearing:
+
+- `WatchReady` **must be armed before `Open`**, because discordgo starts dispatching inside `Open` and a handler registered afterwards can lose the race with READY, which would fail startup on a healthy connection.
+- Gateway handlers are registered in `Init`, not `Start`, because `Open` happens between them. Registering in `Start` drops every message that arrived in that window.
+
+`Open` returning nil means the identify was *sent*, never that Discord accepted it. A rejected identify (close code 4014, a privileged intent the app was not granted) leaves discordgo reconnecting in a loop forever while startup logs success, so the process looks healthy, holds no connection, and learns nothing. `core.WatchReady` turns that into a startup error naming the Developer Portal checkbox.
+
+**Shutdown order is reverse-of-dependency and each step is there because the old code got it wrong:**
+
+```
+1. session.Close()        first, to stop the inflow
+2. dispatcher.Shutdown()  drain work already accepted
+3. registry.ShutdownAll() reverse start order; loops stop and are waited for
+4. store.Close()          via defer in cmd/bot, strictly last
+```
+
+One 8-second budget covers steps 2 and 3 together, deliberately under Docker's 10 seconds between SIGTERM and SIGKILL, because giving each step its own timeout would let them add past it.
+
+**Nothing outside `core` spawns a goroutine per event.** `core.Dispatcher` is a bounded pool reading a buffered channel. `Submit` never blocks: discordgo dispatches every event on its own goroutine, so blocking would grow goroutines without bound and turn a slow corpus into unbounded memory. A full queue drops and counts, and the count is reported. Every `wg.Add` in the dispatcher happens in `Start`, which is what makes the old crash impossible rather than unlikely: the previous handler called `wg.Add` on the WaitGroup the shutdown path waited on, and an `Add` racing a `Wait` at zero panics.
+
+**Background work goes through `core.RunLoop`, not a hand-rolled ticker.** There were nine near-identical copies, each selecting on a shared `stopSignal`, and a panic in any of them killed the process. Each iteration is now panic-isolated, because every one of those loops is an optional behavior.
+
+`stopSignal` and the package-level `wg` are **gone**. Cancellation is a `context.Context` parameter; do not reintroduce a package-level stop channel.
+
+**There is no shared `*rand.Rand`.** There was one, seeded in `main` and called from every message goroutine, which is a data race on the hot path. `math/rand/v2`'s top-level functions are goroutine-safe and auto-seeded, so the fix is to have no shared generator rather than to lock one. Use `rand.Float64()` and `rand.IntN()`; do not add a `*rand.Rand` back for seeding convenience.
+
 ### Configuration is environment variables, validated once, all at once
 
 `internal/config` turns the environment into one `*Config` that `cmd/bot` hands to `legacy.Run`. There is no `config.yaml` and there should not be: merlin needs one because its settings are per guild and edited live from Discord, whereas peregrine's are per process and change on a deploy, which is what an env var already models.
@@ -111,7 +141,7 @@ Read `SPEC.md` §5 for the full specification. The parts most worth knowing befo
 
 **Length is tuned short on purpose.** The old bound was `30 + rand(15)` words, which is a paragraph. Short and punchy reads as a joke; long reads as a malfunction.
 
-**Custom emote output has never worked.** The `:shortcode:` resolver walks `s.State.Guilds`, but the session never requests `IntentsGuilds`, so that slice is always empty and the resolver has never once succeeded. In a meme server the server's own emotes are most of the register, so this is an engagement bug before it is a performance bug. The same missing intent forces the NSFW check into a REST call on every single message.
+**Custom emote output had never worked, and M3 fixed the cause.** The `:shortcode:` resolver walks `s.State.Guilds`, and the session never requested `IntentsGuilds`, so that slice was always empty and the resolver had never once succeeded. In a meme server the server's own emotes are most of the register, so this was an engagement bug before it was a performance bug. `core.NewSession` now requests the intent. The state cache it populates is what M10 uses to replace the per-message REST `s.Channel` call for the NSFW check; that call site is still REST today. Emote-bearing output is worth a golden-sample check in M7 now that it is possible at all.
 
 ## Safety model
 

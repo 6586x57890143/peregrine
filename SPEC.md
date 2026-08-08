@@ -242,9 +242,31 @@ These are the product. None are stripped. Each becomes a plugin with its bugs fi
 
 ## 7. Lifecycle
 
-The per-message handler calls `wg.Add(1)` on the same WaitGroup the shutdown path waits on, which panics when an `Add` races a `Wait` at zero, and lets handlers keep using the database after it closes.
+**Shipped in M3.** What follows is the shape as built; the bugs it replaced are recorded because the shape is only defensible against them.
 
-M1 changed only the outer edge of this. There is now exactly one `context.Context`: `cmd/bot` owns a `signal.NotifyContext`, and `legacy.Run` waits on `ctx.Done()` and then closes `stopSignal`, which stays the internal broadcast because roughly a dozen functions take it as a `<-chan struct{}` parameter. So cancellation has a single source and a test can drive a shutdown without a signal, but the race, the unbounded fan-out and the wrong close order are all still exactly as described below. M3 is what actually fixes them.
+The per-message handler called `wg.Add(1)` on the same WaitGroup the shutdown path waited on, which panics when an `Add` races a `Wait` at zero, and let handlers keep using the database after it closed. `main()` launched nine background goroutines, six of them hand-rolled tickers, each selecting on a package-level `stopSignal` channel, and a panic in any of them killed the process. One shared `*rand.Rand` was called from all of them and from every message goroutine.
+
+`core.Dispatcher` owns a bounded worker pool reading a buffered channel. The gateway handler rejects bots and enqueues non-blocking. Non-blocking is deliberate: discordgo dispatches each event on its own goroutine, so blocking would grow goroutines without bound, and dropping with a counter is the honest semantics for best-effort chat. The drop count is reported on shutdown and surfaces in the status line.
+
+**The queue is never closed**, because closing it would let an in-flight enqueue panic on send. Shutdown sets a flag, drains until empty or a deadline, cancels the workers' own context, then waits on a WaitGroup that is only ever `Add`ed during `Start`, so the race cannot recur by construction. The dispatcher owns that cancel rather than relying on the context passed to `Start`: a `Shutdown` that could only wait for someone else to cancel would block for its entire deadline every time, which is exactly what it did in the first draft and what its tests caught.
+
+`core.RunLoop` replaces the tickers, which become a table of `core.Loop` values that reads as a list of behaviors. Each iteration is panic-isolated, because every one of those loops is an optional behavior and this bot's rule is that one feature failing disables that feature and nothing else. `Immediate` preserves the real distinction the copies made by hand and inconsistently: the status line, the backfill and the clustering pass are wanted at startup, whereas a leaderboard reset check on a fresh process is pure noise. A non-positive interval is refused with a log line naming the loop rather than panicking inside `time.NewTicker`.
+
+There is no shared `*rand.Rand`. `math/rand/v2`'s top-level functions are goroutine-safe and auto-seeded, so the fix was to have no shared generator rather than to put a mutex around one.
+
+Shutdown order, which differed from the old code in four ways:
+
+```
+1. session.Close()        first, not last: stop the inflow before draining
+2. dispatcher.Shutdown()  bounded drain
+3. registry.ShutdownAll() reverse start order; loops stop and are waited for
+4. store.Close()          explicit and last, via cmd/bot, not a bare defer
+                          racing the per-message goroutines
+```
+
+The final leaderboard save is the legacy service's `Shutdown`, so it lands inside step 3 and therefore strictly before the store closes. One 8-second budget covers steps 2 and 3 together, deliberately under Docker's 10 seconds between SIGTERM and SIGKILL: separate timeouts per step could add past it, and the corpus being closed by SIGKILL rather than by us is the outcome worth engineering against.
+
+Startup order has two placements that are load-bearing rather than stylistic. `WatchReady` is armed **before** `Open`, because discordgo starts dispatching inside `Open` and a handler registered after it can lose the race with READY, failing startup on a healthy connection. Gateway handlers are registered in `Init` rather than `Start`, because `Open` happens between them and registering in `Start` drops every message from that window.
 
 Target: `core.Dispatcher` owns a bounded worker pool reading a buffered channel. The gateway handler does nothing but reject bots, snapshot the event into an immutable value (which also stops it mutating discordgo's struct) and enqueue non-blocking. Non-blocking is deliberate: discordgo dispatches each event on its own goroutine, so blocking would grow goroutines without bound, and dropping with a counter is the honest semantics for best-effort chat. The drop count surfaces in the status line so a persistently full queue is visible rather than inferred.
 
@@ -272,14 +294,14 @@ Verified against the source. Ranked by consequence. Numbers are referenced from 
 
 1. Nested bbolt transactions in the generation path can deadlock the process unrecoverably, and the odds rise as the file grows. §3.
 2. The vocabulary interner writes a global map and appends a global slice from every per-message goroutine. A concurrent map write is a Go `fatal error`: no recover, no unwind, process gone. Also an unbounded leak, never pruned.
-3. One `*rand.Rand` shared across every message worker, the aggro ticker, autonomous posting and image reposting. Not goroutine-safe.
-4. The shutdown WaitGroup race in §7.
+3. ~~One `*rand.Rand` shared across every message worker, the aggro ticker, autonomous posting and image reposting. Not goroutine-safe.~~ **Fixed in M3:** there is no shared generator at all now, `math/rand/v2` top-level functions being goroutine-safe and auto-seeded.
+4. ~~The shutdown WaitGroup race in §7.~~ **Fixed in M3.**
 
 **Correctness**
 
 5. The empty-prefix unigram key. §3.1.
 6. Self-learning stores the bot's reply under the *user's* message ID, and the user's message under the same ID, both gated by the same dedup check, so whichever transaction commits first makes the other a no-op and which one wins is a race.
-7. `IntentsGuilds` missing. §6.
+7. `IntentsGuilds` missing. §6. **Half fixed in M3:** the intent is requested, so custom emote output is possible for the first time. The per-message REST `s.Channel` call for the NSFW check still exists and becomes an `s.State.Channel` lookup in M10.
 8. Nothing suppresses mentions, so the replied-to author is pinged on every interaction, and learned user mentions ping forever.
 9. The leaderboard command has no feature guard and no `return`, so it fires while word games are off and falls through into the rest of the handler. The reactor `handled` contract in §2 makes this shape impossible rather than fixed once.
 10. History eviction removes the lexicographically smallest snowflake, and snowflakes are variable-length decimal strings, so a 17-digit ID is evicted before an 18-digit one regardless of age.
@@ -319,7 +341,7 @@ Small, mergeable PRs. `go build ./...`, `go vet ./...`, `golangci-lint run`, `go
 | 0 | Repo hygiene, docs, full CI/CD | `.gitignore` before `git init`; `.dockerignore`; module path; `go mod tidy`; the six punctuation fixes; rune-safe truncation; embedded dictionary; `PEREGRINE_DB_PATH`; `bbolt.Open` timeout; lint green from day one; Dockerfile, both compose files, `.env.example`, `blocklist.example.txt`; `ci.yml` with all six jobs; dependabot; docs; delete `copilot-instructions.md` | **done** |
 | 1 | `cmd/bot` and `internal/legacy` | Verbatim move, `main()` becomes `Run(ctx)`, `performDatabaseCleanup` becomes `CleanDatabase() error`, merlin's `main`/`runGuarded`/`run` split, `slog` bridged over the stdlib `log`, `godotenv`, `signal.NotifyContext`, no `os.Exit` left in `legacy`, Dockerfile builds `./cmd/bot` | **done** |
 | 2 | `internal/config` | Every constant and hardcoded value becomes an env var defaulting to today's value; the two dead knobs deleted and `Creativity` deliberately left a constant (§5.3); the hardcoded admin user ID becomes a fail-closed variable; every error reported in one pass; a bad bool or enum is a startup error rather than a silent default; autonomous-post misconfiguration names both variables; the autonomous-post ticker split off the ingest ticker; deferred-variable warnings; 92% covered | **done** |
-| 3 | `internal/core` lifecycle | `Service`/`Registry`/`Deps` and `WatchReady` ported; `IntentsGuilds` added; bounded `Dispatcher`; `RunLoop`; ordered shutdown; `ctx` throughout. Closes 3, 4, 7 | |
+| 3 | `internal/core` lifecycle | `Service`/`Registry`/`Deps` and `WatchReady` ported; `IntentsGuilds` added, which makes custom emote output possible for the first time; bounded `Dispatcher` with drop accounting; `RunLoop` replacing nine background goroutines; ordered shutdown under one 8s budget; `stopSignal` and the shared WaitGroup deleted in favour of `ctx`; `math/rand/v2` replacing the shared generator; `core` at 94% coverage. Closes 3, 4, and the intent half of 7 | **done** |
 | 4 | `internal/text` and `internal/filter` | Pure moves, regexes hoisted, slur list becomes an ordered slice, per-call interner replaces the global. Closes 2, 16, 22 | |
 | 5 | `internal/safety` | Normalizer, blocklist as data, `CheckLearn` inside `learnMessage`, `CheckEmit` at the generation exit, reject-not-launder, `PAUSE_ALL_WRITES`, rejection logging. Closes A1, A2, A4, A5. **Highest-value row** | |
 | 6 | `internal/corpus` and `internal/storage` | Composite-key codecs; the three KN indexes; distinct-author counts; `schema_version`; `Reader`/`Writer` seam; timestamp-only history; counter-based chronological trims; per-author purge; `dbtest`; `maintenance`. Closes 1, 5, 10, 11, 18 | |

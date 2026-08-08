@@ -8,7 +8,9 @@ Sibling project to [merlin](../merlin), whose deployment conventions this repo f
 
 Mid-restructure. The bot works and runs, but it is being taken from a single 3,200-line `main.go` to a proper package layout one subsystem at a time, with a catalogue of known defects being closed along the way. See `SPEC.md` §8 for the defect list and §9 for the milestone order.
 
-**Milestones 0 (repo hygiene, docs, CI/CD), 1 (the `cmd/bot` entrypoint) and 2 (`internal/config`) are complete.** The entrypoint and the configuration are real; the code behind them is not yet. Everything except startup, shutdown and configuration still sits unchanged in `internal/legacy`, which each later milestone empties one subsystem at a time.
+**Milestones 0 (repo hygiene, docs, CI/CD), 1 (the `cmd/bot` entrypoint), 2 (`internal/config`) and 3 (`internal/core` lifecycle) are complete.** The entrypoint, the configuration and the process lifecycle are real; the bot's actual behavior is not yet. Everything else still sits unchanged in `internal/legacy`, which each later milestone empties one subsystem at a time.
+
+M3 closed the two crash bugs: the shutdown WaitGroup race that could panic the process on exit, and the `*rand.Rand` shared across every message goroutine. It also added the `GUILDS` intent, which means the bot can use the server's own custom emotes for the first time; that resolver had never once succeeded.
 
 Two things worth knowing before running it anywhere real:
 
@@ -22,7 +24,9 @@ cp .env.example .env          # set DISCORD_BOT_TOKEN
 go run ./cmd/bot
 ```
 
-In the Discord Developer Portal the application needs the **Message Content** privileged intent ticked, under Bot. Without it Discord refuses the connection and the bot cannot read the messages it exists to learn from.
+In the Discord Developer Portal the application needs the **Message Content** privileged intent ticked, under Bot. Without it Discord refuses the connection and the bot cannot read the messages it exists to learn from. Since M3 that refusal is a startup error naming the checkbox, rather than a process that connects to nothing and looks healthy while doing so.
+
+The other two intents, `GUILDS` and `GUILD_MESSAGES`, are not privileged and need no portal toggle.
 
 Invite scopes: `bot`. Permissions: View Channels, Read Message History, Send Messages, Send Messages in Threads, Add Reactions, and Manage Messages (used to clean up its own word-game messages).
 
