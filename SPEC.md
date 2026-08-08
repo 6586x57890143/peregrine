@@ -46,7 +46,7 @@ Seams follow merlin's dominant pattern: **each consumer declares the minimal int
 Import rules, stated because each has already nearly been violated:
 
 - `corpus` and `text` stay leaves. `corpus` holds type declarations and nothing else.
-- `clustering` currently points the wrong way: `main.go` aliases *its* bucket-name constants, so the algorithm package owns storage-layer names. All bucket names move into `storage` unexported, and `clustering` needs none, because it stops touching a database.
+- `clustering` used to point the wrong way: `legacy` aliased *its* bucket-name constants, so the algorithm package owned storage-layer names. **Fixed in M6b:** every bucket name is unexported inside `storage`, and `clustering` has no callers at all until M8 rewrites it as a pure function. Its package comment says so, so nobody mistakes it for live code.
 - `markov` must never import `storage`. Every method on `Corpus`/`Sink` returns a stdlib or `corpus.` type, or the cycle returns.
 - `storage` never imports `config`. `Open` takes a path plus options.
 - `core` never imports `plugins`. Plugins import `core`; registration happens only in `cmd/bot`.
@@ -54,15 +54,26 @@ Import rules, stated because each has already nearly been violated:
 
 **Sequencing.** Everything was `package main`, and two `main` packages cannot share code, so M1 moved the root files verbatim into `internal/legacy` with `main()` renamed to `Run(ctx)`. Every later milestone moves one subsystem *out* of `legacy`, which shrinks monotonically and is deleted in M13. This is the only ordering that keeps `go build ./...` green at every commit while still ending at the target layout.
 
-As shipped in M1:
+As shipped, through M6b:
 
 ```
-cmd/bot/main.go          main, runGuarded, run. Flags, slog, godotenv, signal context
-internal/legacy/         legacy.go (was main.go), filter.go, cleanup.go. Unchanged
-clustering/              still at the root; moves under internal/ in M8
+cmd/bot/main.go          main, runGuarded, run, runMaintenance. Flags, slog, signal context
+internal/config/         live
+internal/core/           live
+internal/text/           live
+internal/filter/         live
+internal/safety/         live
+internal/corpus/         live
+internal/storage/        live: the only package that imports bbolt
+internal/dbtest/         live
+internal/maintenance/    live: -clean-db, -compact, -purge-author
+internal/legacy/         legacy.go only. filter.go and cleanup.go deleted in M6b
+clustering/              no callers since M6b; rewritten under internal/ in M8
 wordgames/               still at the root; moves under internal/ in M11
 voicenotes/              still at the root; moves under internal/ in M12
 ```
+
+`internal/legacy` is one file as of M6b: `cleanup.go` was replaced by `internal/maintenance`, and `filter.go` went with it, because its last two wrappers existed only for that pass. The linter reporting them unused is how that was confirmed rather than assumed, which is the same way M5's two wrappers were retired.
 
 The three root subpackages keep their paths deliberately. Relocating them is a one-line import change with no risk, which is exactly why it should ride along with the milestone that actually rewrites each one, rather than producing a diff that touches them twice.
 
@@ -83,9 +94,9 @@ Properties that shape the design rather than merely inform it:
 
 ### 3.1 The key layout, and why it changes
 
-The current layout stores a JSON `map[string]int` as the *value* of each prefix key. So the key `"the"` holds a map of every word that has ever followed "the", read, decoded, mutated, re-encoded and rewritten in full on **every occurrence of the word "the"**. That is the root performance defect, and it has a pathological special case: the ingestion loop runs the n-gram order down to 1, and at order 1 the prefix slice is empty, so the key is the empty string and **the entire vocabulary accumulates into a single database key**. Nothing reads it: every reader constructs a prefix of at least one word. It is pure write amplification and the dominant reason the corpus reached 128 MiB.
+The layout up to M6 stored a JSON `map[string]int` as the *value* of each prefix key. So the key `"the"` held a map of every word that had ever followed "the", read, decoded, mutated, re-encoded and rewritten in full on **every occurrence of the word "the"**. That was the root performance defect, and it had a pathological special case: the ingestion loop ran the n-gram order down to 1, and at order 1 the prefix slice is empty, so the key was the empty string and **the entire vocabulary accumulated into a single database key**. Nothing read it: every reader constructs a prefix of at least one word. It was pure write amplification and the dominant reason the corpus reached 128 MiB.
 
-As shipped in M6a:
+As shipped in M6a and in use by the bot since M6b:
 
 ```
 bucket "ngram"       key = <prefix> 0x00 <next>              value = count u64 | authors u32
@@ -98,7 +109,7 @@ splitting them would double the reads on the hot path.
 
 `0x00` is a safe separator because the tokenizer can only emit URLs, mentions, emotes, shortcodes and runs of letters, digits, symbols and apostrophes, none of which contain a NUL. The codec asserts this and returns an error rather than writing an ambiguous key. `0x00` also sorts below space, so a seek on `"the\x00"` cannot wander into `"the cat\x00..."`. `IncSuccessor` becomes one 8-byte get, an add and one 8-byte put: constant work, no decode, no whole-map rewrite. The ingestion loop starts at order 2, so the empty prefix cannot be produced, and `PEREGRINE_MAX_NGRAM` validates a minimum of 2. Unigram frequency already lives correctly in the `topics` bucket, one key per word.
 
-`TopicWordBucket` and `NameTopicBucket` get the same treatment (`word 0x00 assoc` to a 16-byte `{count, posSum}`), because they share the shape and are the real cost behind finding 12.
+The two association indexes get the same treatment (`word 0x00 assoc` to a 16-byte `{count, posSum}`), because they share the shape and are the real cost behind finding 12. There were three of them before M6b; `TopicClusterBucket` is gone, because it recorded the same word pairs as `topic_word` with the direction and the position discarded (finding 28).
 
 ### 3.2 Kneser-Ney indexes
 
@@ -118,7 +129,11 @@ Each markov key carries a distinct-author count alongside its frequency, maintai
 
 ### 3.4 Migration
 
-There is none, and that is a decision rather than an omission. Every markov key changes shape, so the existing corpus is not readable under the new layout. Production starts empty on a named volume; the corpus is re-derivable from Discord history. Two guards keep the abandonment explicit rather than silent: a `schema_version` key in `ConfigBucket`, and `Open` deleting any stray empty-prefix markov key while logging the bytes reclaimed, which rescues a local development database and turns "the mystery 128 MiB" into a log line.
+There is none, and that is a decision rather than an omission. Every n-gram key changes shape, so the existing corpus is not readable under the new layout. Production starts empty on a named volume; the corpus is re-derivable from Discord history.
+
+The abandonment is explicit rather than silent. `storage.Open` reads a `schema_version` key from the `meta` bucket and distinguishes three cases: the key is present and current, so proceed; the key is absent and no bucket holds data, so stamp it, which is a new file; the key is absent but data exists, so **refuse**, with an error saying to remove the corpus and let it relearn. The third case checks the pre-M6 bucket names too, so an old corpus is recognised as old rather than mistaken for empty and stamped as current.
+
+Refusing rather than salvaging is deliberate. An earlier draft of this section proposed deleting the stray empty-prefix key on open and logging the bytes reclaimed, to rescue a local development database. That is worse than it sounds: it makes the pre-M6 file *open successfully* while every other key in it is still unreadable, so the bot starts, appears healthy, and learns from scratch beside a corpus it silently ignores. A refusal with an instruction is the honest outcome. Deploying M6b therefore requires `docker volume rm peregrine_corpus` once.
 
 Starting fresh is also a **safety** win, not only a schema convenience: per §4 A1 the unfiltered path has been the main ingestion route all along, so the existing corpus is poisoned to an unknown degree.
 
@@ -299,24 +314,24 @@ Verified against the source. Ranked by consequence. Numbers are referenced from 
 
 **Crashes and hangs**
 
-1. Nested bbolt transactions in the generation path can deadlock the process unrecoverably, and the odds rise as the file grows. §3.
+1. ~~Nested bbolt transactions in the generation path can deadlock the process unrecoverably, and the odds rise as the file grows.~~ **Fixed in M6b, and made unwritable rather than fixed.** M6a built the `Reader`/`Writer` seam; M6b is the commit that puts the bot on it. `internal/legacy` no longer imports bbolt at all, so nothing in it can hold a handle, name a bucket, or start a transaction. The two functions that did the nesting now take the `*storage.Reader` they are already inside: `isRecognizedName`, called once per prompt word, and `getNextMap`, called once per candidate per backoff step per generated word, which was thousands of nested transactions per reply. `TestThisPackageCannotReachBbolt` pins the import, because the import is the exact invariant: without it the API is unreachable. §3.
 2. The vocabulary interner writes a global map and appends a global slice from every per-message goroutine. A concurrent map write is a Go `fatal error`: no recover, no unwind, process gone. Also an unbounded leak, never pruned.
 3. ~~One `*rand.Rand` shared across every message worker, the aggro ticker, autonomous posting and image reposting. Not goroutine-safe.~~ **Fixed in M3:** there is no shared generator at all now, `math/rand/v2` top-level functions being goroutine-safe and auto-seeded.
 4. ~~The shutdown WaitGroup race in §7.~~ **Fixed in M3.**
 
 **Correctness**
 
-5. The empty-prefix unigram key. §3.1.
+5. ~~The empty-prefix unigram key.~~ **Fixed in M6b**, by three independent things rather than one: the ingestion loop descends to order 2 rather than 1, `storage.Writer.LearnNgram` refuses an empty prefix so a new caller cannot reintroduce it, and `PEREGRINE_MAX_NGRAM` validates a minimum of 2. Unigram frequency lives in the topic index, one key per word, which is where it always belonged. §3.1.
 6. Self-learning stores the bot's reply under the *user's* message ID, and the user's message under the same ID, both gated by the same dedup check, so whichever transaction commits first makes the other a no-op and which one wins is a race.
 7. `IntentsGuilds` missing. §6. **Half fixed in M3:** the intent is requested, so custom emote output is possible for the first time. The per-message REST `s.Channel` call for the NSFW check still exists and becomes an `s.State.Channel` lookup in M10.
 8. Nothing suppresses mentions, so the replied-to author is pinged on every interaction, and learned user mentions ping forever.
 9. The leaderboard command has no feature guard and no `return`, so it fires while word games are off and falls through into the rest of the handler. The reactor `handled` contract in §2 makes this shape impossible rather than fixed once.
-10. History eviction removes the lexicographically smallest snowflake, and snowflakes are variable-length decimal strings, so a 17-digit ID is evicted before an 18-digit one regardless of age.
+10. ~~History eviction removes the lexicographically smallest snowflake, and snowflakes are variable-length decimal strings, so a 17-digit ID is evicted before an 18-digit one regardless of age.~~ **Fixed in M6b.** Keys are fixed-width big-endian, so byte order equals numeric order equals chronological order and a cursor's `First()` is genuinely the oldest message. A message ID that is not a snowflake is now an error rather than a key, which is the right answer for a caller that invented one.
 
 **Cost**
 
-11. `Bucket.Stats()` walks every page and was called per message to fill a log field, and sits inside the loop condition of both trim functions, making trimming quadratic in pages.
-12. All-pairs co-occurrence and all-pairs topic pairs, O(n^2), inside the single write transaction.
+11. ~~`Bucket.Stats()` walks every page and was called per message to fill a log field, and sits inside the loop condition of both trim functions, making trimming quadratic in pages.~~ **Fixed in M6b.** Both trims are counter-driven, the per-message log field reads a counter, and the only remaining `Stats()` calls are inside `Reader.Status`, on the status ticker. The reply path's "is there anything in the corpus" check became `Reader.CorpusEmpty`, one cursor `First()`, rather than a page walk over the largest bucket per reply.
+12. All-pairs co-occurrence, O(n^2), inside the single write transaction. **Half addressed in M6b:** the second all-pairs loop, over topic pairs, is gone entirely (finding 28), and each surviving pair is a 16-byte read-add-write on its own key instead of a member of an unbounded JSON map. Still quadratic in message length, and M7's co-occurrence window is the actual fix.
 13. The 10-minute loop rescans the whole trailing 24 hours; dedup is a 10,000-key window, so on a busy guild older messages are evicted and then **re-learned, double-counting n-grams**.
 14. Channel fan-out is unbounded, one goroutine per channel per guild, none visible to the shutdown path. The active-channel scan also pages every channel to count, then the ingest pass pages it again.
 15. Clustering does `DeleteBucket` plus `CreateBucket` every pass, a full destructive rebuild, with timestamp-based IDs so nothing is ever diffable.
@@ -325,7 +340,7 @@ Verified against the source. Ranked by consequence. Numbers are referenced from 
 
 **Hygiene and privacy**
 
-18. The history bucket stored 10,000 users' messages **verbatim** while nothing ever read the value, only the key's existence. Store a timestamp.
+18. ~~The history bucket stored 10,000 users' messages **verbatim** while nothing ever read the value, only the key's existence.~~ **Fixed in M6b.** The value is eight bytes of unix nanoseconds, which answers the one question anyone might actually ask of this bucket, and is the difference between a dedup window and a durable copy of ten thousand people's messages sitting in the operator's database.
 19. A hardcoded Discord user ID was the only authorization check in the codebase.
 20. Word-game dictionary `log.Fatalf`, and CWD-relative paths throughout. **Fixed in M0.**
 21. Voice-note download is a bare `http.Get`: no timeout, no context, no size cap, no status check.
@@ -347,6 +362,14 @@ Verified against the source. Ranked by consequence. Numbers are referenced from 
 
     The codec fix is small, and it is deliberately **not** being done here. Turning this path on for real means a seed branch firing at weight 50.0 inside a scorer that is unnormalized and already collapses toward argmax (section 5.1), with no way to judge the result. It lands in M8, after M7 normalizes the scoring and adds the golden-sample harness that can say whether the clusters actually help. Re-enabling the default is part of M8's row, not M4's.
 
+**Found during M6b**
+
+28. **The topic-cluster index recorded nothing the topic-word index did not.** Both were written from the same place in `learnMessage`, over the same message, under the same `len(canonicalNames) > 0` guard and the same stop-word exclusion. `TopicWordBucket` stored every ordered pair of non-stop-words with a count and a sum of relative positions; `TopicClusterBucket` stored every unordered pair of the same words with a count and nothing else, under a key canonicalised as `min|max`. So the second index was the first one with the direction and the position thrown away, and its three consumers, two tiers of seed selection and nothing else, were asking a question the topic-word index could already answer.
+
+    Removed in M6b rather than ported, so the composite-key layout has one co-occurrence index instead of two that can disagree. The seed tiers that read it keep their weights and now read the name-topic and topic-word indexes: `NameTopicsFor` for the name-cluster tier, `TopicWordsFor` for the topic-cluster tier. The `|` separator is worth a note on its way out: it was a literal character inside the key, so a word containing a pipe produced a key that split into three parts and was silently skipped by every reader. The new layout separates with NUL, which the tokenizer provably cannot emit and which the codec asserts anyway.
+
+    Worth recording as a general shape rather than a one-off: two indexes written from the same loop, from the same data, differing only in what one of them discards, is a duplicate however different the two readers look.
+
 Plus, folded into the milestones that touch them: byte-based nickname truncation splitting multi-byte runes (**fixed in M0**); trim loops calling `Stats()` in a loop condition; a `ForEach` on a possibly-nil bucket; `stringContains` reimplementing `slices.Contains`; `s.User("@me")` called per reply when the bot ID is already known.
 
 ---
@@ -364,7 +387,7 @@ Small, mergeable PRs. `go build ./...`, `go vet ./...`, `golangci-lint run`, `go
 | 4 | `internal/text` and `internal/filter` | Both packages are leaves and neither logs; the filters return a reason and the caller decides what to record. Regexes hoisted to package scope, slur map becomes an ordered slice, `ContainsSlur` stops allocating a rewritten string to answer a yes/no question, `CleanSentence` takes an `EmojiResolver` instead of a session, per-call `text.Interner` replaces the global vocabulary. Found and recorded finding 27, and flipped `PEREGRINE_ENABLE_CLUSTERING` to default false as a result. Closes 2, 16, 22 | **done** |
 | 5 | `internal/safety` | Normalizer (case-fold, NFKD, strip marks and format characters, fold Cyrillic/Greek confusables and leet, collapse whitespace, join spaced single-letter runs, cap repeats); blocklist as data from `PEREGRINE_BLOCKLIST_PATH`, three categories, failing closed with every bad line reported by line number; `CheckLearn` **inside** `learnMessage` with an AST test that fails if it leaves; `CheckEmit` at the generation exit, silent on rejection; reject-not-launder made unexpressible; `PAUSE_ALL_WRITES`; rejection counters and logging that never records the offending text. `internal/safety` at 96%. Closes A1, A2, A5 and A4's mechanism. **Highest-value row** | **done** |
 | 6a | `internal/corpus`, `internal/storage`, `internal/dbtest`, `internal/maintenance` | The layer itself: composite-key codecs with a NUL assertion; the three KN indexes maintained incrementally; distinct-author counts as a presence set; `schema_version` refusing a pre-M6 corpus; `Reader`/`Writer` bound to a transaction so nothing outside storage can reach a `*bbolt.DB`; timestamp-only history keyed by fixed-width snowflake; counter-based trims; per-author purge; in-process backup and compaction. `dbtest` with no skip path. 30+ tests against a real bbolt file | **done** |
-| 6b | Switch the bot onto the seam | Rewire `internal/legacy`'s roughly sixty bucket-access sites onto `Reader`/`Writer`, delete its bucket constants and its `*bbolt.DB`, point `-clean-db` at `internal/maintenance` and add `-compact` and `-purge-author`. This is the commit that actually closes 1, 5, 10, 11 and 18 in the running bot, because until legacy holds a `Store` instead of a `DB` the nested transaction is still writable | |
+| 6b | Switch the bot onto the seam | `internal/legacy` holds a `*storage.Store` and no longer imports bbolt, so it cannot name a bucket or start a transaction: `TestThisPackageCannotReachBbolt` pins that. Twelve bucket constants, `EnsureBuckets` and seven bucket helpers deleted; `getNextMap` and `isRecognizedName` take the `Reader` they were nesting inside; `learnMessage` writes through `LearnNgram`/`IncTopic`/`AddNameTopic`/`AddTopicWord`/`MarkSeen` and passes an empty author for the bot's own output so self-learning cannot bootstrap diversity; `cleanup.go` replaced by `internal/maintenance` with `-clean-db`, `-compact` and `-purge-author`; four local types replaced by `internal/corpus`; the clustering loop and its two dead consumers removed, with `PEREGRINE_ENABLE_CLUSTERING` becoming a deferred variable until M8. Found finding 28. Closes 1, 5, 10, 11, 18 and half of 12 | **done** |
 | 7 | `internal/markov`: the engine | Interpolated KN with `mu`; log-space additive scoring; temperature and top-k/top-p; dead scoring deleted; author-diversity gate; consolidated persona; short length model; per-channel memory; co-occurrence window; `math/rand/v2`. Closes 12, A6, and §5.1 | |
 | 8 | `internal/clustering` | Made pure, content-hashed IDs, diff-based persistence, nil-bucket guard, **the string-keyed/int-keyed codec mismatch in finding 27 fixed so a cluster can be read at all**, and `PEREGRINE_ENABLE_CLUSTERING` returned to defaulting true once M7 golden samples show the clusters help. Closes 15, 27 | |
 | 9 | `internal/ingest` | Per-channel high-water cursors with `afterID` paging; `errgroup.SetLimit` at both levels. Closes 13, 14 | |

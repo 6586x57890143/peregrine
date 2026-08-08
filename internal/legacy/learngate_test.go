@@ -11,10 +11,11 @@ import (
 	"strings"
 	"testing"
 
-	"go.etcd.io/bbolt"
-
 	"github.com/6586x57890143/peregrine/internal/config"
+	"github.com/6586x57890143/peregrine/internal/corpus"
+	"github.com/6586x57890143/peregrine/internal/dbtest"
 	"github.com/6586x57890143/peregrine/internal/safety"
+	"github.com/6586x57890143/peregrine/internal/storage"
 )
 
 // This file is the regression pin for SPEC.md section 4, A1: the highest-value
@@ -34,34 +35,25 @@ import (
 
 // gateFixture wires up the package globals learnMessage depends on, with a corpus
 // in a temp directory and a blocklist containing one known pattern.
-func gateFixture(t *testing.T) *bbolt.DB {
+func gateFixture(t *testing.T) *storage.Store {
 	t.Helper()
 
-	path := filepath.Join(t.TempDir(), "markov.db")
-	store, err := bbolt.Open(path, 0600, nil)
-	if err != nil {
-		t.Fatalf("open corpus: %v", err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
-	if err := EnsureBuckets(store); err != nil {
-		t.Fatalf("EnsureBuckets: %v", err)
-	}
+	s := dbtest.Store(t)
 
 	bl, err := safety.LoadBlocklist(writeBlocklist(t))
 	if err != nil {
 		t.Fatalf("LoadBlocklist: %v", err)
 	}
 
-	// Save and restore the globals, so these tests do not leak into each other or
-	// into the cleanup tests in this package.
-	oldDB, oldCfg, oldGate := db, cfg, gate
-	t.Cleanup(func() { db, cfg, gate = oldDB, oldCfg, oldGate })
+	// Save and restore the globals, so these tests do not leak into each other.
+	oldStore, oldCfg, oldGate := store, cfg, gate
+	t.Cleanup(func() { store, cfg, gate = oldStore, oldCfg, oldGate })
 
-	db = store
+	store = s
 	cfg = &config.Config{MaxNGram: 3, MaxHistory: 1000}
 	gate = safety.NewGate(bl, slog.New(slog.NewTextHandler(io.Discard, nil)), false)
 
-	return store
+	return s
 }
 
 func writeBlocklist(t *testing.T) string {
@@ -74,37 +66,59 @@ func writeBlocklist(t *testing.T) string {
 	return path
 }
 
-// markovKeys returns every key in the markov bucket, which is how these tests tell
-// "learned" from "dropped" without depending on the key layout.
-func markovKeys(t *testing.T, store *bbolt.DB) []string {
+// learnedNgrams returns every stored continuation as "prefix -> next", which is how
+// these tests tell "learned" from "dropped".
+func learnedNgrams(t *testing.T, s *storage.Store) []string {
 	t.Helper()
-	var keys []string
-	if err := store.View(func(tx *bbolt.Tx) error {
-		return tx.Bucket([]byte(MarkovBucket)).ForEach(func(k, _ []byte) error {
-			keys = append(keys, string(k))
+	var out []string
+	if err := s.View(func(r *storage.Reader) error {
+		return r.ForEachNgram(func(prefix, next string, _ corpus.Successor) error {
+			out = append(out, prefix+" -> "+next)
 			return nil
 		})
 	}); err != nil {
 		t.Fatalf("read corpus: %v", err)
 	}
-	return keys
+	return out
 }
 
-func learn(t *testing.T, store *bbolt.DB, msg, msgID string) {
+// snowflake makes a syntactically valid Discord ID. Message IDs are stored as
+// fixed-width big-endian integers now, so "m1" is not a message ID any more: it is
+// an error, which is the correct answer for a caller that invented one.
+func snowflake(n int) string {
+	const base = 1000000000000000000
+	return itoa(base + n)
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var buf [24]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(buf[i:])
+}
+
+func learn(t *testing.T, s *storage.Store, msg, msgID string) {
 	t.Helper()
-	if err := store.Update(func(tx *bbolt.Tx) error {
-		return learnMessage(tx, msg, msgID, "999", MentionedUser{Name: "tester", UserID: "1", Username: "tester"}, nil)
+	if err := s.Update(func(w *storage.Writer) error {
+		return learnMessage(w, msg, msgID, "999", MentionedUser{Name: "tester", UserID: "1", Username: "tester"}, nil)
 	}); err != nil {
 		t.Fatalf("learnMessage: %v", err)
 	}
 }
 
 func TestLearnMessageLearnsOrdinaryText(t *testing.T) {
-	store := gateFixture(t)
+	s := gateFixture(t)
 
-	learn(t, store, "the bird is on the roof again", "m1")
+	learn(t, s, "the bird is on the roof again", snowflake(1))
 
-	if len(markovKeys(t, store)) == 0 {
+	if len(learnedNgrams(t, s)) == 0 {
 		t.Fatal("ordinary text was not learned, so the rest of this file proves nothing")
 	}
 }
@@ -127,11 +141,11 @@ func TestLearnMessageDropsBlockedContent(t *testing.T) {
 
 	for name, msg := range cases {
 		t.Run(name, func(t *testing.T) {
-			store := gateFixture(t)
-			learn(t, store, msg, "m1")
+			s := gateFixture(t)
+			learn(t, s, msg, snowflake(1))
 
-			if keys := markovKeys(t, store); len(keys) != 0 {
-				t.Errorf("blocked content was learned: %d keys written, first %q", len(keys), keys[0])
+			if got := learnedNgrams(t, s); len(got) != 0 {
+				t.Errorf("blocked content was learned: %d n-grams written, first %q", len(got), got[0])
 			}
 		})
 	}
@@ -145,22 +159,99 @@ func TestLearnMessageDropsBlockedContent(t *testing.T) {
 // This asserts that NONE of the surrounding words made it in, not merely that the
 // slur did not.
 func TestLearnMessageRejectsWholeMessageNotJustTheWord(t *testing.T) {
-	store := gateFixture(t)
+	s := gateFixture(t)
 
-	learn(t, store, "i think that exampleslur is why the bird left the roof", "m1")
+	learn(t, s, "i think that exampleslur is why the bird left the roof", snowflake(1))
 
-	keys := markovKeys(t, store)
-	if len(keys) != 0 {
-		t.Fatalf("expected nothing learned, got %d keys", len(keys))
+	got := learnedNgrams(t, s)
+	if len(got) != 0 {
+		t.Fatalf("expected nothing learned, got %d n-grams", len(got))
 	}
 	// And specifically not the innocuous fragments, which is what laundering would
 	// have preserved.
-	for _, k := range keys {
+	for _, k := range got {
 		for _, innocuous := range []string{"bird", "roof", "why the"} {
 			if strings.Contains(k, innocuous) {
-				t.Errorf("the message was laundered rather than dropped: key %q survived", k)
+				t.Errorf("the message was laundered rather than dropped: %q survived", k)
 			}
 		}
+	}
+}
+
+// TestLearnMessageWritesNoEmptyPrefix is finding 5's pin, at the layer that used to
+// produce it.
+//
+// The ingestion loop ran n from MaxNGram down to 1, and at n == 1 the prefix is
+// empty, so every unigram in the corpus accumulated into one key holding a map of the
+// whole vocabulary. Writer.LearnNgram refuses an empty prefix, so a regression here
+// is an error rather than silent write amplification, and this asserts learning still
+// succeeds rather than failing on that error.
+func TestLearnMessageWritesNoEmptyPrefix(t *testing.T) {
+	s := gateFixture(t)
+
+	learn(t, s, "the bird is on the roof", snowflake(1))
+
+	for _, ng := range learnedNgrams(t, s) {
+		if strings.HasPrefix(ng, " -> ") {
+			t.Errorf("an empty-prefix n-gram was written: %q. Unigram frequency belongs in the "+
+				"topic index, one key per word (SPEC.md section 8, finding 5)", ng)
+		}
+	}
+}
+
+// TestLearnMessageExcludesTheBotFromAuthorDiversity is A6's pin on the write path.
+//
+// Self-learning feeds the bot's own replies back into the corpus. If the bot counted
+// as a distinct author, anything it said once would carry a diversity count of one
+// from the moment it was said, which is half of what M7's eligibility gate asks for,
+// bootstrapped by the bot itself rather than by people.
+func TestLearnMessageExcludesTheBotFromAuthorDiversity(t *testing.T) {
+	s := gateFixture(t)
+
+	const botUserID = "999"
+	botAuthor := MentionedUser{Name: "peregrine", UserID: botUserID, Username: "peregrine"}
+	if err := s.Update(func(w *storage.Writer) error {
+		return learnMessage(w, "the bird is loose", snowflake(1), botUserID, botAuthor, nil)
+	}); err != nil {
+		t.Fatalf("learnMessage: %v", err)
+	}
+
+	if err := s.View(func(r *storage.Reader) error {
+		succ, ok, err := r.Successor("the", "bird")
+		if err != nil || !ok {
+			t.Fatalf("the bot's own reply was not learned at all: ok=%v err=%v", ok, err)
+		}
+		if succ.Authors != 0 {
+			t.Errorf("Authors = %d after learning the bot's own output, want 0: self-learning "+
+				"must not contribute to author diversity (SPEC.md section 4, A6)", succ.Authors)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestLearnMessageDedupesByMessageID pins the window that stops the backfill
+// double-counting. The backfill re-reads recent history every ten minutes, so
+// without this every pass would add the same n-grams again (finding 13).
+func TestLearnMessageDedupesByMessageID(t *testing.T) {
+	s := gateFixture(t)
+
+	id := snowflake(1)
+	learn(t, s, "the bird is loose", id)
+	learn(t, s, "the bird is loose", id)
+
+	if err := s.View(func(r *storage.Reader) error {
+		succ, ok, err := r.Successor("the", "bird")
+		if err != nil || !ok {
+			t.Fatalf("nothing learned: ok=%v err=%v", ok, err)
+		}
+		if succ.Count != 1 {
+			t.Errorf("Count = %d after learning the same message ID twice, want 1", succ.Count)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -172,23 +263,7 @@ func TestLearnMessageRejectsWholeMessageNotJustTheWord(t *testing.T) {
 // body. If someone hoists it to the callers for performance, or adds a fifth caller
 // that forgets it, every behavioural test above still passes and this fails.
 func TestGateIsInsideLearnMessageNotAtCallSites(t *testing.T) {
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "legacy.go", nil, parser.SkipObjectResolution)
-	if err != nil {
-		t.Fatalf("parse legacy.go: %v", err)
-	}
-
-	var learnFn *ast.FuncDecl
-	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if ok && fn.Name.Name == "learnMessage" {
-			learnFn = fn
-			break
-		}
-	}
-	if learnFn == nil {
-		t.Fatal("learnMessage not found; if it was renamed, update this test rather than deleting it")
-	}
+	learnFn := findFunc(t, "learnMessage")
 
 	if !containsCall(learnFn.Body, "gate", "CheckLearn") {
 		t.Error("learnMessage does not call gate.CheckLearn. That check must live INSIDE this " +
@@ -204,17 +279,11 @@ func TestGateIsInsideLearnMessageNotAtCallSites(t *testing.T) {
 // is worth a moment's thought and a look at whether the new path also needs a
 // CheckEmit counterpart.
 func TestLearnMessageCallerCountIsKnown(t *testing.T) {
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "legacy.go", nil, parser.SkipObjectResolution)
-	if err != nil {
-		t.Fatalf("parse legacy.go: %v", err)
-	}
-
 	// Counted from the AST rather than by grepping the source. A regexp attempt at
 	// this counted five, because the function's own declaration looks exactly like a
 	// call to a pattern that is not parsing Go.
 	calls := 0
-	ast.Inspect(file, func(n ast.Node) bool {
+	ast.Inspect(parseLegacy(t), func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
 			return true
@@ -234,6 +303,73 @@ func TestLearnMessageCallerCountIsKnown(t *testing.T) {
 			"If you removed one: also fine, update this number.\n\n"+
 			"If this dropped to zero, learning is disconnected.", calls, known)
 	}
+}
+
+// TestThisPackageCannotReachBbolt is M6b's structural pin, and it is the same kind of
+// test as the gate one above: it asserts a PLACEMENT rather than a behavior.
+//
+// internal/storage is the only package that may know a bucket exists. This one held
+// twelve bucket-name constants and reached into buckets at roughly sixty sites, which
+// is what made the nested-transaction deadlock writable in the first place: a function
+// holding a *bbolt.Tx can open another transaction, and an outer read plus a writer
+// waiting to remap plus an inner read is an unrecoverable hang (SPEC.md section 8,
+// finding 1).
+//
+// The check is on the IMPORT rather than on the text, and the import is the exact
+// invariant: the bbolt API is unreachable without it, so if no file in this package
+// imports bbolt then no file in this package can name a bucket, start a transaction,
+// or hold a handle. It scans every file rather than just legacy.go, so a new file
+// cannot reintroduce the dependency next to a test that only looks at the old one.
+func TestThisPackageCannotReachBbolt(t *testing.T) {
+	// Files are globbed and parsed one at a time rather than with parser.ParseDir,
+	// which is deprecated: it does not consider build tags when associating files
+	// with packages. Every .go file in the directory is what this test wants anyway,
+	// tags or not.
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("list package files: %v", err)
+	}
+	if len(files) == 0 {
+		t.Fatal("no Go files found, so this test proves nothing")
+	}
+
+	fset := token.NewFileSet()
+	for _, name := range files {
+		file, err := parser.ParseFile(fset, name, nil, parser.ImportsOnly)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		for _, imp := range file.Imports {
+			if strings.Contains(imp.Path.Value, "bbolt") {
+				t.Errorf("%s imports %s. Only internal/storage may reach bbolt; everything "+
+					"here goes through storage.Reader and storage.Writer, neither of which "+
+					"has a method that starts a transaction. See SPEC.md section 8, finding 1.",
+					name, imp.Path.Value)
+			}
+		}
+	}
+}
+
+// parseLegacy parses legacy.go for the structural tests.
+func parseLegacy(t *testing.T) *ast.File {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "legacy.go", nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse legacy.go: %v", err)
+	}
+	return file
+}
+
+func findFunc(t *testing.T, name string) *ast.FuncDecl {
+	t.Helper()
+	for _, decl := range parseLegacy(t).Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == name {
+			return fn
+		}
+	}
+	t.Fatalf("%s not found; if it was renamed, update this test rather than deleting it", name)
+	return nil
 }
 
 // containsCall reports whether body contains a call of the form recv.method(...).
