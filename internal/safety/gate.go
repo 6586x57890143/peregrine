@@ -199,3 +199,16 @@ func (g *Gate) rejectEmit(v Verdict) Verdict {
 // LearnRejected and EmitRejected report the running counts for the status line.
 func (g *Gate) LearnRejected() uint64 { return g.learnRejected.Load() }
 func (g *Gate) EmitRejected() uint64  { return g.emitRejected.Load() }
+
+// BlocklistMatches reports whether the already-normalized text matches any loaded
+// rule, in any category.
+//
+// Exposed for the maintenance pass, which asks a different question from either gate:
+// not "may this be learned" or "may this be sent" but "is this fragment something the
+// operator has said they never want in the corpus". It takes normalized text and does
+// not normalize, matching Blocklist.Match, so a caller that already normalized does
+// not pay for it twice.
+func (g *Gate) BlocklistMatches(normalized string) bool {
+	_, ok := g.blocklist.Match(normalized)
+	return ok
+}
