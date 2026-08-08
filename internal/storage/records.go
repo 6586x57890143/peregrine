@@ -240,6 +240,21 @@ func (r *Reader) Name(key string) (corpus.Name, bool, error) {
 	return n, true, nil
 }
 
+// IsName reports whether a key is a known name or alias, without decoding the
+// record.
+//
+// Separate from Name because of where it is called: the scorer applies a small
+// recognized-name boost to every candidate at every step of every generated sentence,
+// and it only needs the yes or no. Going through Name would put a JSON unmarshal in
+// that innermost loop, where the old code did a bare key lookup.
+func (r *Reader) IsName(key string) bool {
+	b := r.bucket(bucketName)
+	if b == nil {
+		return false
+	}
+	return b.Get([]byte(key)) != nil
+}
+
 // PutName writes a name record.
 func (w *Writer) PutName(key string, n corpus.Name) error {
 	data, err := json.Marshal(n)
@@ -379,6 +394,20 @@ func (w *Writer) IncUserStat(userID string, at time.Time) error {
 	return w.bucket(bucketStats).Put([]byte(userID), data)
 }
 
+// PutUserStat writes a user's counter outright, rather than incrementing it.
+//
+// It exists because the weekly reset is a POLICY decision and does not belong here.
+// The rule is "if this user's last message predates the start of the current week,
+// their count starts again at one", which needs a definition of when a week starts,
+// and storage has no business holding one. The caller reads, decides, and writes.
+func (w *Writer) PutUserStat(userID string, s corpus.WeeklyStat) error {
+	data, err := json.Marshal(s)
+	if err != nil {
+		return err
+	}
+	return w.bucket(bucketStats).Put([]byte(userID), data)
+}
+
 // AllUserStats returns every user's counter.
 func (r *Reader) AllUserStats() (map[string]corpus.WeeklyStat, error) {
 	b := r.bucket(bucketStats)
@@ -398,6 +427,19 @@ func (r *Reader) AllUserStats() (map[string]corpus.WeeklyStat, error) {
 	}
 	return out, nil
 }
+
+// MessagesLearned returns the lifetime count of messages ingested.
+//
+// A meta counter rather than a key in the stats bucket, which is where it used to
+// live under the literal key "total_messages_learned". That put a scalar in a bucket
+// whose every other key is a Discord user ID holding a JSON WeeklyStat, so every
+// reader of that bucket had to recognize and skip it: the leaderboard filtered it out
+// with a strconv.ParseInt on the key, and anything that forgot to would have decoded
+// an integer as a stat and silently counted a phantom user.
+func (r *Reader) MessagesLearned() uint64 { return r.counter(metaMessagesLearned) }
+
+// IncMessagesLearned bumps the lifetime ingestion counter.
+func (w *Writer) IncMessagesLearned() error { return w.addCounter(metaMessagesLearned, 1) }
 
 // ---------------------------------------------------------------- opaque blobs
 
@@ -509,6 +551,7 @@ type Status struct {
 	Clusters      int
 	HistoryWindow uint64
 	ImageCache    uint64
+	Learned       uint64
 }
 
 // Status collects the counts.
@@ -534,6 +577,7 @@ func (r *Reader) Status() Status {
 		Clusters:      keyN(bucketCluster),
 		HistoryWindow: r.counter(metaHistoryCount),
 		ImageCache:    r.counter(metaImageCount),
+		Learned:       r.counter(metaMessagesLearned),
 	}
 }
 

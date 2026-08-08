@@ -31,42 +31,28 @@ import (
 	"math/rand/v2"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/6586x57890143/peregrine/clustering"
 	"github.com/6586x57890143/peregrine/internal/config"
 	"github.com/6586x57890143/peregrine/internal/core"
+	"github.com/6586x57890143/peregrine/internal/corpus"
 	"github.com/6586x57890143/peregrine/internal/safety"
+	"github.com/6586x57890143/peregrine/internal/storage"
 	"github.com/6586x57890143/peregrine/internal/text"
 	"github.com/6586x57890143/peregrine/voicenotes"
 	"github.com/6586x57890143/peregrine/wordgames"
 	"github.com/beevik/ntp"
 	"github.com/bwmarrin/discordgo"
-	"go.etcd.io/bbolt"
 )
 
-// Bucket names. These are the only members of the old CONFIG block that are
-// genuinely constant: they are the on-disk schema, not a tuning decision, and
-// changing one at runtime would just mean reading from a bucket nothing wrote.
-// M6 moves them into internal/storage unexported, which is also what stops
-// clustering owning storage-layer names as it does here.
-const (
-	MarkovBucket         = "markov"
-	TopicBucket          = "topics"
-	HistoryBucket        = "history"
-	NameBucket           = "names"
-	NameTopicBucket      = clustering.NameTopicBucket
-	TopicWordBucket      = "TopicWordBucket"
-	TopicClusterBucket   = clustering.TopicClusterBucket
-	ImageCacheBucket     = "ImageCacheBucket"
-	ConfigBucket         = "ConfigBucket"
-	ConceptClusterBucket = clustering.ConceptClusterBucket
-	StatsBucket          = "stats"
-	LeaderboardBucket    = "LeaderboardBucket"
-)
+// The twelve bucket-name constants that used to live here are gone, and with them
+// this package's ability to name a bucket at all. They are unexported in
+// internal/storage now, which is what stops the clustering package owning
+// storage-layer names as it did: three of these were aliases of constants exported
+// by an algorithm package, pointing the dependency the wrong way round
+// (SPEC.md section 2).
 
 // cfg is the loaded configuration, set once by Run before anything reads it.
 //
@@ -90,40 +76,27 @@ var cfg *config.Config
 // it is not fit to be configuration. See the comment on cfg.
 const Creativity = 0.75
 
-// WordPosData tracks word statistics for positional weighting and name/topic associations
-type WordPosData struct {
-	Word       string             `json:"word,omitempty"`       // the actual word/token
-	Position   int                `json:"position,omitempty"`   // optional absolute position
-	IsName     bool               `json:"is_name,omitempty"`    // true if recognized as a name
-	Associated []string           `json:"associated,omitempty"` // associated names/topics
-	Count      int                `json:"count"`                // how many times this word occurred
-	PosSum     float64            `json:"pos_sum"`              // sum of relative positions for averaging
-	TopicBias  map[string]float64 `json:"topic_bias,omitempty"` //	 topic bias scores
-	Sentiment  float64            `json:"sentiment,omitempty"`  // 	sentiment score
-}
-
-// TopicAssociationData tracks topic statistics for positional weighting and name associations
-type TopicAssociationData struct {
-	Count  int     `json:"count"`   // how many times this topic occurred with the name
-	PosSum float64 `json:"pos_sum"` // sum of relative positions for averaging
-}
-
-type TopicClusterData = clustering.TopicClusterData
-
-// NameData stores information about a recognized name, including its canonical form.
-type NameData struct {
-	Count         int    `json:"count"`
-	DiscordUser   string `json:"discord_user,omitempty"`
-	CanonicalName string `json:"canonical_name,omitempty"` // The primary name this alias points to (e.g., the username).
-}
+// Four local types are gone here, and they are worth naming because each was a
+// duplicate of something internal/corpus now owns.
+//
+// WordPosData and TopicAssociationData were both JSON shapes for a co-occurrence
+// record: a count plus a sum of relative positions. They are corpus.TopicAssoc,
+// whose MeanPosition method replaces the `data.PosSum / float64(data.Count)`
+// division that was open-coded at nine call sites, one of which could divide by
+// zero. WordPosData additionally carried four fields (Position, TopicBias,
+// Sentiment, and a Word that restated the map key) that no code ever read.
+//
+// NameData is corpus.Name and WeeklyStat is corpus.WeeklyStat.
+//
+// TopicClusterData and ConceptCluster were type aliases into the clustering
+// package, which is the dependency inversion described above. See the note on
+// findBestSeed for why the concept-cluster paths went with them.
 
 // ActiveChannelInfo holds a channel and its recent message count.
 type ActiveChannelInfo struct {
 	Channel      *discordgo.Channel
 	MessageCount int
 }
-
-type ConceptCluster = clustering.ConceptCluster
 
 // TranscriptionJob holds the necessary info for a voice transcription task.
 type TranscriptionJob struct {
@@ -134,12 +107,6 @@ type TranscriptionJob struct {
 	PlaceholderID string
 	Author        *discordgo.User
 	Member        *discordgo.Member
-}
-
-// WeeklyStat holds the message count for a user for the current week.
-type WeeklyStat struct {
-	Count         int       `json:"count"`
-	LastTimestamp time.Time `json:"last_timestamp"`
 }
 
 // ----- GLOBALS -----
@@ -162,7 +129,16 @@ type WeeklyStat struct {
 // Service's own WaitGroup, which only RunLoop touches and only during Start, and
 // per-message work goes through core.Dispatcher, whose Adds all happen before any
 // event can arrive.
-var db *bbolt.DB
+// store replaces what was `var db *bbolt.DB`, and the type is the whole of M6b.
+//
+// Nothing in this package can reach a *bbolt.DB any more, so nothing here can open
+// a transaction: only store.View and store.Update can, and they hand back a Reader
+// or Writer that has no method to open another. The generation path used to run
+// inside a db.View and call helpers (isRecognizedName, getNextMap) that each opened
+// their own db.View, which is an unrecoverable hang that gets likelier as the file
+// grows (SPEC.md section 8, finding 1). Those helpers now take the Reader they are
+// already inside, and the version that could nest no longer compiles.
+var store *storage.Store
 var dg *discordgo.Session
 var dispatcher *core.Dispatcher
 
@@ -216,26 +192,26 @@ type AggroState struct {
 	EndTime  time.Time `json:"end_time"`
 }
 
-// saveAggroState persists the bird aggro state to the ConfigBucket.
-func saveAggroState(tx *bbolt.Tx, state AggroState) error {
-	b := tx.Bucket([]byte(ConfigBucket))
-	if b == nil {
-		return fmt.Errorf("ConfigBucket not found")
-	}
+// saveAggroState persists the bird aggro state.
+//
+// Through the opaque blob API rather than a bucket of its own, because the shape of
+// this value belongs to the aggro feature and not to storage: making storage hold a
+// type definition for every scrap of state a feature persists is how it ends up
+// importing the features it is meant to serve.
+func saveAggroState(w *storage.Writer, state AggroState) error {
 	encoded, err := json.Marshal(state)
 	if err != nil {
 		return err
 	}
-	return b.Put([]byte("aggroState"), encoded)
+	return w.PutBlob(storage.BlobConfig, "aggroState", encoded)
 }
 
-// loadAggroState loads the bird aggro state from the ConfigBucket.
-func loadAggroState(tx *bbolt.Tx) (AggroState, error) {
-	b := tx.Bucket([]byte(ConfigBucket))
-	if b == nil {
-		return AggroState{}, fmt.Errorf("ConfigBucket not found")
+// loadAggroState loads the bird aggro state.
+func loadAggroState(r *storage.Reader) (AggroState, error) {
+	v, err := r.GetBlob(storage.BlobConfig, "aggroState")
+	if err != nil {
+		return AggroState{}, err
 	}
-	v := b.Get([]byte("aggroState"))
 	if v == nil {
 		return AggroState{}, nil // No state saved yet
 	}
@@ -316,31 +292,12 @@ type Service struct {
 // happens in Init, where a failure aborts startup with an explanation.
 func New() *Service { return &Service{} }
 
-// EnsureBuckets creates the buckets this package expects, if they do not already
-// exist.
-//
-// Exported and called from cmd/bot rather than from Init because both the bot and
-// the -clean-db maintenance mode need the corpus to be well formed, and only one
-// of them runs a Service. M6 moves this inside internal/storage.Open, where it
-// belongs, along with the schema_version key that makes "these buckets exist" and
-// "these buckets are the layout this binary understands" different questions.
-func EnsureBuckets(store *bbolt.DB) error {
-	if err := store.Update(func(tx *bbolt.Tx) error {
-		for _, b := range []string{
-			MarkovBucket, TopicBucket, HistoryBucket, NameBucket, NameTopicBucket,
-			TopicWordBucket, TopicClusterBucket, ImageCacheBucket, ConfigBucket,
-			ConceptClusterBucket, StatsBucket, LeaderboardBucket,
-		} {
-			if _, err := tx.CreateBucketIfNotExists([]byte(b)); err != nil {
-				return err
-			}
-		}
-		return nil
-	}); err != nil {
-		return fmt.Errorf("create buckets: %w", err)
-	}
-	return nil
-}
+// EnsureBuckets is gone. It was exported so that both the bot and the -clean-db
+// mode could make the corpus well formed, which meant a hand-maintained slice of
+// bucket names in this package that a new bucket could be forgotten from.
+// storage.Open does it now, from one list, and in the same transaction that checks
+// schema_version: "these buckets exist" and "this file is the layout this binary
+// understands" are different questions, and only the second one can refuse to run.
 
 func (s *Service) Name() string { return "legacy" }
 
@@ -349,7 +306,7 @@ func (s *Service) Name() string { return "legacy" }
 func (s *Service) Init(deps core.Deps) error {
 	s.deps = deps
 	cfg = deps.Config
-	db = deps.Store
+	store = deps.Store
 	dispatcher = deps.Dispatcher
 	gate = deps.Gate
 	dg = deps.Session
@@ -371,14 +328,14 @@ func (s *Service) Init(deps core.Deps) error {
 	}
 
 	// Load persistent states from DB
-	_ = db.View(func(tx *bbolt.Tx) error {
+	_ = store.View(func(r *storage.Reader) error {
 		var err error
-		state, err := loadAggroState(tx)
+		state, err := loadAggroState(r)
 		if err != nil {
 			log.Printf("[WARN] Failed to load aggro state: %v", err)
 			return err
 		}
-		leaderboard, err = loadLeaderboard(tx)
+		leaderboard, err = loadLeaderboard(r)
 		if err != nil {
 			log.Printf("[WARN] Failed to load leaderboard, starting fresh: %v", err)
 			leaderboard = wordgames.NewLeaderboard()
@@ -398,8 +355,8 @@ func (s *Service) Init(deps core.Deps) error {
 				defer birdAggroMutex.Unlock()
 				birdAggroTargetID = ""
 				birdAggroEndTime = time.Time{}
-				_ = db.Update(func(tx *bbolt.Tx) error {
-					return saveAggroState(tx, AggroState{})
+				_ = store.Update(func(w *storage.Writer) error {
+					return saveAggroState(w, AggroState{})
 				})
 			}()
 		}
@@ -484,17 +441,22 @@ func (s *Service) Start(ctx context.Context) error {
 			Fn:    func(ctx context.Context) { autonomousPost(ctx, dg) },
 		})
 	}
-	if cfg.EnableClustering {
-		// Skippable because it walks the whole corpus inside a write transaction
-		// and bbolt has one writer process-wide, making it the pass most worth
-		// turning off while diagnosing stalled ingestion.
-		loops = append(loops, core.Loop{
-			Name:      "clustering",
-			Every:     cfg.ClusteringTick,
-			Immediate: true,
-			Fn:        func(context.Context) { performClustering() },
-		})
-	}
+	// There is no clustering loop any more, and its absence is a finding rather
+	// than a regression.
+	//
+	// The pass took a *bbolt.DB, which nothing outside internal/storage can hold, so
+	// it could not be called from here even if it worked. It does not work: its
+	// members are persisted string-keyed and unmarshalled into map[int]float32, so
+	// every cluster fails to decode, and both consumers guarded that with
+	// `if err := json.Unmarshal(...); err == nil` and no else, making the failure
+	// completely silent. It has never once produced data anything read
+	// (SPEC.md section 8, finding 27), which is why PEREGRINE_ENABLE_CLUSTERING has
+	// defaulted to false since M4.
+	//
+	// It also read the name-topic bucket as a JSON map per name, which the composite
+	// key layout no longer stores, so under M6 it would find nothing regardless of
+	// the codec bug. M8 rebuilds it against storage's blob API with content-hashed
+	// IDs, and PEREGRINE_ENABLE_CLUSTERING is a deferred variable until then.
 	for _, l := range loops {
 		core.RunLoop(loopCtx, &s.loops, s.deps.Logger, l)
 	}
@@ -550,8 +512,8 @@ func (s *Service) Shutdown(ctx context.Context) error {
 
 	// Last write before cmd/bot closes the store.
 	if leaderboard != nil {
-		if err := db.Update(func(tx *bbolt.Tx) error {
-			return saveLeaderboard(tx, leaderboard)
+		if err := store.Update(func(w *storage.Writer) error {
+			return saveLeaderboard(w, leaderboard)
 		}); err != nil {
 			return fmt.Errorf("save leaderboard: %w", err)
 		}
@@ -580,8 +542,8 @@ func maybeTriggerAggro(ctx context.Context, dg *discordgo.Session) {
 	birdAggroEndTime = time.Now().Add(cfg.AggroDuration)
 	log.Printf("[AGGRO] Bird aggro triggered on user %s for %v.", target, cfg.AggroDuration)
 	// Persist the new aggro state
-	if err := db.Update(func(tx *bbolt.Tx) error {
-		return saveAggroState(tx, AggroState{TargetID: birdAggroTargetID, EndTime: birdAggroEndTime})
+	if err := store.Update(func(w *storage.Writer) error {
+		return saveAggroState(w, AggroState{TargetID: birdAggroTargetID, EndTime: birdAggroEndTime})
 	}); err != nil {
 		log.Printf("[ERR] Failed to persist aggro state: %v", err)
 	}
@@ -609,51 +571,38 @@ func maybeResetLeaderboard() {
 	leaderboard.WeekStartDate = now
 	leaderboard.LastReset = now
 	leaderboard.Scores = make(map[string]wordgames.LeaderboardEntry)
-	if err := db.Update(func(tx *bbolt.Tx) error {
-		return saveLeaderboard(tx, leaderboard)
+	if err := store.Update(func(w *storage.Writer) error {
+		return saveLeaderboard(w, leaderboard)
 	}); err != nil {
 		log.Printf("[ERR] Failed to persist leaderboard reset: %v", err)
 	}
 }
 
 // learnOrUpdateName finds the canonical name for a user and updates aliases.
-func learnOrUpdateName(tx *bbolt.Tx, name, discordUserID, username string) (string, error) {
-	nameB := tx.Bucket([]byte(NameBucket))
-	if nameB == nil {
-		return "", fmt.Errorf("name bucket not found")
-	}
-
+func learnOrUpdateName(w *storage.Writer, name, discordUserID, username string) (string, error) {
 	canonicalName := toLowerCaseExceptURLs(username)
 	nameKey := toLowerCaseExceptURLs(name)
 
 	// Update the canonical name entry first.
-	var canonicalData NameData
-	if v := nameB.Get([]byte(canonicalName)); v != nil {
-		_ = json.Unmarshal(v, &canonicalData)
-	}
-	canonicalData.Count++
-	canonicalData.DiscordUser = discordUserID
-	out, err := json.Marshal(canonicalData)
+	canonicalData, _, err := w.Name(canonicalName)
 	if err != nil {
 		return "", err
 	}
-	if err := nameB.Put([]byte(canonicalName), out); err != nil {
+	canonicalData.Count++
+	canonicalData.DiscordUserID = discordUserID
+	if err := w.PutName(canonicalName, canonicalData); err != nil {
 		return "", err
 	}
 
 	// If the current name is an alias (nickname), create/update its entry to point to the canonical name.
 	if nameKey != canonicalName {
-		var aliasData NameData
-		if v := nameB.Get([]byte(nameKey)); v != nil {
-			_ = json.Unmarshal(v, &aliasData)
-		}
-		aliasData.DiscordUser = discordUserID
-		aliasData.CanonicalName = canonicalName // Link to the primary username.
-		out, err := json.Marshal(aliasData)
+		aliasData, _, err := w.Name(nameKey)
 		if err != nil {
 			return "", err
 		}
-		if err := nameB.Put([]byte(nameKey), out); err != nil {
+		aliasData.DiscordUserID = discordUserID
+		aliasData.Canonical = canonicalName // Link to the primary username.
+		if err := w.PutName(nameKey, aliasData); err != nil {
 			return "", err
 		}
 	}
@@ -661,30 +610,32 @@ func learnOrUpdateName(tx *bbolt.Tx, name, discordUserID, username string) (stri
 	return canonicalName, nil
 }
 
-// isRecognizedName checks if a token is a known name or alias and returns its canonical form.
-func isRecognizedName(token string) (canonicalName string, exists bool) {
+// isRecognizedName checks if a token is a known name or alias and returns its
+// canonical form.
+//
+// It takes the Reader it is already inside, and that signature is half of finding
+// 1's fix. It used to open its own db.View, and its only caller runs inside the read
+// transaction that wraps generation, so every recognized-name lookup was a nested
+// bbolt transaction: an outer read holds mmaplock.RLock for its whole life, a writer
+// waiting to grow the mmap queues for the write lock, and Go's RWMutex then queues
+// the inner read behind that writer. Unrecoverable, no timeout, and likelier the
+// bigger the file gets.
+//
+// Passing the Reader is not merely the fix but the only thing that compiles now:
+// a Reader has no method that opens a transaction.
+func isRecognizedName(r *storage.Reader, token string) (canonicalName string, exists bool) {
 	if token == "" {
 		return "", false
 	}
 	lower := toLowerCaseExceptURLs(token)
-	_ = db.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket([]byte(NameBucket))
-		if b != nil {
-			if v := b.Get([]byte(lower)); v != nil {
-				var data NameData
-				if json.Unmarshal(v, &data) == nil {
-					exists = true
-					if data.CanonicalName != "" {
-						canonicalName = data.CanonicalName // It's an alias, return the canonical name.
-					} else {
-						canonicalName = lower // It's a canonical name itself.
-					}
-				}
-			}
-		}
-		return nil
-	})
-	return
+	data, ok, err := r.Name(lower)
+	if err != nil || !ok {
+		return "", false
+	}
+	if data.Canonical != "" {
+		return data.Canonical, true // It's an alias, return the canonical name.
+	}
+	return lower, true // It's a canonical name itself.
 }
 
 // getActiveChannels returns all text channels in a guild that have recent activity.
@@ -789,134 +740,52 @@ func countRecentMessages(s *discordgo.Session, ch *discordgo.Channel, cutoff tim
 // ----------------------------
 // Utilities & DB helpers
 // ----------------------------
-func getMapFromBucket(b *bbolt.Bucket, key string) (map[string]int, error) {
-	if b == nil {
-		return nil, fmt.Errorf("nil bucket")
-	}
-	v := b.Get([]byte(key))
-	if v == nil {
-		return nil, nil
-	}
-	var out map[string]int
-	if err := json.Unmarshal(v, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func putJSONToBucket(b *bbolt.Bucket, key string, val interface{}) error {
-	if b == nil {
-		return fmt.Errorf("nil bucket")
-	}
-	data, err := json.Marshal(val)
-	if err != nil {
-		return err
-	}
-	return b.Put([]byte(key), data)
-}
-
-func incTopicInTx(topicB *bbolt.Bucket, word string) error {
-	if topicB == nil {
-		return fmt.Errorf("nil topic bucket")
-	}
-	word = strings.ToLower(word)
-	if len(word) < 3 {
-		return nil
-	}
-	var count int
-	if v := topicB.Get([]byte(word)); v != nil {
-		if err := json.Unmarshal(v, &count); err != nil {
-			return fmt.Errorf("failed to unmarshal topic count: %w", err)
-		}
-	}
-	count++
-	data, _ := json.Marshal(count)
-	return topicB.Put([]byte(word), data)
-}
-
-func trimHistoryInTx(historyB *bbolt.Bucket, max int) error {
-	if historyB == nil {
-		return nil
-	}
-	for historyB.Stats().KeyN > max {
-		c := historyB.Cursor()
-		k, _ := c.First()
-		if k == nil {
-			break
-		}
-		if err := historyB.Delete(k); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// saveImageURLToDB stores an image URL in the ImageCacheBucket.
-func saveImageURLToDB(tx *bbolt.Tx, url string) error {
-	bucket := tx.Bucket([]byte(ImageCacheBucket))
-	if bucket == nil {
-		return fmt.Errorf("ImageCacheBucket not found")
-	}
-	return bucket.Put([]byte(url), []byte("1")) // Store URL as key, value doesn't matter much
-}
-
-// trimImageCacheInTx removes oldest image URLs from the ImageCacheBucket if it exceeds max.
-func trimImageCacheInTx(tx *bbolt.Tx, max int) error {
-	bucket := tx.Bucket([]byte(ImageCacheBucket))
-	if bucket == nil {
-		return nil
-	}
-
-	for bucket.Stats().KeyN > max {
-		c := bucket.Cursor()
-		k, _ := c.First()
-		if k == nil {
-			break
-		}
-		if err := bucket.Delete(k); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// loadImageURLsFromDB loads image URLs from the ImageCacheBucket into memory.
+// Seven helpers used to live here and all seven are gone, because each of them was
+// a bucket operation that internal/storage now owns and does better:
+//
+//   - getMapFromBucket and putJSONToBucket read and wrote a JSON map[string]int as
+//     the VALUE of a prefix key, which is the write amplification at the root of the
+//     old layout: learning one occurrence of "the cat" rewrote every successor "the"
+//     had ever had. Writer.LearnNgram replaces both with one 12-byte put.
+//   - incTopicInTx silently dropped words shorter than three characters, so the
+//     topic count for "ok", "no" and "wtf" was permanently zero in a server whose
+//     register is short interjections (finding G10). Writer.IncTopic has no minimum.
+//   - trimHistoryInTx and trimImageCacheInTx called Bucket.Stats() in their LOOP
+//     CONDITION. Stats() walks every page in the bucket, so evicting a thousand keys
+//     walked the whole bucket a thousand times (finding 11). Both trims are counter
+//     driven now, and history eviction is chronological because the keys are
+//     fixed-width big-endian snowflakes rather than decimal strings (finding 10).
+//   - saveImageURLToDB stored the literal byte "1" as a value that nothing read.
+//     Writer.AddImageURL stores a timestamp, which is what makes eviction by age
+//     possible at all.
+//
+// loadImageURLsFromDB survives only as the one line below, because the store now
+// answers the question directly.
 func loadImageURLsFromDB() ([]string, error) {
 	var urls []string
-	err := db.View(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket([]byte(ImageCacheBucket))
-		if bucket == nil {
-			return fmt.Errorf("ImageCacheBucket not found")
-		}
-		_ = bucket.ForEach(func(k, v []byte) error {
-			urls = append(urls, string(k))
-			return nil
-		})
-		return nil
+	err := store.View(func(r *storage.Reader) error {
+		var err error
+		urls, err = r.ImageURLs()
+		return err
 	})
 	return urls, err
 }
 
-// saveLeaderboard saves the current leaderboard state to the database.
-func saveLeaderboard(tx *bbolt.Tx, l *wordgames.Leaderboard) error {
-	b := tx.Bucket([]byte(LeaderboardBucket))
-	if b == nil {
-		return fmt.Errorf("LeaderboardBucket not found")
-	}
+// saveLeaderboard saves the current leaderboard state.
+func saveLeaderboard(w *storage.Writer, l *wordgames.Leaderboard) error {
 	encoded, err := json.Marshal(l)
 	if err != nil {
 		return err
 	}
-	return b.Put([]byte("current"), encoded)
+	return w.PutBlob(storage.BlobLeaderboard, "current", encoded)
 }
 
-// loadLeaderboard loads the leaderboard state from the database.
-func loadLeaderboard(tx *bbolt.Tx) (*wordgames.Leaderboard, error) {
-	b := tx.Bucket([]byte(LeaderboardBucket))
-	if b == nil {
-		return nil, fmt.Errorf("LeaderboardBucket not found")
+// loadLeaderboard loads the leaderboard state.
+func loadLeaderboard(r *storage.Reader) (*wordgames.Leaderboard, error) {
+	v, err := r.GetBlob(storage.BlobLeaderboard, "current")
+	if err != nil {
+		return nil, err
 	}
-	v := b.Get([]byte("current"))
 	if v == nil {
 		return wordgames.NewLeaderboard(), nil // No state saved, create a new one
 	}
@@ -931,47 +800,40 @@ func loadLeaderboard(tx *bbolt.Tx) (*wordgames.Leaderboard, error) {
 	return &l, nil
 }
 
-// loadAllUserStats loads all user message counts from the StatsBucket for the current week.
-func loadAllUserStats(tx *bbolt.Tx) (map[string]int, error) {
-	statsB := tx.Bucket([]byte(StatsBucket))
-	if statsB == nil {
-		return nil, fmt.Errorf("StatsBucket not found")
+// startOfWeekUTC is the Monday 00:00 UTC that the current week began at.
+//
+// Hoisted because the same five lines were open-coded in two places, the reader that
+// filters the chat leaderboard and the writer that resets a user's count, and those
+// two disagreeing would mean a user's stats were counted for a week the leaderboard
+// was not showing.
+func startOfWeekUTC(now time.Time) time.Time {
+	now = now.UTC()
+	daysSinceMonday := (now.Weekday() - time.Monday + 7) % 7
+	return now.Truncate(24 * time.Hour).Add(-time.Duration(daysSinceMonday) * 24 * time.Hour)
+}
+
+// loadAllUserStats returns each user's message count for the current week.
+//
+// Two pieces of tolerance went away with the layout. It no longer skips keys that
+// are not numeric, because the stats bucket no longer holds a non-user key:
+// total_messages_learned is a meta counter now. And it no longer falls back to
+// decoding a bare integer for the "old format", because there is no old format to
+// read: storage.Open refuses a corpus written before M6 outright rather than
+// half-understanding it.
+func loadAllUserStats(r *storage.Reader) (map[string]int, error) {
+	all, err := r.AllUserStats()
+	if err != nil {
+		return nil, err
 	}
 
-	scores := make(map[string]int)
-
-	now := time.Now().UTC()
-	// Determine the start of the current week (Monday).
-	weekday := now.Weekday()
-	daysSinceMonday := (weekday - time.Monday + 7) % 7
-	startOfWeek := now.Truncate(24 * time.Hour).Add(-time.Duration(daysSinceMonday) * 24 * time.Hour)
-
-	err := statsB.ForEach(func(k, v []byte) error {
-		// Skip non-user ID stats like "total_messages_learned"
-		if _, err := strconv.ParseInt(string(k), 10, 64); err != nil {
-			return nil
-		}
-		var stat WeeklyStat
-		if err := json.Unmarshal(v, &stat); err != nil {
-			// Could be old format (just an int). Try to unmarshal that.
-			var count int
-			if err2 := json.Unmarshal(v, &count); err2 == nil {
-				// It's the old format. Include it for now.
-				// It will be converted to the new format when the user next speaks.
-				scores[string(k)] = count
-			}
-			return nil // Skip to the next item
-		}
-
-		// Only include stats from the current week.
+	startOfWeek := startOfWeekUTC(time.Now())
+	scores := make(map[string]int, len(all))
+	for userID, stat := range all {
 		if !stat.LastTimestamp.Before(startOfWeek) {
-			scores[string(k)] = stat.Count
+			scores[userID] = int(stat.Count)
 		}
-
-		return nil
-	})
-
-	return scores, err
+	}
+	return scores, nil
 }
 
 // isTimeToResetLeaderboard checks an NTP server to see if it's Monday morning UTC.
@@ -989,23 +851,18 @@ func isTimeToResetLeaderboard() (bool, error) {
 	return false, nil
 }
 
-func getNextMap(prefix string) (map[string]int, error) {
-	var nextMap map[string]int
-	err := db.View(func(tx *bbolt.Tx) error {
-		markovB := tx.Bucket([]byte(MarkovBucket))
-		if markovB == nil {
-			return nil
-		}
-		if v := markovB.Get([]byte(prefix)); v != nil {
-			_ = json.Unmarshal(v, &nextMap)
-		}
-		return nil
-	})
-	return nextMap, err
-}
+// getNextMap is gone, and it was the other half of finding 1.
+//
+// It opened its own db.View to read one prefix's successor map, and it was called
+// from inside the read transaction that wraps generation, once per candidate per
+// backoff step per word. So the hottest path in the bot opened a nested bbolt
+// transaction thousands of times per reply. Its caller now takes the *storage.Reader
+// it is already inside and calls Reader.Successors, which is also a range scan over
+// fixed-width values instead of unmarshalling a map that can hold thousands of
+// entries.
 
 // learnMessage ingests and learns from a single message.
-func learnMessage(tx *bbolt.Tx, msg, msgID, botID string, author MentionedUser, mentionedUsers []MentionedUser) error {
+func learnMessage(w *storage.Writer, msg, msgID, botID string, author MentionedUser, mentionedUsers []MentionedUser) error {
 	msg = botMentionPattern(botID).ReplaceAllString(msg, "")
 	msg = strings.TrimSpace(msg)
 	if msg == "" {
@@ -1043,70 +900,58 @@ func learnMessage(tx *bbolt.Tx, msg, msgID, botID string, author MentionedUser, 
 
 	startTime := time.Now()
 
-	// Get buckets within the existing transaction.
-	// Note: `tx` is already provided by the calling function (e.g., processChannelIncremental)
-	// so we do not need to call `db.Update` here.
-
-	// ... (bucket retrieval is the same)
-	historyB := tx.Bucket([]byte(HistoryBucket))
-	markovB := tx.Bucket([]byte(MarkovBucket))
-	topicB := tx.Bucket([]byte(TopicBucket))
-	nameTopicB := tx.Bucket([]byte(NameTopicBucket))
-	statsB := tx.Bucket([]byte(StatsBucket))
-
-	if historyB == nil || markovB == nil || topicB == nil || nameTopicB == nil || statsB == nil {
-		return fmt.Errorf("missing bucket")
+	// The dedup window. Checked before anything is written, because the backfill
+	// re-reads recent history and without this every pass would re-learn the same
+	// messages and double-count their n-grams (finding 13).
+	//
+	// A message ID that is not a snowflake is an error rather than a miss: it means
+	// a caller invented one, and silently learning it twice is worse than saying so.
+	seen, err := w.Seen(msgID)
+	if err != nil {
+		return fmt.Errorf("dedup check for message %s: %w", msgID, err)
 	}
-
-	if historyB.Get([]byte(msgID)) != nil {
+	if seen {
 		return nil
 	}
 
 	// Update user stats
 	if author.UserID != "" {
-		if _, err := learnOrUpdateName(tx, author.Name, author.UserID, author.Username); err == nil {
-			var stat WeeklyStat
-			if v := statsB.Get([]byte(author.UserID)); v != nil {
-				_ = json.Unmarshal(v, &stat)
+		if _, err := learnOrUpdateName(w, author.Name, author.UserID, author.Username); err == nil {
+			stat, _, err := w.UserStat(author.UserID)
+			if err != nil {
+				return fmt.Errorf("read stats for %s: %w", author.UserID, err)
 			}
-
 			now := time.Now().UTC()
-			// Determine the start of the current week (Monday).
-			weekday := now.Weekday()
-			daysSinceMonday := (weekday - time.Monday + 7) % 7
-			startOfWeek := now.Truncate(24 * time.Hour).Add(-time.Duration(daysSinceMonday) * 24 * time.Hour)
-
-			if stat.LastTimestamp.Before(startOfWeek) {
-				// It's a new week for this user
-				stat.Count = 1
+			if stat.LastTimestamp.Before(startOfWeekUTC(now)) {
+				stat.Count = 1 // It's a new week for this user
 			} else {
 				stat.Count++
 			}
 			stat.LastTimestamp = now
-
-			statBytes, _ := json.Marshal(stat)
-			_ = statsB.Put([]byte(author.UserID), statBytes)
+			if err := w.PutUserStat(author.UserID, stat); err != nil {
+				return fmt.Errorf("write stats for %s: %w", author.UserID, err)
+			}
 		}
 	}
 
-	// Increment total messages learned counter
-	var totalLearnedCount int
-	if v := statsB.Get([]byte("total_messages_learned")); v != nil {
-		_ = json.Unmarshal(v, &totalLearnedCount)
+	if err := w.IncMessagesLearned(); err != nil {
+		return fmt.Errorf("bump learned counter: %w", err)
 	}
-	totalLearnedCount++
-	totalLearnedBytes, _ := json.Marshal(totalLearnedCount)
-	_ = statsB.Put([]byte("total_messages_learned"), totalLearnedBytes)
 
-	// Increment global topic counts
-	for _, w := range words {
-		_ = incTopicInTx(topicB, toLowerCaseExceptURLs(w)) // Use helper
+	// Increment global topic counts. This is also where unigram frequency lives, one
+	// key per word, which is where it always belonged: the old ingestion loop tried
+	// to keep it in the n-gram bucket under an empty prefix and that key held a map
+	// of the entire vocabulary (finding 5).
+	for _, word := range words {
+		if err := w.IncTopic(toLowerCaseExceptURLs(word)); err != nil {
+			return fmt.Errorf("increment topic: %w", err)
+		}
 	}
 
 	// Create a set of canonical names to process for this message.
 	canonicalNames := make(map[string]struct{})
 	for _, user := range mentionedUsers {
-		canonical, err := learnOrUpdateName(tx, user.Name, user.UserID, user.Username)
+		canonical, err := learnOrUpdateName(w, user.Name, user.UserID, user.Username)
 		if err != nil {
 			log.Printf("[WARN] Failed to learn name '%s': %v", user.Name, err)
 			continue
@@ -1115,16 +960,14 @@ func learnMessage(tx *bbolt.Tx, msg, msgID, botID string, author MentionedUser, 
 	}
 
 	// Update associations for each unique canonical name.
+	//
+	// One composite-key put per (name, word) pair, where this used to read a JSON map
+	// of every word ever associated with the name, mutate it in memory, and write the
+	// whole thing back. On a name that has been discussed a lot that map is thousands
+	// of entries rewritten per message.
 	for canonicalName := range canonicalNames {
-		var nameTopicAssoc map[string]WordPosData
-		if v := nameTopicB.Get([]byte(canonicalName)); v != nil {
-			_ = json.Unmarshal(v, &nameTopicAssoc)
-		} else {
-			nameTopicAssoc = make(map[string]WordPosData)
-		}
-
-		for i, w := range words {
-			lw := toLowerCaseExceptURLs(w) // Use helper
+		for i, word := range words {
+			lw := toLowerCaseExceptURLs(word)
 			if lw == "<end>" {
 				continue
 			}
@@ -1132,151 +975,100 @@ func learnMessage(tx *bbolt.Tx, msg, msgID, botID string, author MentionedUser, 
 			if _, isStop := stopWords[lw]; isStop {
 				continue
 			}
-			pos := float64(i) / float64(len(words))
-
-			// Update NameTopicBucket
-			topicData, ok := nameTopicAssoc[lw]
-			if !ok {
-				topicData = WordPosData{Count: 0, PosSum: 0}
+			if err := w.AddNameTopic(canonicalName, lw, float64(i)/float64(len(words))); err != nil {
+				return fmt.Errorf("associate %q with %q: %w", canonicalName, lw, err)
 			}
-			topicData.Count++
-			topicData.PosSum += pos
-			nameTopicAssoc[lw] = topicData
 		}
-		out, _ := json.Marshal(nameTopicAssoc)
-		_ = nameTopicB.Put([]byte(canonicalName), out)
 	}
 
-	// If any names were involved, update global word/topic associations.
-	// This ensures the global graph is built from user-provided context.
+	// If any names were involved, update global word-to-word associations. This
+	// ensures the global graph is built from user-provided context.
+	//
+	// Still all-pairs and still O(n^2) in message length, which is finding 12 and
+	// belongs to M7's co-occurrence window. What changed is the cost per pair: each
+	// one is now a 16-byte read-add-write on its own key instead of a member of a
+	// JSON map that grows without bound.
+	//
+	// The separate topic-cluster pass that used to follow this is gone, and it was
+	// pure duplication: it recorded the same word pairs from the same messages under
+	// the same stop-word exclusion, canonicalised into one order and WITHOUT the
+	// position sum, into a second bucket. Everything it stored is derivable from what
+	// this loop stores, so the layout has one co-occurrence index rather than two
+	// that could disagree (SPEC.md section 8, finding 28).
 	if len(canonicalNames) > 0 {
-		// Update TopicWordBucket for word-to-word associations
-		topicWordB := tx.Bucket([]byte(TopicWordBucket))
-		if topicWordB != nil {
-			topicWordUpdates := make(map[string]map[string]WordPosData)
-			for _, word := range words {
-				lw := toLowerCaseExceptURLs(word) // Use helper
-				if lw == "<end>" {
+		for i, wordA := range words {
+			lwA := toLowerCaseExceptURLs(wordA)
+			if lwA == "<end>" {
+				continue
+			}
+			if _, isStop := stopWords[lwA]; isStop {
+				continue
+			}
+			for j, wordB := range words {
+				if i == j {
 					continue
 				}
-				if _, exists := topicWordUpdates[lw]; !exists {
-					var wordAssoc map[string]WordPosData
-					if v := topicWordB.Get([]byte(lw)); v != nil {
-						_ = json.Unmarshal(v, &wordAssoc)
-					} else {
-						wordAssoc = make(map[string]WordPosData)
-					}
-					topicWordUpdates[lw] = wordAssoc
-				}
-			}
-
-			for i, wordA := range words {
-				lwA := toLowerCaseExceptURLs(wordA) // Use helper
-				if lwA == "<end>" {
+				lwB := toLowerCaseExceptURLs(wordB)
+				if lwB == "<end>" {
 					continue
 				}
-				if _, isStop := stopWords[lwA]; isStop {
+				if _, isStop := stopWords[lwB]; isStop {
 					continue
 				}
-				for j, wordB := range words {
-					if i == j {
-						continue
-					}
-					lwB := toLowerCaseExceptURLs(wordB) // Use helper
-					if lwB == "<end>" {
-						continue
-					}
-					if _, isStop := stopWords[lwB]; isStop {
-						continue
-					}
-					assocMapA := topicWordUpdates[lwA]
-					dataB := assocMapA[lwB]
-					dataB.Word = lwB
-					dataB.Count++
-					dataB.PosSum += float64(j) / float64(len(words))
-					assocMapA[lwB] = dataB
-				}
-			}
-
-			for topic, wordAssocMap := range topicWordUpdates {
-				out, _ := json.Marshal(wordAssocMap)
-				_ = topicWordB.Put([]byte(topic), out)
-			}
-		}
-
-		// Update Topic Clusters based on all words in the message
-		topicClusterB := tx.Bucket([]byte(TopicClusterBucket))
-		if topicClusterB != nil {
-			uniqueWords := make(map[string]struct{})
-			for _, word := range words {
-				lw := toLowerCaseExceptURLs(word) // Use helper
-				if lw != "<end>" {
-					uniqueWords[lw] = struct{}{}
-				}
-			}
-			topicList := make([]string, 0, len(uniqueWords))
-			for topic := range uniqueWords {
-				topicList = append(topicList, topic)
-			}
-
-			for i := 0; i < len(topicList); i++ {
-				for j := i + 1; j < len(topicList); j++ {
-					topicA, topicB := topicList[i], topicList[j]
-					if _, isStopA := stopWords[topicA]; isStopA {
-						continue
-					}
-					if _, isStopB := stopWords[topicB]; isStopB {
-						continue
-					}
-					var key string
-					if topicA < topicB {
-						key = fmt.Sprintf("%s|%s", topicA, topicB)
-					} else {
-						key = fmt.Sprintf("%s|%s", topicB, topicA)
-					}
-					var clusterData TopicClusterData
-					if v := topicClusterB.Get([]byte(key)); v != nil {
-						if err := json.Unmarshal(v, &clusterData); err != nil {
-							// Skip rather than fall through: on a decode error
-							// clusterData stays zero, so the Count++ below would
-							// write 1 and silently discard however many
-							// co-occurrences had already accumulated for this pair.
-							log.Printf("[WARN] topic cluster %q has an undecodable value, skipping: %v", key, err)
-							continue
-						}
-					}
-					clusterData.Count++
-					out, _ := json.Marshal(clusterData)
-					_ = topicClusterB.Put([]byte(key), out)
+				if err := w.AddTopicWord(lwA, lwB, float64(j)/float64(len(words))); err != nil {
+					return fmt.Errorf("associate %q with %q: %w", lwA, lwB, err)
 				}
 			}
 		}
 	}
 
-	// ... (Markov n-gram ingestion is the same)
+	// Markov n-gram ingestion.
+	//
+	// The loop starts at 2, not 1, and that single bound is finding 5. At n == 1 the
+	// prefix slice is empty, so the key was "" and every unigram in the corpus
+	// accumulated into ONE bbolt key whose value was a JSON map of the entire
+	// vocabulary, unmarshalled and re-marshalled once per word per message. Nothing
+	// ever read it, because every reader builds a prefix of at least one word. It was
+	// pure write amplification and the dominant reason the file reached 128 MB.
+	//
+	// Writer.LearnNgram refuses an empty prefix as well, so the bug cannot come back
+	// through a different caller rather than only being avoided here.
+	//
+	// authorID is empty for the bot's own output, which is what keeps self-learning
+	// out of the author-diversity counts: if the bot counted as an author, anything it
+	// said once would bootstrap itself toward eligibility to be said again
+	// (SPEC.md section 4, A6).
+	authorID := author.UserID
+	if authorID == botID {
+		authorID = ""
+	}
+
 	totalNgrams := 0
-	for n := cfg.MaxNGram; n >= 1; n-- {
+	for n := cfg.MaxNGram; n >= 2; n-- {
 		if len(words) < n {
 			continue
 		}
 		for i := 0; i <= len(words)-n; i++ {
-			key := toLowerCaseExceptURLs(strings.Join(words[i:i+n-1], " ")) // Use helper
-			next := toLowerCaseExceptURLs(words[i+n-1])                     // Use helper
-			ng, _ := getMapFromBucket(markovB, key)
-			if ng == nil {
-				ng = make(map[string]int)
+			prefix := toLowerCaseExceptURLs(strings.Join(words[i:i+n-1], " "))
+			next := toLowerCaseExceptURLs(words[i+n-1])
+			if err := w.LearnNgram(prefix, next, authorID); err != nil {
+				return fmt.Errorf("learn %q -> %q: %w", prefix, next, err)
 			}
-			ng[next]++
-			_ = putJSONToBucket(markovB, key, ng)
 			totalNgrams++
 		}
 	}
 
-	_ = historyB.Put([]byte(msgID), []byte(msg))
-	_ = trimHistoryInTx(historyB, cfg.MaxHistory)
+	// Recorded last, so a failure anywhere above rolls the whole message back rather
+	// than marking it seen and then not learning it.
+	if err := w.MarkSeen(msgID, time.Now(), cfg.MaxHistory); err != nil {
+		return fmt.Errorf("mark message %s seen: %w", msgID, err)
+	}
 
+	// The history size comes from a counter rather than Bucket.Stats(), which walked
+	// every page in the bucket once per message to fill this one log field
+	// (finding 11).
 	log.Printf("[LEARNED] msg=%q | words=%d | ngrams=%d | history=%d | names=%d | took=%s",
-		msg, len(words), totalNgrams, historyB.Stats().KeyN, len(canonicalNames), time.Since(startTime))
+		msg, len(words), totalNgrams, w.HistoryCount(), len(canonicalNames), time.Since(startTime))
 
 	return nil
 } // ----------------------------
@@ -1338,12 +1130,40 @@ func (cm *ConversationMemory) GetWeightedWords() []string {
 	return weightedWords
 }
 
-// extractNamesFromMessage returns Discord usernames and display names mentioned in a message
+// extractNamesFromMessage returns Discord usernames and display names mentioned in
+// a message.
+//
+// It is deliberately split into two phases, and the split is about transaction
+// duration rather than tidiness. Phase one makes REST calls (GuildMember, to resolve
+// nicknames) and touches no corpus. Phase two reads the corpus and makes no network
+// call. It used to be one pass, which held a bbolt read transaction open across N
+// HTTP round trips: a read transaction holds mmaplock.RLock for its entire life, so
+// every writer waiting to grow the mmap was waiting on Discord's latency.
+//
+// No caller may invoke this from inside a transaction. That is not a convention here
+// but a consequence: the store is the only thing that can open one, and a caller that
+// already holds a Reader has namesFromContent below instead.
 func extractNamesFromMessage(s *discordgo.Session, m *discordgo.MessageCreate, guildID string) []MentionedUser {
+	users, seenIDs := mentionedUsersFromMentions(s, m, guildID)
+
+	var fromContent []MentionedUser
+	if err := store.View(func(r *storage.Reader) error {
+		fromContent = namesFromContent(r, m.Content, seenIDs)
+		return nil
+	}); err != nil {
+		log.Printf("[WARN] name lookup for message %s failed, using @mentions only: %v", m.ID, err)
+		return users
+	}
+	return append(users, fromContent...)
+}
+
+// mentionedUsersFromMentions is phase one: explicit @mentions, resolved to their
+// server nicknames over REST. It returns the set of user IDs it consumed so phase two
+// does not add anyone twice.
+func mentionedUsersFromMentions(s *discordgo.Session, m *discordgo.MessageCreate, guildID string) ([]MentionedUser, map[string]struct{}) {
 	users := []MentionedUser{}
 	seenIDs := make(map[string]struct{})
 
-	// 1. Process explicit @mentions first.
 	for _, u := range m.Mentions {
 		if _, ok := seenIDs[u.ID]; ok {
 			continue
@@ -1361,49 +1181,42 @@ func extractNamesFromMessage(s *discordgo.Session, m *discordgo.MessageCreate, g
 			}
 		}
 	}
+	return users, seenIDs
+}
 
-	// 2. Scan message content for any other known names that weren't @mentioned.
-	words := tokenize(m.Content)
-	_ = db.View(func(tx *bbolt.Tx) error {
-		nameB := tx.Bucket([]byte(NameBucket))
-		if nameB == nil {
-			return nil
+// namesFromContent is phase two: known names appearing in the text that were not
+// @mentioned. It takes the Reader rather than opening a transaction, so it is usable
+// from a caller that already holds one, and adds to seenIDs as it goes.
+func namesFromContent(r *storage.Reader, content string, seenIDs map[string]struct{}) []MentionedUser {
+	var users []MentionedUser
+	for _, word := range tokenize(content) {
+		lw := toLowerCaseExceptURLs(word)
+		data, ok, err := r.Name(lw)
+		if err != nil || !ok {
+			continue
 		}
 
-		for _, word := range words {
-			lw := toLowerCaseExceptURLs(word)
-			if v := nameB.Get([]byte(lw)); v != nil {
-				var data NameData
-				if err := json.Unmarshal(v, &data); err != nil {
-					continue // Skip malformed data.
-				}
-
-				// Determine the canonical name for the found word (which could be an alias).
-				canonicalName := lw
-				if data.CanonicalName != "" {
-					canonicalName = data.CanonicalName
-				}
-
-				// Fetch the full data for the canonical name to get the UserID.
-				var canonicalData NameData
-				if vCanonical := nameB.Get([]byte(canonicalName)); vCanonical != nil {
-					if err := json.Unmarshal(vCanonical, &canonicalData); err == nil {
-						// If we haven't already processed this user via @mention, add them.
-						if _, ok := seenIDs[canonicalData.DiscordUser]; !ok && canonicalData.DiscordUser != "" {
-							seenIDs[canonicalData.DiscordUser] = struct{}{}
-							users = append(users, MentionedUser{
-								Name:     canonicalName,
-								UserID:   canonicalData.DiscordUser,
-								Username: canonicalName,
-							})
-						}
-					}
-				}
-			}
+		// Determine the canonical name for the found word, which could be an alias.
+		canonicalName := lw
+		if data.Canonical != "" {
+			canonicalName = data.Canonical
 		}
-		return nil
-	})
 
+		// Fetch the full record for the canonical name to get the user ID.
+		canonicalData, ok, err := r.Name(canonicalName)
+		if err != nil || !ok || canonicalData.DiscordUserID == "" {
+			continue
+		}
+		if _, dup := seenIDs[canonicalData.DiscordUserID]; dup {
+			continue
+		}
+		seenIDs[canonicalData.DiscordUserID] = struct{}{}
+		users = append(users, MentionedUser{
+			Name:     canonicalName,
+			UserID:   canonicalData.DiscordUserID,
+			Username: canonicalName,
+		})
+	}
 	return users
 }
 
@@ -1543,8 +1356,8 @@ func processChannelIncremental(ctx context.Context, s *discordgo.Session, ch *di
 			authorInfo.Name = m.Member.Nick
 		}
 
-		err := db.Update(func(tx *bbolt.Tx) error {
-			return learnMessage(tx, m.Content, m.ID, botID, authorInfo, names)
+		err := store.Update(func(w *storage.Writer) error {
+			return learnMessage(w, m.Content, m.ID, botID, authorInfo, names)
 		})
 
 		if err != nil {
@@ -1666,22 +1479,30 @@ func applyEdgyStyle(s string, isAboutName bool) string {
 	return s
 }
 
-// findBestSeed analyzes the prompt and context to find the highest-quality starting seed.
-func findBestSeed(tx *bbolt.Tx, in *text.Interner, promptWords, recentWords, recognizedNames []string) string {
+// findBestSeed analyzes the prompt and context to find the highest-quality starting
+// seed.
+//
+// Two of the seven priority tiers it used to have are gone, and both for the same
+// reason: they read buckets that recorded nothing the surviving indexes do not.
+//
+// The concept-cluster tier scored at weight 50, higher than everything else here, and
+// had never once fired. Cluster members were persisted with string keys and decoded
+// into map[int]float32, which fails for every cluster, and the decode was guarded by
+// `err == nil` with no else, so the tier silently contributed nothing for the whole
+// life of the bot (SPEC.md section 8, finding 27). It is also unfixable as written:
+// the members are text.Interner ids, and those depend on insertion order, so an id
+// written to disk means a different word to the next process. M8 rebuilds it.
+//
+// The two topic-cluster tiers read a bucket that stored the same word pairs as the
+// topic-word index, minus the position data, so tiers 2 and 4 asked the topic-word
+// index a question it could already answer. They are folded into the name-topic and
+// topic-word tiers below, keeping their weights (finding 28).
+func findBestSeed(r *storage.Reader, in *text.Interner, promptWords, recentWords, recognizedNames []string) string {
 	type candidate struct {
 		key    int
 		weight float64
 	}
 	candidateMap := make(map[int]float64)
-
-	markovB := tx.Bucket([]byte(MarkovBucket))
-	if markovB == nil {
-		log.Printf("[WARN] findBestSeed: MarkovBucket not found")
-		return "<START>"
-	}
-	nameTopicB := tx.Bucket([]byte(clustering.NameTopicBucket))
-	topicWordB := tx.Bucket([]byte(TopicWordBucket))
-	topicClusterB := tx.Bucket([]byte(clustering.TopicClusterBucket))
 
 	addCandidate := func(key int, weight float64) {
 		if existingWeight, ok := candidateMap[key]; !ok || weight > existingWeight {
@@ -1689,141 +1510,86 @@ func findBestSeed(tx *bbolt.Tx, in *text.Interner, promptWords, recentWords, rec
 		}
 	}
 
-	// 1. High Priority: Use Concept Clusters for seed generation
-	if conceptClusterB := tx.Bucket([]byte(clustering.ConceptClusterBucket)); conceptClusterB != nil {
-		for _, word := range promptWords {
-			wordIdx, ok := in.ID(word)
-			if !ok {
-				continue
-			}
-			// Find which cluster the prompt word belongs to
-			c := conceptClusterB.Cursor()
-			for k, v := c.First(); k != nil; k, v = c.Next() {
-				var cluster ConceptCluster
-				if err := json.Unmarshal(v, &cluster); err == nil {
-					if _, ok := cluster.Members[wordIdx]; ok {
-						// Add all members of the cluster as high-weight candidates
-						for memberIdx := range cluster.Members {
-							addCandidate(memberIdx, 50.0) // High weight for being in a relevant cluster
-						}
-						break // Move to the next prompt word
-					}
-				}
-			}
-		}
-	}
-
-	// 2. High Priority: Multi-word n-grams from the prompt.
+	// 1. High Priority: Multi-word n-grams from the prompt.
+	//
+	// n starts at 1 rather than at MaxNGram-1 downward being cut off, because a
+	// single-word prefix is a legitimate n-gram context in the new layout: the key is
+	// <prefix> NUL <next>, so "bird" has successors of its own.
 	for n := cfg.MaxNGram - 1; n >= 1; n-- {
 		for i := 0; i <= len(promptWords)-n; i++ {
 			key := toLowerCaseExceptURLs(strings.Join(promptWords[i:i+n], " "))
-			if markovB.Get([]byte(key)) != nil {
+			if r.HasSuccessors(key) {
 				addCandidate(in.Intern(key), float64(n*30))
 			}
 		}
 	}
 
-	// 2. Name-Cluster Expansion: Find topics clustered with recognized names.
-	if topicClusterB != nil && len(recognizedNames) > 0 {
-		for _, name := range recognizedNames {
-			prefix := []byte(toLowerCaseExceptURLs(name) + "|")
-			c := topicClusterB.Cursor()
-			for k, v := c.Seek(prefix); k != nil && strings.HasPrefix(string(k), string(prefix)); k, v = c.Next() {
-				parts := strings.Split(string(k), "|")
-				if len(parts) == 2 {
-					associatedTopic := parts[1]
-					var clusterData TopicClusterData
-					if err := json.Unmarshal(v, &clusterData); err != nil {
-						log.Printf("[WARN] findBestSeed: failed to unmarshal cluster data for key %s: %v", k, err)
-						continue
-					}
-					addCandidate(in.Intern(associatedTopic), 25.0+math.Sqrt(float64(clusterData.Count)))
-				}
-			}
+	// 2. Name Expansion: topics this message's names are associated with. This is the
+	// former name-cluster tier, answered from the name-topic index at its old weight.
+	for _, name := range recognizedNames {
+		assocs, err := r.NameTopicsFor(toLowerCaseExceptURLs(name))
+		if err != nil {
+			log.Printf("[WARN] findBestSeed: name-topic lookup for %s failed: %v", name, err)
+			continue
+		}
+		for topic, data := range assocs {
+			addCandidate(in.Intern(topic), 25.0+math.Sqrt(float64(data.Count)))
 		}
 	}
 
 	// 3. Associative Expansion: Find words related to the prompt words.
-	if topicWordB != nil {
-		for _, word := range promptWords {
-			topic := toLowerCaseExceptURLs(word)
-			if v := topicWordB.Get([]byte(topic)); v != nil {
-				var wordAssoc map[string]WordPosData
-				if err := json.Unmarshal(v, &wordAssoc); err != nil {
-					log.Printf("[WARN] findBestSeed: failed to unmarshal word association for topic %s: %v", topic, err)
-					continue
-				}
-				for associatedWord, data := range wordAssoc {
-					if associatedWord != topic && data.Count > 1 {
-						addCandidate(in.Intern(associatedWord), 18.0+math.Sqrt(float64(data.Count)))
-					}
-				}
+	for _, word := range promptWords {
+		topic := toLowerCaseExceptURLs(word)
+		assocs, err := r.TopicWordsFor(topic)
+		if err != nil {
+			log.Printf("[WARN] findBestSeed: topic-word lookup for %s failed: %v", topic, err)
+			continue
+		}
+		for associatedWord, data := range assocs {
+			if associatedWord != topic && data.Count > 1 {
+				addCandidate(in.Intern(associatedWord), 18.0+math.Sqrt(float64(data.Count)))
 			}
 		}
 	}
 
-	// 4. Topic Cluster Expansion: Find words from related topic clusters.
-	if topicClusterB != nil {
-		for _, word := range promptWords {
-			lw := toLowerCaseExceptURLs(word)
-			prefix := []byte(lw + "|")
-			c := topicClusterB.Cursor()
-			for k, v := c.Seek(prefix); k != nil && strings.HasPrefix(string(k), string(prefix)); k, v = c.Next() {
-				parts := strings.Split(string(k), "|")
-				if len(parts) == 2 {
-					associatedTopic := parts[1]
-					var clusterData TopicClusterData
-					if err := json.Unmarshal(v, &clusterData); err != nil {
-						log.Printf("[WARN] findBestSeed: failed to unmarshal cluster data for key %s: %v", k, err)
-						continue
-					}
-					addCandidate(in.Intern(associatedTopic), 15.0+math.Sqrt(float64(clusterData.Count)))
-				}
-			}
-		}
-	}
-
-	// 5. Medium-High Priority: Topics directly associated with recognized names.
-	if len(recognizedNames) > 0 && nameTopicB != nil {
+	// 4. Medium-High Priority: Topics directly associated with the most recent
+	// recognized name, restricted to ones the chain can actually continue from.
+	if len(recognizedNames) > 0 {
 		name := toLowerCaseExceptURLs(recognizedNames[len(recognizedNames)-1])
-		if v := nameTopicB.Get([]byte(name)); v != nil {
-			var topicAssoc map[string]TopicAssociationData
-			if err := json.Unmarshal(v, &topicAssoc); err != nil {
-				log.Printf("[WARN] findBestSeed: failed to unmarshal topic association for name %s: %v", name, err)
-			} else {
-				for topic, data := range topicAssoc {
-					if markovB.Get([]byte(topic)) != nil {
-						addCandidate(in.Intern(topic), 10.0+math.Sqrt(float64(data.Count)))
-					}
+		assocs, err := r.NameTopicsFor(name)
+		if err != nil {
+			log.Printf("[WARN] findBestSeed: name-topic lookup for %s failed: %v", name, err)
+		} else {
+			for topic, data := range assocs {
+				if r.HasSuccessors(topic) {
+					addCandidate(in.Intern(topic), 10.0+math.Sqrt(float64(data.Count)))
 				}
 			}
 		}
 	}
 
-	// 6. Medium Priority: Single words from the prompt.
+	// 5. Medium Priority: Single words from the prompt.
 	for _, word := range promptWords {
 		lw := toLowerCaseExceptURLs(word)
-		if markovB.Get([]byte(lw)) != nil {
+		if r.HasSuccessors(lw) {
 			addCandidate(in.Intern(lw), 15.0)
 		}
 	}
 
-	// 7. Low Priority: Recent context fallback.
+	// 6. Low Priority: Recent context fallback.
 	for n := cfg.MaxNGram - 1; n >= 1; n-- {
 		for i := 0; i <= len(recentWords)-n; i++ {
 			key := toLowerCaseExceptURLs(strings.Join(recentWords[i:i+n], " "))
-			if markovB.Get([]byte(key)) != nil {
+			if r.HasSuccessors(key) {
 				addCandidate(in.Intern(key), float64(n))
 			}
 		}
 	}
 
 	if len(candidateMap) == 0 {
-		// Absolute fallback.
-		c := markovB.Cursor()
-		k, _ := c.First()
-		if k != nil {
-			return string(k)
+		// Absolute fallback: any real prefix beats a sentinel with no continuations.
+		if prefix, ok := r.FirstPrefix(); ok {
+			return prefix
 		}
 		return "<START>"
 	}
@@ -1852,75 +1618,38 @@ func findBestSeed(tx *bbolt.Tx, in *text.Interner, promptWords, recentWords, rec
 	return in.Word(candidates[0].key)
 }
 
-// performClustering runs an agglomerative clustering algorithm to merge and refine concepts.
-func performClustering() {
-	err := clustering.PerformClusteringOptimized(db, nil)
-	if err != nil {
-		log.Printf("[ERR] Optimized clustering pass failed: %v", err)
-	}
-}
-
 // findJumpWord attempts to find a related word when generation hits a dead end.
-func findJumpWord(tx *bbolt.Tx, in *text.Interner, promptWords, currentWords, recognizedNames []string) string {
-	nameTopicB := tx.Bucket([]byte(clustering.NameTopicBucket))
-	topicWordB := tx.Bucket([]byte(TopicWordBucket))
-	if topicWordB == nil || nameTopicB == nil {
-		return ""
-	}
-
+//
+// The concept-cluster pivot that used to sit between the two surviving tiers is gone
+// for the reasons on findBestSeed: it had never fired, and its members are interner
+// ids that cannot mean anything across processes. M8 owns the replacement.
+//
+// The interner parameter went with it. Nothing left here needs one.
+func findJumpWord(r *storage.Reader, promptWords, currentWords, recognizedNames []string) string {
 	// 1. Name-Centric Pivot: Prioritize finding a topic related to a recognized name.
 	if len(recognizedNames) > 0 {
 		// Use the most recently mentioned name as the primary context.
 		name := toLowerCaseExceptURLs(recognizedNames[len(recognizedNames)-1])
-		if v := nameTopicB.Get([]byte(name)); v != nil {
-			var topicAssoc map[string]TopicAssociationData
-			if json.Unmarshal(v, &topicAssoc) == nil {
-				bestJump := ""
-				closestDist := 0.5 // Target the middle of the sentence for a pivot
-				for topic, data := range topicAssoc {
-					if data.Count > 1 { // Require at least two occurrences to be considered a stable topic
-						avgPos := data.PosSum / float64(data.Count)
-						dist := math.Abs(avgPos - 0.5) // Find topic closest to the middle of a sentence
-						if dist < closestDist {
-							closestDist = dist
-							bestJump = topic
-						}
+		if topicAssoc, err := r.NameTopicsFor(name); err == nil {
+			bestJump := ""
+			closestDist := 0.5 // Target the middle of the sentence for a pivot
+			for topic, data := range topicAssoc {
+				if data.Count > 1 { // Require at least two occurrences to be a stable topic
+					dist := math.Abs(data.MeanPosition() - 0.5)
+					if dist < closestDist {
+						closestDist = dist
+						bestJump = topic
 					}
 				}
-				if bestJump != "" {
-					log.Printf("[INFO] Generation stuck, jumping via name->topic: '%s'", bestJump)
-					return bestJump
-				}
+			}
+			if bestJump != "" {
+				log.Printf("[INFO] Generation stuck, jumping via name->topic: '%s'", bestJump)
+				return bestJump
 			}
 		}
 	}
 
-	// 2. Concept Cluster Pivot: If we're stuck, try to jump to a related concept.
-	if conceptClusterB := tx.Bucket([]byte(clustering.ConceptClusterBucket)); conceptClusterB != nil {
-		for _, word := range currentWords {
-			wordIdx, ok := in.ID(word)
-			if !ok {
-				continue
-			}
-			c := conceptClusterB.Cursor()
-			for k, v := c.First(); k != nil; k, v = c.Next() {
-				var cluster ConceptCluster
-				if err := json.Unmarshal(v, &cluster); err == nil {
-					if _, ok := cluster.Members[wordIdx]; ok {
-						// Found a cluster, pick a random member to jump to
-						for memberIdx := range cluster.Members {
-							if memberIdx != wordIdx { // Avoid jumping to the same word
-								log.Printf("[INFO] Generation stuck, jumping via concept cluster: '%s' -> '%s'", word, in.Word(memberIdx))
-								return in.Word(memberIdx)
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-
-	// 3. Topic-Centric Pivot: Fallback to finding a word related to the last topic.
+	// 2. Topic-Centric Pivot: Fallback to finding a word related to the last topic.
 	// Cap the context words to a reasonable limit before combining.
 	const maxContext = 5
 	var searchContext []string
@@ -1942,29 +1671,27 @@ func findJumpWord(tx *bbolt.Tx, in *text.Interner, promptWords, currentWords, re
 
 	for i := len(searchContext) - 1; i >= 0; i-- {
 		topic := toLowerCaseExceptURLs(searchContext[i])
-		if v := topicWordB.Get([]byte(topic)); v != nil {
-			var wordAssoc map[string]WordPosData
-			if err := json.Unmarshal(v, &wordAssoc); err != nil {
-				log.Printf("[WARN] findJumpWord: failed to unmarshal word association for topic %s: %v", topic, err)
+		wordAssoc, err := r.TopicWordsFor(topic)
+		if err != nil {
+			log.Printf("[WARN] findJumpWord: topic-word lookup for %s failed: %v", topic, err)
+			continue
+		}
+
+		for word, data := range wordAssoc {
+			// Don't jump to the topic word itself or a word already used.
+			if _, exists := sentenceSet[word]; exists || word == topic || data.Count <= 1 {
 				continue
 			}
 
-			for word, data := range wordAssoc {
-				// Don't jump to the topic word itself or a word already used.
-				if _, exists := sentenceSet[word]; exists || word == topic || data.Count <= 1 {
-					continue
-				}
+			// Combine association strength (primary) with positional preference
+			// (secondary).
+			strengthScore := math.Sqrt(float64(data.Count))
+			posScore := 1.0 - math.Abs(data.MeanPosition()-0.5) // value from 0.5 to 1.0
 
-				// New scoring: Combine association strength (primary) with positional preference (secondary).
-				strengthScore := math.Sqrt(float64(data.Count))
-				avgPos := data.PosSum / float64(data.Count)
-				posScore := 1.0 - math.Abs(avgPos-0.5) // value from 0.5 to 1.0
-
-				score := strengthScore * posScore
-				if score > bestScore {
-					bestScore = score
-					bestJump = word
-				}
+			score := strengthScore * posScore
+			if score > bestScore {
+				bestScore = score
+				bestJump = word
 			}
 		}
 	}
@@ -1979,23 +1706,26 @@ func findJumpWord(tx *bbolt.Tx, in *text.Interner, promptWords, currentWords, re
 
 // pickPromptAwareNextWithSimilarity picks the next word considering prompt similarity and context.
 func pickPromptAwareNextWithSimilarity(
+	r *storage.Reader,
 	prefix string,
-	topicB, nameB, topicWordB *bbolt.Bucket,
 	fullPrompt string,
 	recentWords []string,
 	used map[string]int,
 	generatedNgrams map[string]struct{},
-	aggregatedAssoc map[string]WordPosData,
+	aggregatedAssoc map[string]corpus.TopicAssoc,
 	isRoast bool,
-	sentenceLength int, // NEW: pass current sentence length
-	maxWords int, // NEW: pass max words for this sentence
-	currentTopic string, // NEW: pass current topic
+	sentenceLength int, // current sentence length
+	maxWords int, // max words for this sentence
+	currentTopic string,
 	coreTopics map[int]float64, // For Topic Gravity
 	in *text.Interner, // per-call token interner; see internal/text.Interner
-	currentSentence []string, // NEW: Pass current sentence for immediate repetition check
+	currentSentence []string, // for the immediate repetition check
 ) string {
-	nextMap, _ := getNextMap(prefix)
-	if len(nextMap) == 0 {
+	// The Reader replaces four *bbolt.Bucket parameters and the getNextMap call that
+	// opened its own transaction. The buckets were passed down because the helper
+	// could not be trusted to look them up without nesting; that whole hazard is gone.
+	successors, err := r.Successors(prefix)
+	if err != nil || len(successors) == 0 {
 		return ""
 	}
 
@@ -2003,7 +1733,7 @@ func pickPromptAwareNextWithSimilarity(
 		word   string
 		weight float64
 	}
-	cands := make([]cand, 0, len(nextMap))
+	cands := make([]cand, 0, len(successors))
 
 	promptWords := tokenize(fullPrompt)
 	promptSet := make(map[string]struct{}, len(promptWords))
@@ -2020,37 +1750,28 @@ func pickPromptAwareNextWithSimilarity(
 	// NEW: momentum factor, grows as we move forward to encourage linguistic continuity
 	momentum := math.Min(1.0, curPos*1.2+0.1)
 
-	// Pre-load all topic-word associations needed for this generation round to avoid repeated DB access
-	topicWordAssocCache := make(map[string]map[string]WordPosData)
-	if topicWordB != nil {
-		// Cache associations for aggregated name topics
-		for topic := range aggregatedAssoc {
-			if _, exists := topicWordAssocCache[topic]; !exists {
-				if v := topicWordB.Get([]byte(topic)); v != nil {
-					var wordAssoc map[string]WordPosData
-					if err := json.Unmarshal(v, &wordAssoc); err == nil {
-						topicWordAssocCache[topic] = wordAssoc
-					}
-				}
-			}
+	// Pre-load all topic-word associations needed for this generation round to avoid
+	// repeated DB access.
+	topicWordAssocCache := make(map[string]map[string]corpus.TopicAssoc)
+	loadAssoc := func(topic string) {
+		if _, exists := topicWordAssocCache[topic]; exists {
+			return
 		}
-		// Cache associations for core prompt topics (for Topic Gravity)
-		for topicIdx := range coreTopics {
-			topic := in.Word(topicIdx)
-			if _, exists := topicWordAssocCache[topic]; !exists {
-				if v := topicWordB.Get([]byte(topic)); v != nil {
-					var wordAssoc map[string]WordPosData
-					if err := json.Unmarshal(v, &wordAssoc); err == nil {
-						topicWordAssocCache[topic] = wordAssoc
-					}
-				}
-			}
+		if assoc, err := r.TopicWordsFor(topic); err == nil {
+			topicWordAssocCache[topic] = assoc
 		}
 	}
+	// Aggregated name topics, then core prompt topics for Topic Gravity.
+	for topic := range aggregatedAssoc {
+		loadAssoc(topic)
+	}
+	for topicIdx := range coreTopics {
+		loadAssoc(in.Word(topicIdx))
+	}
 
-	for w, base := range nextMap {
-		lw := toLowerCaseExceptURLs(w) // Use helper
-		score := float64(base)
+	for _, succ := range successors {
+		lw := toLowerCaseExceptURLs(succ.Token)
+		score := float64(succ.Count)
 
 		// --- Topic Gravity (New Sophisticated Version) ---
 		topicGravity := 1.0
@@ -2062,8 +1783,7 @@ func pickPromptAwareNextWithSimilarity(
 					strengthScore := math.Sqrt(float64(data.Count))
 
 					// 2. Positional Score: Does this word tend to appear in the right place relative to the topic?
-					avgPos := data.PosSum / float64(data.Count)
-					distance := math.Abs(curPos - avgPos)
+					distance := math.Abs(curPos - data.MeanPosition())
 					posScore := math.Exp(-distance * 5.0) // Exponential decay based on distance
 
 					// Combine scores: strength * position * topic significance
@@ -2097,34 +1817,33 @@ func pickPromptAwareNextWithSimilarity(
 			}
 		}
 
-		// recognized name boost (moderated)
-		if nameB != nil && nameB.Get([]byte(lw)) != nil {
+		// recognized name boost (moderated). IsName rather than Name, because this runs
+		// once per candidate per step and only needs the yes or no: decoding the record
+		// would put a JSON unmarshal in the innermost loop of generation.
+		if r.IsName(lw) {
 			score *= 1.2
 		}
 
 		// global topic boost (moderated)
-		if topicB != nil {
-			if v := topicB.Get([]byte(lw)); len(v) > 0 {
-				var count int
-				_ = json.Unmarshal(v, &count)
-				score += math.Sqrt(float64(count)) * 0.3
-			}
-		}
+		//
+		// This now sees short words. incTopicInTx silently dropped anything under
+		// three characters, so the count for "ok", "no" and "wtf" was permanently
+		// zero and this term contributed nothing for much of the vocabulary of a
+		// server that talks in short interjections (SPEC.md section 8, G10).
+		score += math.Sqrt(float64(r.TopicCount(lw))) * 0.3
 
 		// aggregated name-topic weighting (now hierarchical and cached)
 		if len(aggregatedAssoc) > 0 {
 			for topic, topicData := range aggregatedAssoc {
-				avgTopicPos := topicData.PosSum / float64(topicData.Count)
-				distanceToTopic := math.Abs(curPos - avgTopicPos)
+				distanceToTopic := math.Abs(curPos - topicData.MeanPosition())
 				topicPosScore := math.Exp(-distanceToTopic * 3)
 
 				if topicPosScore > 0.1 {
 					if wordAssoc, ok := topicWordAssocCache[topic]; ok {
-						if wordPosData, ok := wordAssoc[lw]; ok {
-							avgWordPos := wordPosData.PosSum / float64(wordPosData.Count)
-							distanceToWordInTopic := math.Abs(curPos - avgWordPos)
+						if wordPos, ok := wordAssoc[lw]; ok {
+							distanceToWordInTopic := math.Abs(curPos - wordPos.MeanPosition())
 							wordPosScore := math.Exp(-distanceToWordInTopic * 4)
-							score += math.Sqrt(float64(wordPosData.Count)) * 0.8 * topicPosScore * wordPosScore
+							score += math.Sqrt(float64(wordPos.Count)) * 0.8 * topicPosScore * wordPosScore
 						}
 					}
 				}
@@ -2233,7 +1952,7 @@ func pickPromptAwareNextWithSimilarity(
 		}
 
 		if score > 0 {
-			cands = append(cands, cand{w, score})
+			cands = append(cands, cand{succ.Token, score})
 		}
 	}
 
@@ -2241,16 +1960,23 @@ func pickPromptAwareNextWithSimilarity(
 		return ""
 	}
 
-	// stochastic selection
+	// stochastic selection.
+	//
+	// The 1.0 to 1.05 bonus that used to be applied to cands[0] is deleted here rather
+	// than in M7 with the rest of the scoring, because M6b would have made it worse.
+	// It was a bonus attached to an arbitrary index: candidates arrived in Go's
+	// randomized map iteration order, so the bonus landed on a random candidate, which
+	// is meaningless but at least unbiased (SPEC.md section 8, G4).
+	//
+	// Reader.Successors returns a cursor scan, which is sorted key order, so the same
+	// line would now hand a permanent 5% advantage to whichever continuation sorts
+	// first alphabetically, every time, at every step of every sentence. A known-bad
+	// heuristic becoming systematic instead of random is a change worth not shipping.
 	total := 0.0
 	weights := make([]float64, len(cands))
 	for i := range cands {
-		w := math.Pow(cands[i].weight, 1.0/(Creativity+0.01))
-		if i == 0 {
-			w *= 1.0 + 0.05*rand.Float64()
-		}
-		weights[i] = w
-		total += w
+		weights[i] = math.Pow(cands[i].weight, 1.0/(Creativity+0.01))
+		total += weights[i]
 	}
 
 	if total <= 0 {
@@ -2282,15 +2008,18 @@ func generateSentenceWithContext(s *discordgo.Session, prompt string, isRoast bo
 	var sentence []string
 	var recognizedNames []string
 
-	err := db.View(func(tx *bbolt.Tx) error {
-		markovB := tx.Bucket([]byte(MarkovBucket))
-		if markovB == nil || markovB.Stats().KeyN == 0 {
+	// ONE read transaction for the whole attempt, and now genuinely one: everything
+	// inside used to reach back for its own. Reader.CorpusEmpty replaces a
+	// Bucket.Stats() call, which walked every page in the largest bucket in the
+	// database on every reply purely to answer "is there anything in here".
+	err := store.View(func(r *storage.Reader) error {
+		if r.CorpusEmpty() {
 			sentence = append(sentence, "...")
 			return nil
 		}
 
 		// Initial generation attempt
-		sentence, recognizedNames, _ = generateSentenceAttempt(tx, promptWords, recentWords, prompt, isRoast)
+		sentence, recognizedNames, _ = generateSentenceAttempt(r, promptWords, recentWords, prompt, isRoast)
 		return nil
 	})
 
@@ -2336,7 +2065,7 @@ func generateSentenceWithContext(s *discordgo.Session, prompt string, isRoast bo
 }
 
 // generateSentenceAttempt is a helper that contains the core sentence generation logic.
-func generateSentenceAttempt(tx *bbolt.Tx, promptWords, recentWords []string, originalPrompt string, isRoast bool) ([]string, []string, map[string]WordPosData) {
+func generateSentenceAttempt(r *storage.Reader, promptWords, recentWords []string, originalPrompt string, isRoast bool) ([]string, []string, map[string]corpus.TopicAssoc) {
 	// One interner per attempt, created here and discarded with the attempt.
 	//
 	// This replaces a package-level map and slice that every per-message goroutine
@@ -2355,17 +2084,13 @@ func generateSentenceAttempt(tx *bbolt.Tx, promptWords, recentWords []string, or
 	usedWords := make(map[string]int)
 	generatedNgrams := make(map[string]struct{}) // Track generated n-grams
 	var recognizedNames []string
-	var aggregatedAssoc map[string]WordPosData
+	var aggregatedAssoc map[string]corpus.TopicAssoc
 	var currentTopic string // Track the current topic cluster
 
-	topicB := tx.Bucket([]byte(TopicBucket))
-	nameB := tx.Bucket([]byte(NameBucket))
-	nameTopicB := tx.Bucket([]byte(NameTopicBucket))
-	topicWordB := tx.Bucket([]byte(TopicWordBucket))
-
-	// populate recognizedNames inside closure
-	for _, w := range promptWords {
-		if name, exists := isRecognizedName(w); exists {
+	// populate recognizedNames. isRecognizedName takes the Reader now, so this no
+	// longer opens a transaction per prompt word inside the one already open.
+	for _, word := range promptWords {
+		if name, exists := isRecognizedName(r, word); exists {
 			recognizedNames = append(recognizedNames, name)
 		}
 	}
@@ -2373,43 +2098,32 @@ func generateSentenceAttempt(tx *bbolt.Tx, promptWords, recentWords []string, or
 	// --- Topic Gravity ---
 	// Extract core non-stop-words from the prompt and weigh them by significance (global count).
 	coreTopics := make(map[int]float64)
-	for _, w := range promptWords {
-		if _, isStop := stopWords[w]; !isStop {
-			var count int
-			if v := topicB.Get([]byte(w)); v != nil {
-				_ = json.Unmarshal(v, &count)
-			}
+	for _, word := range promptWords {
+		if _, isStop := stopWords[word]; !isStop {
 			// Use the log of the count to get a significance score that doesn't grow too quickly.
-			coreTopics[in.Intern(w)] = math.Log(float64(count) + 1)
+			coreTopics[in.Intern(word)] = math.Log(float64(r.TopicCount(word)) + 1)
 		}
 	}
 
-	// NEW: aggregate all recognized names' associations
-	aggregatedAssoc = make(map[string]WordPosData)
-	if nameTopicB != nil && len(recognizedNames) > 0 {
-		for _, nm := range recognizedNames {
-			nmKey := toLowerCaseExceptURLs(nm)
-			if assocV := nameTopicB.Get([]byte(nmKey)); len(assocV) > 0 {
-				var assoc map[string]WordPosData
-				if err := json.Unmarshal(assocV, &assoc); err != nil {
-					log.Printf("[WARN] failed to unmarshal name-topic association for %s: %v", nmKey, err)
-					continue
-				}
-				for w, data := range assoc {
-					if existing, ok := aggregatedAssoc[w]; ok {
-						existing.Count += data.Count
-						existing.PosSum += data.PosSum
-						aggregatedAssoc[w] = existing
-					} else {
-						aggregatedAssoc[w] = data
-					}
-				}
-			}
+	// Aggregate all recognized names' associations.
+	aggregatedAssoc = make(map[string]corpus.TopicAssoc)
+	for _, nm := range recognizedNames {
+		nmKey := toLowerCaseExceptURLs(nm)
+		assoc, err := r.NameTopicsFor(nmKey)
+		if err != nil {
+			log.Printf("[WARN] name-topic lookup for %s failed: %v", nmKey, err)
+			continue
+		}
+		for word, data := range assoc {
+			existing := aggregatedAssoc[word]
+			existing.Count += data.Count
+			existing.PosSum += data.PosSum
+			aggregatedAssoc[word] = existing
 		}
 	}
 
 	// Determine seed using the new intelligent algorithm
-	seed := findBestSeed(tx, in, promptWords, recentWords, recognizedNames)
+	seed := findBestSeed(r, in, promptWords, recentWords, recognizedNames)
 	if seed == "" || seed == "<START>" {
 		if len(promptWords) > 0 {
 			seed = promptWords[0]
@@ -2445,24 +2159,38 @@ func generateSentenceAttempt(tx *bbolt.Tx, promptWords, recentWords []string, or
 		var next string
 		// Shrink prefix if no match
 		for shrink := n; shrink >= 1; shrink-- {
-			prefix := strings.Join(lastWords[len(lastWords)-shrink:], " ")
+			// Lowercased, because that is how learning stores the prefix, and it was
+			// not lowercased here.
+			//
+			// This is defence rather than a fixed bug, and the distinction is worth
+			// being honest about: as it stands every producer of lastWords is already
+			// lowercase, so the old code matched. The seed comes from findBestSeed,
+			// whose candidates are all interned from lowercased sources, and every
+			// subsequent word is a stored successor token. The one branch that could
+			// have introduced a raw prompt word, the `seed == "<START>"` fallback
+			// below, is unreachable with a non-empty corpus because
+			// generateSentenceWithContext returns early on CorpusEmpty.
+			//
+			// It is lowercased anyway because the alternative is an invariant held by
+			// five separate producers agreeing, none of which states it, against a
+			// lookup that fails silently by returning no candidates. M7 normalizes
+			// once at the storage boundary and this goes away.
+			prefix := toLowerCaseExceptURLs(strings.Join(lastWords[len(lastWords)-shrink:], " "))
 			next = pickPromptAwareNextWithSimilarity(
+				r,
 				prefix,
-				topicB,
-				nameB,
-				topicWordB,
 				originalPrompt,
 				recentWords,
 				usedWords,
-				generatedNgrams, // NEW: pass generated n-grams map
+				generatedNgrams,
 				aggregatedAssoc,
 				isRoast,
-				len(sentence), // NEW: pass current sentence length
-				maxWords,      // NEW: pass max words
-				currentTopic,  // NEW: pass current topic
-				coreTopics,    // Pass core topics for Topic Gravity
+				len(sentence),
+				maxWords,
+				currentTopic,
+				coreTopics, // for Topic Gravity
 				in,
-				sentence, // Pass current sentence for immediate repetition check
+				sentence, // for the immediate repetition check
 			)
 			if next != "" {
 				break
@@ -2478,7 +2206,7 @@ func generateSentenceAttempt(tx *bbolt.Tx, promptWords, recentWords []string, or
 
 		if next == "" {
 			// Creative Jump: If we hit a dead end, try to find a related word to jump to.
-			jumpWord := findJumpWord(tx, in, promptWords, sentence, recognizedNames)
+			jumpWord := findJumpWord(r, promptWords, sentence, recognizedNames)
 			if jumpWord != "" {
 				next = jumpWord
 			} else {
@@ -2625,8 +2353,8 @@ func handleMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 
 				// Update and save leaderboard
 				leaderboard.AddWin(m.Author.ID, winnerUsername)
-				_ = db.Update(func(tx *bbolt.Tx) error {
-					return saveLeaderboard(tx, leaderboard)
+				_ = store.Update(func(w *storage.Writer) error {
+					return saveLeaderboard(w, leaderboard)
 				})
 
 				// Clean up messages
@@ -2691,9 +2419,9 @@ func handleMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 	// --- Leaderboard Command ---
 	if strings.ToLower(m.Content) == "!leaderboard" {
 		var userScores map[string]int
-		err := db.View(func(tx *bbolt.Tx) error {
+		err := store.View(func(r *storage.Reader) error {
 			var loadErr error
-			userScores, loadErr = loadAllUserStats(tx)
+			userScores, loadErr = loadAllUserStats(r)
 			return loadErr
 		})
 
@@ -2797,8 +2525,8 @@ func handleMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 		birdAggroMutex.Unlock()
 
 		// Perform DB update and reaction removal outside the lock.
-		_ = db.Update(func(tx *bbolt.Tx) error {
-			return saveAggroState(tx, AggroState{})
+		_ = store.Update(func(w *storage.Writer) error {
+			return saveAggroState(w, AggroState{})
 		})
 		_ = s.MessageReactionRemove(m.ChannelID, m.ID, cfg.AggroEmoji, s.State.User.ID)
 	}
@@ -2883,11 +2611,23 @@ func handleMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 						UserID:   botUser.ID,
 						Username: botUser.Username,
 					}
-					// Learn the bot's own reply, associating it with the users mentioned in the original prompt.
-					// This teaches the bot what a good, on-topic response looks like.
-					_ = db.Update(func(tx *bbolt.Tx) error {
-						mentionedInPrompt := extractNamesFromMessage(s, m, m.GuildID)
-						if err := learnMessage(tx, replyContent, m.ID, botID, botAsMention, mentionedInPrompt); err != nil {
+					// Learn the bot's own reply, associating it with the users mentioned
+					// in the original prompt. This teaches the bot what a good,
+					// on-topic response looks like.
+					//
+					// The name extraction is hoisted OUT of the write transaction, and
+					// that is a fix rather than a tidy-up: it used to run inside the
+					// db.Update, which meant a read transaction and a series of REST
+					// calls nested inside a write transaction while bbolt's single
+					// writer lock was held.
+					//
+					// The bot's own user ID reaching learnMessage is deliberate and
+					// safe: learnMessage compares it to botID and passes an empty
+					// author to LearnNgram, so self-learning contributes nothing to
+					// author diversity (SPEC.md section 4, A6).
+					mentionedInPrompt := extractNamesFromMessage(s, m, m.GuildID)
+					_ = store.Update(func(w *storage.Writer) error {
+						if err := learnMessage(w, replyContent, m.ID, botID, botAsMention, mentionedInPrompt); err != nil {
 							return fmt.Errorf("self-learning failed: %w", err)
 						}
 						return nil
@@ -2901,9 +2641,9 @@ func handleMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 	if flags["TEXT"] {
 		mentionedUsers := extractNamesFromMessage(s, m, m.GuildID)
 		if len(mentionedUsers) > 0 {
-			_ = db.Update(func(tx *bbolt.Tx) error {
+			_ = store.Update(func(w *storage.Writer) error {
 				for _, user := range mentionedUsers {
-					_, err := learnOrUpdateName(tx, user.Name, user.UserID, user.Username)
+					_, err := learnOrUpdateName(w, user.Name, user.UserID, user.Username)
 					if err != nil {
 						log.Printf("[WARN] Failed to learn name '%s' during extraction: %v", user.Name, err)
 					}
@@ -2941,8 +2681,8 @@ func handleMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 		}
 
 		// Learn the message in a new transaction to avoid conflicts with ongoing processing
-		_ = db.Update(func(tx *bbolt.Tx) error {
-			if err := learnMessage(tx, m.Content, m.ID, botID, authorAsMention, mentionedUsers); err != nil {
+		_ = store.Update(func(w *storage.Writer) error {
+			if err := learnMessage(w, m.Content, m.ID, botID, authorAsMention, mentionedUsers); err != nil {
 				return fmt.Errorf("learning failed: %w", err)
 			}
 			return nil
@@ -3058,24 +2798,22 @@ func captureImageURLs(s *discordgo.Session, m *discordgo.MessageCreate) {
 		// 3. If a URL was found (either from attachment or content), save it.
 		if urlToCache != "" {
 			var newUrlList []string
-			// Persist to DB and then reload the cache to ensure consistency
-			err := db.Update(func(tx *bbolt.Tx) error {
-				if err := saveImageURLToDB(tx, urlToCache); err != nil {
-					return fmt.Errorf("failed to save image URL to DB: %w", err)
+			// Persist and then reload the cache to ensure consistency. The reload
+			// happens through the Writer, which embeds Reader, so it sees its own
+			// write without opening a second transaction: that is the reason the
+			// Writer embeds the Reader rather than being a separate type.
+			//
+			// Trimming is part of AddImageURL now, and evicts the OLDEST entry by
+			// timestamp. The old trim deleted the lexicographically first URL, which
+			// has nothing to do with age, so which cached image got dropped was a
+			// function of how the URL happened to be spelled.
+			err := store.Update(func(w *storage.Writer) error {
+				if err := w.AddImageURL(urlToCache, time.Now(), cfg.ImageCacheSize); err != nil {
+					return fmt.Errorf("failed to save image URL: %w", err)
 				}
-				if err := trimImageCacheInTx(tx, cfg.ImageCacheSize); err != nil {
-					return fmt.Errorf("failed to trim image cache: %w", err)
-				}
-
-				// After trimming, reload all URLs to ensure the in-memory slice is in sync
-				bucket := tx.Bucket([]byte(ImageCacheBucket))
-				if bucket == nil {
-					return fmt.Errorf("ImageCacheBucket not found during reload")
-				}
-				return bucket.ForEach(func(k, v []byte) error {
-					newUrlList = append(newUrlList, string(k))
-					return nil
-				})
+				var err error
+				newUrlList, err = w.ImageURLs()
+				return err
 			})
 
 			if err != nil {
@@ -3278,8 +3016,8 @@ func transcriptionWorker(ctx context.Context, s *discordgo.Session) {
 			if job.Member != nil && job.Member.Nick != "" {
 				authorInfo.Name = job.Member.Nick
 			}
-			err = db.Update(func(tx *bbolt.Tx) error {
-				return learnMessage(tx, transcript, job.MsgID, botID, authorInfo, []MentionedUser{})
+			err = store.Update(func(w *storage.Writer) error {
+				return learnMessage(w, transcript, job.MsgID, botID, authorInfo, []MentionedUser{})
 			})
 			if err != nil {
 				log.Printf("[VOICE] Failed to learn transcript for message %s: %v", job.MsgID, err)
@@ -3295,45 +3033,28 @@ func transcriptionWorker(ctx context.Context, s *discordgo.Session) {
 //  Monitoring & status
 // -----------------------------------------------------------------------------
 
-// printLibraryStatus logs counts of markov/topic/history keys.
+// printLibraryStatus logs the size of each index.
+//
+// It calls Bucket.Stats() through Reader.Status, which walks every page, so it is
+// genuinely expensive and belongs on this ticker and nowhere else. The same call used
+// to sit in learnMessage, once per message, purely to fill a log field
+// (SPEC.md section 8, finding 11).
+//
+// Two of the counts here come from meta counters instead: the history window and the
+// image cache are the two buckets that get trimmed, and their counters are what made
+// the trims stop being quadratic.
 func printLibraryStatus() {
 	start := time.Now()
-	err := db.View(func(tx *bbolt.Tx) error {
-		buckets := []string{MarkovBucket, TopicBucket, HistoryBucket, NameBucket, NameTopicBucket, TopicWordBucket, TopicClusterBucket, ImageCacheBucket, ConceptClusterBucket}
-		status := make(map[string]int)
-
-		for _, bName := range buckets {
-			b := tx.Bucket([]byte(bName))
-			if b != nil {
-				status[bName] = b.Stats().KeyN
-			} else {
-				status[bName] = 0
-			}
-		}
-
-		// Fetch total_messages_learned separately if it exists
-		totalMessagesLearned := 0
-		if statsB := tx.Bucket([]byte(StatsBucket)); statsB != nil {
-			if v := statsB.Get([]byte("total_messages_learned")); v != nil {
-				_ = json.Unmarshal(v, &totalMessagesLearned)
-			}
-		}
-
+	err := store.View(func(r *storage.Reader) error {
+		st := r.Status()
 		log.Printf(
-			"Library status: markov=%d | topics=%d | history=%d | names=%d | name-topic=%d | topic-word=%d | raw-clusters=%d | concepts=%d | images=%d | total-learned=%d | checked in %s",
-			status[MarkovBucket],
-			status[TopicBucket],
-			status[HistoryBucket],
-			status[NameBucket],
-			status[NameTopicBucket],
-			status[TopicWordBucket],
-			status[TopicClusterBucket],
-			status[ConceptClusterBucket],
-			status[ImageCacheBucket],
-			totalMessagesLearned, // NEW: Include total messages learned
+			"Library status: ngrams=%d | author-entries=%d | topics=%d | topic-word=%d | "+
+				"name-topic=%d | names=%d | clusters=%d | history=%d | images=%d | "+
+				"total-learned=%d | checked in %s",
+			st.Ngrams, st.AuthorEntries, st.Topics, st.TopicWords, st.NameTopics,
+			st.Names, st.Clusters, st.HistoryWindow, st.ImageCache, st.Learned,
 			time.Since(start),
 		)
-
 		return nil
 	})
 
