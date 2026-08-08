@@ -8,9 +8,9 @@ Sibling project to [merlin](../merlin), whose deployment conventions this repo f
 
 Mid-restructure. The bot works and runs, but it is being taken from a single 3,200-line `main.go` to a proper package layout one subsystem at a time, with a catalogue of known defects being closed along the way. See `SPEC.md` §8 for the defect list and §9 for the milestone order.
 
-**Milestones 0 through 5 are complete, and 6a:** repo hygiene and CI/CD, the `cmd/bot` entrypoint, `internal/config`, the `internal/core` lifecycle, `internal/text` plus `internal/filter`, `internal/safety`, and the storage layer (`internal/corpus`, `internal/storage`, `internal/dbtest`, `internal/maintenance`).
+**Milestones 0 through 6 are complete:** repo hygiene and CI/CD, the `cmd/bot` entrypoint, `internal/config`, the `internal/core` lifecycle, `internal/text` plus `internal/filter`, `internal/safety`, and the storage layer (`internal/corpus`, `internal/storage`, `internal/dbtest`, `internal/maintenance`) with the bot now running on it.
 
-The storage layer is built and tested but the bot does not use it yet: M6b rewires `internal/legacy` onto it, and until then legacy still holds a raw bbolt handle, so the nested-transaction deadlock is fixed in design and not yet in the running bot. The generation engine is M7.
+M6b is what put the bot on the seam, and it is the commit that closes the worst bug in the review rather than designing around it. `internal/legacy` no longer imports bbolt at all, so nothing in it can hold a database handle, name a bucket, or start a transaction: generation used to run inside a read transaction and call two helpers that each opened their own, which is a hang with no timeout and no recovery that got likelier as the corpus grew. A test pins the import, because the import is the whole invariant. The generation engine is M7.
 
 All three crash bugs are now closed: the shutdown WaitGroup race that could panic on exit (M3), the `*rand.Rand` shared across every message goroutine (M3), and the global vocabulary map written concurrently, which was a Go runtime *fatal error* rather than a recoverable panic (M4).
 
@@ -19,7 +19,7 @@ M3 also added the `GUILDS` intent, so the bot can use the server's own custom em
 Two things worth knowing before running it anywhere real:
 
 - **The safety gate is in as of M5**, and it is the reason the bot is closer to deployable than it was. `CheckLearn` sits inside `learnMessage`, so the backfill path that used to re-learn blocked messages minutes later is covered by construction; `CheckEmit` sits at the generation exit. Matching happens against a normalized form, so spacing, leet, homoglyphs, combining marks and zero-width characters no longer walk through. **Set `PEREGRINE_BLOCKLIST_PATH` before pointing it at a hostile channel:** without it the bot runs on the built-in baseline only and warns loudly at startup, and the operator list is where the threat and illegal-content patterns live.
-- **The corpus format changes in M6.** Anything learned before then is discarded rather than migrated, deliberately. See `SPEC.md` §3.4.
+- **The corpus format changed in M6 and there is no migration.** `storage.Open` refuses a corpus written before it, with an error saying what to do, rather than opening it and silently ignoring every key in it. Deploying this needs `docker volume rm peregrine_corpus` once; see "Start the corpus over" below and `SPEC.md` §3.4.
 
 Still open before this is genuinely safe to leave running: mentions are not suppressed (finding 8, M10), the corpus can still be poisoned by repetition because generation does not yet require author diversity (A6, M7), and `CheckEmit` covers the generation exit rather than all thirteen send sites (M10).
 
@@ -56,10 +56,18 @@ Maintenance modes do not need `DISCORD_BOT_TOKEN`: cleaning a poisoned corpus sh
 ## Maintenance
 
 ```sh
-go run ./cmd/bot -clean-db     # strip spammy and slur-bearing keys from the corpus
+go run ./cmd/bot -clean-db                    # remove spammy and blocklisted n-grams
+go run ./cmd/bot -compact /data/markov.new    # reclaim free pages into a fresh file
+go run ./cmd/bot -purge-author 1234567890     # undo one user's contribution to diversity
 ```
 
-Runs against the corpus and never touches Discord. It respects `PEREGRINE_DB_PATH`. Running it while the bot is live fails within five seconds with a clear message rather than hanging, because bbolt holds an exclusive lock on the file.
+All three run against the corpus and never touch Discord, and none needs `DISCORD_BOT_TOKEN`: cleaning a poisoned corpus should not require a live credential. They respect `PEREGRINE_DB_PATH`. Running one while the bot is live fails within five seconds with a clear message rather than hanging, because bbolt holds an exclusive lock on the file. Pass one at a time; the order they should run in is your decision, not a default.
+
+`-clean-db` loads `PEREGRINE_BLOCKLIST_PATH`, so it removes what your list covers and not only the built-in baseline. That matters because adding a pattern to the blocklist does not retroact: this is the only thing that applies it to what is already in the corpus.
+
+`-compact` exists because **bbolt's file never shrinks.** Deleting keys frees pages for reuse but does not return them to the filesystem, so a corpus that grew large stays large after `-clean-db` removes most of it. It writes a new file rather than replacing the original, so you move it into place yourself and the rollback stays trivial. Compacting onto the live path fails rather than corrupting anything, because bbolt would have to open a file it already holds.
+
+`-purge-author` is the surgical alternative to discarding a corpus one bad actor has poisoned. It removes that user's contribution to the **author-diversity** counts, which is what generation eligibility reads, and leaves occurrence counts alone: the counts do not record who produced them, and storing that would mean a count on every entry of the fastest-growing index in the database. In practice it is the effective half, since a phrase only one person ever said drops to zero distinct authors.
 
 In a container:
 
@@ -140,7 +148,7 @@ docker volume rm peregrine_corpus
 docker compose -f docker-compose.prod.yml up -d
 ```
 
-Required once after M6, since the key layout changes and old data is not migrated.
+Required once when deploying M6b, since the key layout changed and old data is not migrated. Skipping it does not corrupt anything: `storage.Open` refuses the old file and the container fails to start with an error saying to do this.
 
 ## Development
 

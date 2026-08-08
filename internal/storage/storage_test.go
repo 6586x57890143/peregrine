@@ -827,3 +827,183 @@ func TestUserStats(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestHasSuccessorsMatchesTheOldPrefixLookup covers the replacement for what used to
+// be `markovB.Get([]byte(prefix)) != nil`, which worked only because the prefix was
+// itself a key. It no longer is, so the question became "is this prefix's key range
+// non-empty", and getting the range wrong the obvious way (a byte-prefix match) would
+// report true for "the" when only "the cat" had been learned.
+func TestHasSuccessorsMatchesTheOldPrefixLookup(t *testing.T) {
+	s := dbtest.Store(t)
+	dbtest.Seed(t, s,
+		dbtest.Learn{Prefix: "the cat", Next: "sat", Author: "u1"},
+		dbtest.Learn{Prefix: "bird", Next: "flew", Author: "u1"},
+	)
+
+	cases := map[string]bool{
+		"bird":     true,
+		"the cat":  true,
+		"the":      false, // "the cat" keys must NOT satisfy a query for "the"
+		"the ca":   false, // a byte-prefix match would wrongly say true
+		"birds":    false,
+		"":         false, // an empty prefix is never a real key (finding 5)
+		"nonsense": false,
+	}
+	if err := s.View(func(r *storage.Reader) error {
+		for prefix, want := range cases {
+			if got := r.HasSuccessors(prefix); got != want {
+				t.Errorf("HasSuccessors(%q) = %v, want %v", prefix, got, want)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestCorpusEmptyAndFirstPrefix covers the two cheap answers the generation path
+// needs before it will attempt a reply. CorpusEmpty exists so that check is not a
+// Bucket.Stats() page walk on a per-message path (finding 11).
+func TestCorpusEmptyAndFirstPrefix(t *testing.T) {
+	s := dbtest.Store(t)
+
+	if err := s.View(func(r *storage.Reader) error {
+		if !r.CorpusEmpty() {
+			t.Error("a fresh corpus must report empty")
+		}
+		if prefix, ok := r.FirstPrefix(); ok {
+			t.Errorf("FirstPrefix on an empty corpus returned %q", prefix)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	dbtest.Seed(t, s,
+		dbtest.Learn{Prefix: "zebra", Next: "ran", Author: "u1"},
+		dbtest.Learn{Prefix: "aardvark", Next: "slept", Author: "u1"},
+	)
+
+	if err := s.View(func(r *storage.Reader) error {
+		if r.CorpusEmpty() {
+			t.Error("a seeded corpus must not report empty")
+		}
+		prefix, ok := r.FirstPrefix()
+		if !ok {
+			t.Fatal("FirstPrefix found nothing in a seeded corpus")
+		}
+		// The prefix alone, not the composite key: the separator and the successor
+		// token must be stripped, or the fallback seed is a string with a NUL in it.
+		if prefix != "aardvark" {
+			t.Errorf("FirstPrefix = %q, want %q (the prefix, with no separator or successor)",
+				prefix, "aardvark")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestMessagesLearnedIsAMetaCounter pins that the lifetime ingestion count is not a
+// key in the stats bucket. It used to be, under the literal key
+// "total_messages_learned", so every reader of that bucket had to recognize and skip
+// it; one that forgot would decode an integer as a WeeklyStat and count a phantom
+// user.
+func TestMessagesLearnedIsAMetaCounter(t *testing.T) {
+	s := dbtest.Store(t)
+
+	if err := s.Update(func(w *storage.Writer) error {
+		for range 3 {
+			if err := w.IncMessagesLearned(); err != nil {
+				return err
+			}
+		}
+		return w.IncUserStat("u1", time.Unix(1700000000, 0))
+	}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if err := s.View(func(r *storage.Reader) error {
+		if got := r.MessagesLearned(); got != 3 {
+			t.Errorf("MessagesLearned = %d, want 3", got)
+		}
+		all, err := r.AllUserStats()
+		if err != nil {
+			return err
+		}
+		if len(all) != 1 {
+			t.Errorf("AllUserStats returned %d entries, want only the one real user: %v", len(all), all)
+		}
+		if r.Status().Learned != 3 {
+			t.Errorf("Status().Learned = %d, want 3", r.Status().Learned)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPutUserStatOverwrites covers the weekly reset, which is the reason PutUserStat
+// exists at all: the rule is "start again at one if the last message predates this
+// week", and that needs a definition of when a week starts, which is the caller's
+// policy and not storage's.
+func TestPutUserStatOverwrites(t *testing.T) {
+	s := dbtest.Store(t)
+	lastWeek := time.Unix(1700000000, 0).UTC()
+
+	if err := s.Update(func(w *storage.Writer) error {
+		for range 50 {
+			if err := w.IncUserStat("u1", lastWeek); err != nil {
+				return err
+			}
+		}
+		// The reset a caller performs at a week boundary.
+		return w.PutUserStat("u1", corpus.WeeklyStat{Count: 1, LastTimestamp: lastWeek.Add(7 * 24 * time.Hour)})
+	}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if err := s.View(func(r *storage.Reader) error {
+		got, ok, err := r.UserStat("u1")
+		if err != nil || !ok {
+			t.Fatalf("UserStat: ok=%v err=%v", ok, err)
+		}
+		if got.Count != 1 {
+			t.Errorf("Count = %d after a reset write, want 1: PutUserStat must overwrite rather "+
+				"than accumulate", got.Count)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestIsNameDoesNotDecode covers the cheap presence check the scorer uses. It must
+// agree with Name on existence, including for an alias, and must not care whether the
+// record decodes: a malformed record is still a name that exists, and the scorer's
+// boost has no use for the fields.
+func TestIsNameDoesNotDecode(t *testing.T) {
+	s := dbtest.Store(t)
+	if err := s.Update(func(w *storage.Writer) error {
+		if err := w.PutName("dave", corpus.Name{Count: 3, DiscordUserID: "u1"}); err != nil {
+			return err
+		}
+		return w.PutName("davey", corpus.Name{DiscordUserID: "u1", Canonical: "dave"})
+	}); err != nil {
+		t.Fatalf("PutName: %v", err)
+	}
+
+	if err := s.View(func(r *storage.Reader) error {
+		for _, key := range []string{"dave", "davey"} {
+			if !r.IsName(key) {
+				t.Errorf("IsName(%q) = false, want true", key)
+			}
+		}
+		if r.IsName("nobody") {
+			t.Error("IsName reported an unknown key as a name")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}

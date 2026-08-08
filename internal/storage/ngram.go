@@ -41,6 +41,68 @@ func (r *Reader) Successors(prefix string) ([]corpus.Successor, error) {
 	return out, nil
 }
 
+// HasSuccessors reports whether a prefix has any continuation at all.
+//
+// One cursor Seek and one comparison, no allocation of the successor list. It
+// exists because the seed selector asks this question dozens of times per reply,
+// once per candidate n-gram from the prompt, and it only needs the yes or no.
+//
+// Under the old layout this was `markovB.Get([]byte(prefix)) != nil`, which worked
+// because the prefix WAS a key. It no longer is: keys are <prefix> NUL <next>, so
+// the equivalent question is whether the prefix's key range is non-empty.
+func (r *Reader) HasSuccessors(prefix string) bool {
+	if prefix == "" {
+		return false
+	}
+	b := r.bucket(bucketNgram)
+	if b == nil {
+		return false
+	}
+	seek, limit, err := ngramPrefixRange(prefix)
+	if err != nil {
+		return false
+	}
+	k, _ := b.Cursor().Seek(seek)
+	return k != nil && bytes.Compare(k, limit) < 0
+}
+
+// CorpusEmpty reports whether anything has been learned yet.
+//
+// Deliberately NOT NgramCount() == 0. NgramCount goes through Bucket.Stats(),
+// which walks every page in the largest bucket in the database, and the caller
+// asking this question is the reply path: it runs on every message the bot answers,
+// purely to decide whether to give up early. That is the shape of finding 11, where
+// a page walk sat on a per-message path to fill a log field.
+func (r *Reader) CorpusEmpty() bool {
+	b := r.bucket(bucketNgram)
+	if b == nil {
+		return true
+	}
+	k, _ := b.Cursor().First()
+	return k == nil
+}
+
+// FirstPrefix returns the lowest-sorting prefix in the corpus.
+//
+// The absolute fallback for seed selection: when nothing in the prompt or the
+// recent context matches anything learned, generation still needs somewhere to
+// start, and any real prefix beats a sentinel that has no continuations.
+func (r *Reader) FirstPrefix() (string, bool) {
+	b := r.bucket(bucketNgram)
+	if b == nil {
+		return "", false
+	}
+	k, _ := b.Cursor().First()
+	if k == nil {
+		return "", false
+	}
+	i := bytes.IndexByte(k, sep)
+	if i <= 0 {
+		return "", false
+	}
+	return string(k[:i]), true
+}
+
 // Successor returns one continuation, and whether it exists.
 func (r *Reader) Successor(prefix, next string) (corpus.Successor, bool, error) {
 	b := r.bucket(bucketNgram)

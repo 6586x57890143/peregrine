@@ -80,10 +80,15 @@ type Config struct {
 	MessageQueue   int // PEREGRINE_MESSAGE_QUEUE
 
 	// Housekeeping loops.
-	StatusTick       time.Duration // PEREGRINE_STATUS_TICK
-	EnableClustering bool          // PEREGRINE_ENABLE_CLUSTERING
-	ClusteringTick   time.Duration // PEREGRINE_CLUSTERING_TICK
-	LeaderboardTick  time.Duration // PEREGRINE_LEADERBOARD_CHECK_TICK
+	//
+	// EnableClustering and ClusteringTick were here until M6b and are now deferred
+	// variables instead, because the rule is that every field in this struct is read
+	// by code that exists. The clustering loop is gone: it needed a *bbolt.DB, which
+	// nothing outside internal/storage can hold, and it had never produced readable
+	// data anyway (SPEC.md section 8, finding 27). They come back as live fields in
+	// M8, with the pass rebuilt.
+	StatusTick      time.Duration // PEREGRINE_STATUS_TICK
+	LeaderboardTick time.Duration // PEREGRINE_LEADERBOARD_CHECK_TICK
 
 	// Engagement: bird aggro.
 	AggroTick     time.Duration // PEREGRINE_AGGRO_TICK
@@ -130,6 +135,12 @@ const (
 // documentation. Load warns instead. Delete an entry when its milestone lands and
 // the field appears in Config above.
 var deferredVars = map[string]string{
+	// Deferred as of M6b rather than from the start, which is the one direction this
+	// map is not supposed to move. It is honest here: the loop these two drove is
+	// gone, so leaving them as live fields would mean an operator could set them and
+	// watch nothing happen, which is precisely what this map exists to prevent.
+	"PEREGRINE_ENABLE_CLUSTERING":          "M8",
+	"PEREGRINE_CLUSTERING_TICK":            "M8",
 	"PEREGRINE_BACKUP_DIR":                 "M13",
 	"PEREGRINE_BACKUP_TICK":                "M13",
 	"PEREGRINE_BACKUP_KEEP":                "M13",
@@ -177,11 +188,14 @@ func Load() (*Config, error) {
 		BlocklistPath:  l.str("PEREGRINE_BLOCKLIST_PATH", ""),
 		PauseAllWrites: l.boolVal("PEREGRINE_PAUSE_ALL_WRITES", false),
 
-		// Minimum 2. Order 1 makes the prefix empty, and an empty prefix is one
-		// bbolt key holding a map of the entire vocabulary, rewritten once per
-		// word per message. Nothing reads it. The ingestion loop still descends
-		// to 1 today, so this validation does not yet stop that write happening
-		// (SPEC.md section 8, finding 5); M6 changes the loop.
+		// Minimum 2. Order 1 makes the prefix empty, and under the old layout an
+		// empty prefix was one bbolt key holding a map of the entire vocabulary,
+		// rewritten once per word per message, that nothing ever read
+		// (SPEC.md section 8, finding 5).
+		//
+		// This bound is now one of three things stopping that. M6b's ingestion loop
+		// descends to 2 rather than 1, and storage.Writer.LearnNgram refuses an empty
+		// prefix outright, so a new caller cannot reintroduce it either.
 		MaxNGram:             l.intVal("PEREGRINE_MAX_NGRAM", 5, 2, 8),
 		PromptRelevanceBoost: l.float("PEREGRINE_PROMPT_RELEVANCE_BOOST", 15.0, 0, 1000),
 		SelfMention:          l.regex("PEREGRINE_SELF_MENTION_PATTERN", `(?i)\b(peregrine|bird)\b`),
@@ -195,26 +209,7 @@ func Load() (*Config, error) {
 
 		StatusTick: l.dur("PEREGRINE_STATUS_TICK", 5*time.Minute, time.Minute, 24*time.Hour),
 
-		// Defaults to FALSE as of M4, which is a change from the value the code
-		// previously had, and the reason is that the pass currently cannot affect
-		// output at all.
-		//
-		// Clustering writes its members string-keyed and the generation path reads
-		// them into a map[int]float32, so every unmarshal fails and both consumers
-		// silently skip the cluster (SPEC.md section 8, finding 27). So the pass
-		// walks the whole corpus every 24 hours inside a write transaction, against
-		// bbolt's single writer, ends in a destructive bucket rebuild, and produces
-		// data nothing can read. Leaving that on by default once it is known to be a
-		// no-op is not defensible; the observable behavior is unchanged because the
-		// output was never readable.
-		//
-		// M8 fixes the codec and re-enables this default, after M7's golden samples
-		// exist to judge whether the clusters actually improve output. Turning it on
-		// before then would add a seed branch firing at weight 50 inside a scorer
-		// that is not yet normalized, with no way to evaluate the result.
-		EnableClustering: l.boolVal("PEREGRINE_ENABLE_CLUSTERING", false),
-		ClusteringTick:   l.dur("PEREGRINE_CLUSTERING_TICK", 24*time.Hour, time.Minute, 30*24*time.Hour),
-		LeaderboardTick:  l.dur("PEREGRINE_LEADERBOARD_CHECK_TICK", time.Hour, time.Minute, 24*time.Hour),
+		LeaderboardTick: l.dur("PEREGRINE_LEADERBOARD_CHECK_TICK", time.Hour, time.Minute, 24*time.Hour),
 
 		AggroTick:     l.dur("PEREGRINE_AGGRO_TICK", time.Hour, time.Minute, 30*24*time.Hour),
 		AggroChance:   l.float("PEREGRINE_AGGRO_CHANCE", 0.20, 0, 1),
@@ -260,10 +255,6 @@ func Load() (*Config, error) {
 			"PEREGRINE_ENABLE_AUTONOMOUS_POST is true but PEREGRINE_AUTONOMOUS_POST_CHANNELS is empty: "+
 				"a bot that speaks unprompted must never do so in a channel nobody named, so set the channel IDs or turn the feature off"))
 	}
-	if cfg.EnableClustering && cfg.ClusteringTick < time.Minute {
-		l.errs = append(l.errs, errors.New("PEREGRINE_CLUSTERING_TICK is below one minute: clustering walks the whole corpus and would starve ingestion, which shares bbolt's single writer"))
-	}
-
 	if len(l.errs) > 0 {
 		return nil, errors.Join(l.errs...)
 	}

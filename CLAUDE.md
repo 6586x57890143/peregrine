@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `peregrine` is a Markov-chain Discord engagement bot (Go 1.24, `discordgo` v0.29, `bbolt` v1.4). It learns from channel messages and replies in the server's own voice. Full design doc: [`SPEC.md`](./SPEC.md). Read it before any non-trivial change, especially §4 (safety and threat model) and §5 (the generation pipeline). The bot lives in a meme-heavy server and exists to cause engagement, fun and chaos, so **output that lands matters more than output that is grammatical**, and several things that look like bugs are deliberate register. The things that are actually bugs are catalogued in §8.
 
-**The repository is mid-restructure.** It is being taken from a single 3,200-line `package main` to merlin's `cmd/` plus `internal/` layout, one subsystem per milestone (`SPEC.md` §9). The entrypoint is now `cmd/bot`, and everything it calls still lives in `internal/legacy/legacy.go`, which is the old `main.go` moved verbatim. A comment saying "M6 replaces this" means exactly that. Do not treat the current shape as the intended shape, and in particular do not add anything new to `internal/legacy`: it is a holding pen that only shrinks.
+**The repository is mid-restructure.** It is being taken from a single 3,200-line `package main` to merlin's `cmd/` plus `internal/` layout, one subsystem per milestone (`SPEC.md` §9). The entrypoint is `cmd/bot`, and most of what it calls still lives in `internal/legacy/legacy.go`, which started as the old `main.go` moved verbatim. A comment saying "M7 replaces this" means exactly that. Do not treat the current shape as the intended shape, and in particular do not add anything new to `internal/legacy`: it is a holding pen that only shrinks. Storage, config, safety, the lifecycle, the tokenizer and the filters have all left it; generation, ingestion, the sends and the engagement features have not.
 
 ## Commands
 
@@ -38,9 +38,11 @@ go run ./cmd/bot
 docker compose up --build # or in a container
 ```
 
-Maintenance modes, which operate on the corpus and never touch Discord:
+Maintenance modes, which operate on the corpus, never touch Discord, and need no token. One at a time: they each take the whole corpus, and the order they should run in is the operator's decision rather than a default:
 ```sh
-go run ./cmd/bot -clean-db   # remove spammy and slur-bearing keys
+go run ./cmd/bot -clean-db                  # remove spammy and blocklisted n-grams
+go run ./cmd/bot -compact ./markov.new      # reclaim free pages; bbolt never shrinks its file
+go run ./cmd/bot -purge-author 123456789    # undo one author's contribution to diversity counts
 ```
 
 ## Architecture
@@ -49,7 +51,11 @@ go run ./cmd/bot -clean-db   # remove spammy and slur-bearing keys
 
 `cmd/bot/main.go` is thin on purpose and mirrors merlin's: `main` builds the logger and loads `.env`, `runGuarded` turns a panic into a logged fatal instead of a bare stderr trace, and `run` parses flags, creates the signal context, and calls `legacy.Run(ctx)`. Nothing else belongs there. Build it as `./cmd/bot`, not `.`; the root is no longer a main package.
 
-`internal/legacy` holds the old `main.go`, `filter.go` and `cleanup.go` unchanged. It exists because **two `main` packages cannot share code**: making `cmd/bot` the entrypoint required the 3,200 lines it calls to live somewhere importable, and moving them verbatim was the only sequencing that keeps `go build ./...` green at every commit while ending at merlin's layout. Each later milestone moves one subsystem *out*, so the package only shrinks; M13 deletes it. Add nothing to it.
+`internal/legacy` held the old `main.go`, `filter.go` and `cleanup.go`. It exists because **two `main` packages cannot share code**: making `cmd/bot` the entrypoint required the 3,200 lines it calls to live somewhere importable, and moving them verbatim was the only sequencing that keeps `go build ./...` green at every commit while ending at merlin's layout. Each later milestone moves one subsystem *out*, so the package only shrinks; M13 deletes it. Add nothing to it.
+
+As of M6b it is one file. `cleanup.go` was replaced by `internal/maintenance`, and `filter.go` went with it because its last two wrappers existed only for that pass; the linter reporting them unused is how that was confirmed rather than assumed.
+
+**`internal/legacy` must not import bbolt, and a test enforces it.** `TestThisPackageCannotReachBbolt` globs every `.go` file in the package and fails on the import, because the import is the exact invariant: the bbolt API is unreachable without it, so if no file imports it then no function here can name a bucket, hold a handle, or start a transaction. It scans the whole directory rather than `legacy.go` alone, so a new file cannot reintroduce the dependency next to a test that only looks at the old one.
 
 Two behaviors changed in that move, and both are about `log.Fatal`. `main()` became `Run(ctx) error`, so its six `log.Fatal` calls are returned errors, and `performDatabaseCleanup` became `CleanDatabase() error` for the same reason. `log.Fatal` calls `os.Exit`, which **skips every deferred function**, so any startup failure after `bbolt.Open` left the exclusive flock on `markov.db` held by a dying process, and the operator's natural next attempt then failed on the five-second `Open` timeout instead of on the original problem. There is now no `os.Exit` anywhere in `internal/legacy`.
 
@@ -75,13 +81,25 @@ Both import nothing from this module and must stay that way, so the tokenizer th
 
 **Nothing may persist a `text.Interner` id.** Ids depend on insertion order, so an id written to the database means something different to the next process. This is not hypothetical: see the clustering note below.
 
-### Clustering currently does nothing, and that is a finding, not a design
+### Clustering has never worked, and as of M6b it has no callers
 
-`clustering` persists cluster members **string-keyed**; the generation path unmarshals them into `map[int]float32`. Go parses integer map keys with `strconv`, so every cluster fails to unmarshal, and both consumers guard with `if err := json.Unmarshal(...); err == nil` and no `else`. The failure is completely silent.
+`clustering` persists cluster members **string-keyed**; the generation path unmarshalled them into `map[int]float32`. Go parses integer map keys with `strconv`, so every cluster failed to unmarshal, and both consumers guarded with `if err := json.Unmarshal(...); err == nil` and no `else`. The failure was completely silent. So the pass ran a full similarity walk over the corpus every 24 hours, inside a write transaction against bbolt's single writer, ending in a destructive `DeleteBucket` plus `CreateBucket`, and produced data that **has never once been read**. `SPEC.md` §8 finding 27 has the detail.
 
-So the pass runs a full similarity walk over the corpus every 24 hours, inside a write transaction against bbolt's single writer, ending in a destructive `DeleteBucket` plus `CreateBucket`, and produces data that **has never once been read**. Both consumers are dead code: the concept-cluster seed branch and the cluster-based jump. `PEREGRINE_ENABLE_CLUSTERING` therefore defaults to **false** since M4. `SPEC.md` §8 finding 27 has the detail.
+M6b removed the loop and both dead consumers, and there are three independent reasons rather than one, which is worth knowing before anyone tries to restore them:
 
-The codec fix is small and deliberately deferred to M8, because turning the path on adds a seed branch firing at weight 50 inside a scorer that is not yet normalized, and M7's golden samples are what can judge whether it helps. The general lesson is worth keeping: an unmarshal guarded by `err == nil` with no `else` is indistinguishable from one that works, and only round-tripping the two real types tells you which you have.
+- The codec has never worked, as above.
+- `PerformClusteringOptimized` takes a `*bbolt.DB`, and nothing outside `internal/storage` can hold one now. It is not callable from `legacy` even in principle.
+- It reads the name-topic index as a JSON map per name, which the composite-key layout does not store, so it would find nothing with the codec fixed.
+
+The concept-cluster consumers are also **unfixable as written**, not merely broken: cluster members are `text.Interner` ids, and ids depend on insertion order, so an id written to disk means a different word to the next process. M8 rebuilds the whole path against storage's blob API with content-hashed IDs and a member representation that survives a restart, and only then can M7's golden samples say whether the clusters help. `PEREGRINE_ENABLE_CLUSTERING` and `PEREGRINE_CLUSTERING_TICK` are **deferred variables** until then, not `Config` fields; the `clustering` package keeps its algorithm and says so in its package comment so nobody mistakes it for live code.
+
+The general lesson is worth keeping: an unmarshal guarded by `err == nil` with no `else` is indistinguishable from one that works, and only round-tripping the two real types tells you which you have.
+
+### Two indexes written from the same loop are one index
+
+M6b found that `TopicClusterBucket` recorded nothing `TopicWordBucket` did not. Both were written from the same place in `learnMessage`, over the same message, under the same guard and the same stop-word exclusion; the second was the first with the direction and the position discarded, keyed `min|max` with a literal pipe. It is gone, and its two seed-selection tiers read the surviving indexes at their old weights (`SPEC.md` §8, finding 28).
+
+Recorded as a shape rather than a one-off: two indexes written from the same loop, from the same data, differing only in what one of them throws away, are a duplicate however different their readers look. The pipe separator is the other lesson on its way out, and it is why the new layout uses NUL: a word containing `|` produced a key that split into three parts and was silently skipped by every reader.
 
 ### The storage seam, and why it is a seam rather than a fix
 
@@ -95,7 +113,13 @@ That shape exists to make the worst bug in the review **unwritable**. Generation
 
 **Presence sets store one byte, not zero.** This was a real bug, found by three failing tests. bbolt's `Bucket.Get` returns nil both for a missing key and for a key stored with an empty value, so `Get(k) == nil` could not tell them apart: every presence check reported absent, and both the distinct-author count and the Kneser-Ney predecessor count silently counted occurrences instead of distinct things. 500 repetitions by one person reported 500 distinct authors.
 
-**Snowflakes are stored as fixed-width big-endian.** Discord IDs are 64-bit integers whose high bits are a timestamp, so numeric order is chronological order. Stored as decimal *strings* they were not: a 17-digit ID sorted before an 18-digit one, so history eviction removed entries essentially at random. Fixed-width bytes make a cursor's `First()` genuinely the oldest.
+**Snowflakes are stored as fixed-width big-endian.** Discord IDs are 64-bit integers whose high bits are a timestamp, so numeric order is chronological order. Stored as decimal *strings* they were not: a 17-digit ID sorted before an 18-digit one, so history eviction removed entries essentially at random. Fixed-width bytes make a cursor's `First()` genuinely the oldest. A message ID that is not a snowflake is now an *error* rather than a key, which is the right answer for a caller that invented one.
+
+**There is a cheap-answer method for every question the hot path asks, and you should use it.** `HasSuccessors`, `CorpusEmpty`, `IsName` and `TopicCount` exist next to `Successors`, `NgramCount` and `Name` because the scorer calls some of these once per candidate per step per generated word, and the decoding version would put a JSON unmarshal or a `Bucket.Stats()` page walk in that innermost loop. `HasSuccessors` in particular is not a byte-prefix match: keys are `<prefix> 0x00 <next>`, so it seeks the prefix's range and bounds it, which is what stops a query for `"the"` being satisfied by `"the cat"` keys.
+
+**`total_messages_learned` is a meta counter, not a key in the stats bucket.** It used to be the latter, so every reader of a bucket whose every other key is a Discord user ID holding a JSON `WeeklyStat` had to recognise and skip it; the leaderboard did that with a `strconv.ParseInt` on the key, and anything that forgot would decode an integer as a stat and count a phantom user.
+
+**`PurgeAuthor` removes diversity, not frequency, and that asymmetry is deliberate.** The counts do not record who produced them, and storing that would mean a value on every entry of `ngram_auth`, already the fastest-growing structure in the database. So a purge reduces the author diversity of everything that author touched, which is what generation eligibility reads. In practice that is the effective half: a phrase only one person ever said drops to zero distinct authors.
 
 **Trims use counters, never `Bucket.Stats()`.** `Stats()` walks every page, and the old trims called it in the *loop condition*, making eviction quadratic in pages. Counters live in the `meta` bucket and are updated in the same transaction as the insert, so they cannot drift.
 
@@ -154,7 +178,7 @@ The consequences of bbolt that bite in practice:
 
 - **One writer at a time, process-wide.** Every write transaction serializes against every other. A slow loop inside a `db.Update` blocks all ingestion, which is why the O(n^2) co-occurrence loops in `learnMessage` are a correctness-adjacent problem and not just slow.
 - **An exclusive `flock` on the file.** A second process opening it read-write blocks. `bbolt.Open` is called with a 5-second `Timeout` for this reason: running `-clean-db` against a live bot used to hang forever with no output, and now it fails and says why.
-- **Nested transactions deadlock.** bbolt holds `mmaplock.RLock` for a read transaction's entire life and takes the write lock to grow the mmap. Go's `RWMutex` queues new readers behind a waiting writer, so an outer read transaction plus a writer waiting to remap plus an inner `db.View` is an unrecoverable hang, and it gets likelier as the file grows. The generation path does exactly this today (`SPEC.md` §8, finding 1). M6 introduces a `Reader`/`Writer` seam bound to a `*bbolt.Tx` specifically so that nothing outside `internal/storage` can reach a `*bbolt.DB`, making the bug **unwritable** rather than fixed once.
+- **Nested transactions deadlock.** bbolt holds `mmaplock.RLock` for a read transaction's entire life and takes the write lock to grow the mmap. Go's `RWMutex` queues new readers behind a waiting writer, so an outer read transaction plus a writer waiting to remap plus an inner `db.View` is an unrecoverable hang, and it gets likelier as the file grows. The generation path did exactly this until M6b (`SPEC.md` §8, finding 1): `isRecognizedName` opened a transaction per prompt word and `getNextMap` opened one per candidate per backoff step per generated word, all inside the read transaction wrapping generation. Both take the `*storage.Reader` they are already inside now, and the version that could nest **does not compile**, because a `Reader` has no method that opens a transaction.
 - **The file never shrinks.** Deleting keys frees pages for reuse but does not return them to the filesystem. That is why a `-compact` mode is planned rather than optional.
 
 ### Paths must never be relative
@@ -185,6 +209,10 @@ Read `SPEC.md` §5 for the full specification. The parts most worth knowing befo
 
 **Kneser-Ney is deliberately not applied in its textbook form, and this is the single most counter-intuitive decision in the codebase.** KN estimates lower orders from *continuation counts*, the number of distinct contexts a token follows, which correctly demotes a token like "Francisco" that is frequent but nearly always preceded by "San". The problem is that a meme, a copypasta and an inside joke are statistically indistinguishable from "Francisco": high frequency, few distinct contexts. Pure KN would therefore systematically suppress exactly the register this server runs on. `PEREGRINE_KN_RAW_MIX` interpolates the lower-order estimate back toward raw counts (`0.0` is textbook KN, `1.0` is raw counts, default `0.25`). If someone "fixes" this to 0 because a paper says so, output quality by the only metric that matters here gets worse.
 
+**Candidate order is now deterministic, and one heuristic had to go because of it.** Candidates used to arrive in Go's randomized map iteration order, because the successors of a prefix were a `map[string]int`. `Reader.Successors` is a cursor scan, so they arrive in sorted key order. That is fine everywhere except one line: a 1.0-to-1.05 bonus applied to `cands[0]`, which was meaningless-but-unbiased when the index was random and would have become a permanent 5% advantage for whichever continuation sorts first alphabetically, at every step of every sentence. It was already slated for deletion in M7 (`SPEC.md` §8, G4) and was deleted in M6b instead, because a known-bad heuristic becoming systematic rather than random is a change worth not shipping. **When you change how candidates are enumerated, check what reads their index.**
+
+**Prefix lookups are lowercased at the point of lookup, and that is defence rather than a fixed bug.** Learning lowercases the prefix before storing it; the generation path did not lowercase before looking it up. M6b added it, and the honest position is that it changed no behavior: every producer of the generation prefix is already lowercase, because the seed's candidates are all interned from lowercased sources, every later word is a stored successor token, and the one branch that could have introduced a raw prompt word is unreachable with a non-empty corpus. The reason to normalize anyway is that the alternative is an invariant held by five separate producers agreeing, none of which states it, against a lookup whose failure mode is silently returning no candidates. M7 normalizes once at the storage boundary. `TestGenerateWithAMixedCasePromptFindsTheCorpus` says in its own comment that it does not distinguish the two implementations, because a test that looks like a regression pin and is not one is worse than no test.
+
 **Length is tuned short on purpose.** The old bound was `30 + rand(15)` words, which is a paragraph. Short and punchy reads as a joke; long reads as a malfunction.
 
 **Custom emote output had never worked, and M3 fixed the cause.** The `:shortcode:` resolver walks `s.State.Guilds`, and the session never requested `IntentsGuilds`, so that slice was always empty and the resolver had never once succeeded. In a meme server the server's own emotes are most of the register, so this was an engagement bug before it was a performance bug. `core.NewSession` now requests the intent. The state cache it populates is what M10 uses to replace the per-message REST `s.Channel` call for the NSFW check; that call site is still REST today. Emote-bearing output is worth a golden-sample check in M7 now that it is possible at all.
@@ -213,7 +241,9 @@ Once set it fails **closed**: a missing file, an unreadable file, a malformed li
 
 **`PEREGRINE_PAUSE_ALL_WRITES` refuses every send, and deliberately does not stop learning.** During an incident the output is the problem, not the corpus, and stopping ingestion would also stop the bot noticing what is being said to it. It logs at startup, so a silent bot is never a mystery. `Gate.SetPaused` exists so a Discord-reachable kill switch can be added later without inventing a second lever.
 
-**Poisoning is cheap unless generation requires author diversity.** n-gram weight is raw frequency, so repeating a phrase is a direct write to the model, and one determined user can teach the bot to say anything. `PEREGRINE_MIN_DISTINCT_AUTHORS` requires a continuation to have come from `k` distinct authors before the bot will *generate* it, independent of how often it was seen. That turns the attack from persistence into collusion. The bot's own output is excluded from those counts, so self-learning cannot bootstrap a phrase into eligibility.
+**Poisoning is cheap unless generation requires author diversity.** n-gram weight is raw frequency, so repeating a phrase is a direct write to the model, and one determined user can teach the bot to say anything. `PEREGRINE_MIN_DISTINCT_AUTHORS` requires a continuation to have come from `k` distinct authors before the bot will *generate* it, independent of how often it was seen. That turns the attack from persistence into collusion. **The counts are being maintained as of M6b; M7 is what reads them**, so the eligibility gate does not exist yet and the variable is still deferred.
+
+The bot's own output is excluded from those counts, and the exclusion is a comparison in `learnMessage`: if the author's user ID equals `botID`, an empty author is passed to `LearnNgram`, which does not count an empty author. That matters because self-learning feeds the bot's replies back into the corpus under the bot's own identity, so without the comparison anything it said once would carry a diversity count of one from the moment it said it, bootstrapped by the bot rather than by people. `TestLearnMessageExcludesTheBotFromAuthorDiversity` pins it.
 
 ## Deployment
 
