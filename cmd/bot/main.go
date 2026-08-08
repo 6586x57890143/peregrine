@@ -18,10 +18,13 @@ import (
 	"runtime/debug"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/joho/godotenv"
+	"go.etcd.io/bbolt"
 
 	"github.com/6586x57890143/peregrine/internal/config"
+	"github.com/6586x57890143/peregrine/internal/core"
 	"github.com/6586x57890143/peregrine/internal/legacy"
 )
 
@@ -109,24 +112,113 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 	}
 
 	// SIGTERM is the one that matters in production: it is what `docker stop`
-	// sends, and the container gets ten seconds before SIGKILL. Under the old
-	// signal.Notify the same handling existed but lived 300 lines into main();
-	// here the cancellation is owned by the entrypoint and Run just waits on it,
-	// which is what lets a test drive a shutdown without a signal.
+	// sends, and the container gets ten seconds before SIGKILL, which is where the
+	// shutdown budget below comes from.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := legacy.Run(ctx, cfg); err != nil {
+	if err := cfg.RequireToken(); err != nil {
 		return err
 	}
 
-	// Distinguish a clean shutdown from a Run that returned nil for some other
-	// reason. Only the former is expected.
-	if !errors.Is(ctx.Err(), context.Canceled) {
-		log.Warn("bot stopped without a shutdown signal")
+	// The corpus is opened here, and closed here, LAST. It used to be a defer
+	// inside the same function that spawned the message goroutines, so shutdown
+	// raced them: a handler still in flight could reach a closed database. Owning
+	// the open and the close at the outermost level is what makes the ordering
+	// below statable at all.
+	store, err := bbolt.Open(cfg.DBPath, 0600, &bbolt.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		return fmt.Errorf("open corpus at %s: %w", cfg.DBPath, err)
 	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			log.Error("closing corpus", "err", err)
+		}
+	}()
+	if err := legacy.EnsureBuckets(store); err != nil {
+		return err
+	}
+
+	session, err := core.NewSession(cfg.Token)
+	if err != nil {
+		return err
+	}
+
+	dispatcher := core.NewDispatcher(cfg.MessageWorkers, cfg.MessageQueue, log)
+	registry := core.NewRegistry(core.Deps{
+		Session:    session,
+		Config:     cfg,
+		Logger:     log,
+		Store:      store,
+		Dispatcher: dispatcher,
+	}, log)
+	registry.Register(legacy.New())
+
+	if err := registry.InitAll(); err != nil {
+		return err
+	}
+
+	// Armed before Open, which is where discordgo starts dispatching. Open only
+	// means the identify was sent, never that Discord accepted it: a rejected
+	// identify leaves discordgo reconnecting in a loop while startup carries on
+	// and logs success. See core.WatchReady.
+	awaitReady := core.WatchReady(session)
+
+	if err := session.Open(); err != nil {
+		return fmt.Errorf("open discord session: %w", err)
+	}
+	if err := awaitReady(); err != nil {
+		// Close the half-open session before returning, or the process exits with
+		// discordgo's reconnect loop still running.
+		if closeErr := session.Close(); closeErr != nil {
+			log.Error("closing session after failed readiness check", "err", closeErr)
+		}
+		return err
+	}
+
+	// Workers start before services, so a message that arrives the instant a
+	// service registers its handler has somewhere to go.
+	dispatcher.Start(ctx)
+
+	if err := registry.StartAll(ctx); err != nil {
+		return err
+	}
+
+	<-ctx.Done()
+	log.Info("shutting down")
+
+	// The order matters and each step is here because the old code got it wrong.
+	//
+	//  1. Close the session FIRST, to stop the inflow. Draining while Discord is
+	//     still delivering messages is a race against a live gateway.
+	//  2. Drain the dispatcher, so work already accepted finishes rather than
+	//     being dropped on the floor.
+	//  3. Shut services down in reverse start order, which is where the loops get
+	//     stopped and waited for.
+	//  4. Close the store, via the defer above, strictly after every writer has
+	//     stopped.
+	//
+	// One budget covers steps 2 and 3 together, because the container's ten
+	// seconds is the real constraint and giving each step its own full timeout
+	// would let them add up past it.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownBudget)
+	defer cancel()
+
+	if err := session.Close(); err != nil {
+		log.Error("closing discord session", "err", err)
+	}
+	dispatcher.Shutdown(shutdownCtx)
+	registry.ShutdownAll(shutdownCtx)
+
+	log.Info("shutdown complete", "dropped_events", dispatcher.Dropped())
 	return nil
 }
+
+// shutdownBudget is deliberately under Docker's default ten seconds between
+// SIGTERM and SIGKILL. Exceeding it means the corpus is closed by the process
+// being killed rather than by us, which is the one outcome worth engineering
+// against: bbolt survives it, but the final leaderboard write does not.
+const shutdownBudget = 8 * time.Second
 
 // unwrapJoined flattens an errors.Join into its parts so each can be logged
 // separately. Returns a one-element slice for anything else, so the caller never
