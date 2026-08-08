@@ -8,7 +8,7 @@ Sibling project to [merlin](../merlin), whose deployment conventions this repo f
 
 Mid-restructure. The bot works and runs, but it is being taken from a single 3,200-line `main.go` to a proper package layout one subsystem at a time, with a catalogue of known defects being closed along the way. See `SPEC.md` §8 for the defect list and §9 for the milestone order.
 
-**Milestones 0 (repo hygiene, docs, CI/CD) and 1 (the `cmd/bot` entrypoint) are complete.** The entrypoint is real; the code behind it is not yet. Everything except `main`'s own startup and shutdown still sits unchanged in `internal/legacy`, which each later milestone empties one subsystem at a time.
+**Milestones 0 (repo hygiene, docs, CI/CD), 1 (the `cmd/bot` entrypoint) and 2 (`internal/config`) are complete.** The entrypoint and the configuration are real; the code behind them is not yet. Everything except startup, shutdown and configuration still sits unchanged in `internal/legacy`, which each later milestone empties one subsystem at a time.
 
 Two things worth knowing before running it anywhere real:
 
@@ -37,7 +37,11 @@ docker compose up --build
 
 ## Configuration
 
-Everything is environment variables; there is no config file. `.env.example` documents every one with its default and, where it matters, why the default is what it is. Only the variables marked ACTIVE are read today: the rest are the constants that M2 promotes to configuration, written down now so that milestone is mechanical.
+Everything is environment variables; there is no config file. `.env.example` documents every one with its default and, where it matters, why the default is what it is. Variables tagged `LATER (Mn)` are read by no code yet, and the tag names the milestone that starts reading each one; everything else is live.
+
+Configuration is validated once at startup and a bad value is a **startup error, not a fallback to the default**. That includes booleans, so `PEREGRINE_ENABLE_X=ture` fails loudly rather than reading as "off". Every problem is reported in one pass, one log line each, so a multi-variable mistake takes one restart to diagnose rather than one restart per variable. Setting a `LATER` variable is not an error but does produce a warning listing it, because a documented knob that is silently ignored is indistinguishable from a broken one.
+
+Maintenance modes do not need `DISCORD_BOT_TOKEN`: cleaning a poisoned corpus should not require a live credential.
 
 ## Maintenance
 

@@ -4,28 +4,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"os"
 	"time"
 
 	"go.etcd.io/bbolt"
 )
 
-// dbPath resolves the corpus location. PEREGRINE_DB_PATH exists because every
-// runtime path in this bot used to be relative to the working directory, which
-// silently created a fresh empty corpus whenever the bot was started from
-// anywhere but the repo root. It is mandatory in a container: the image runs
-// with a read-only root filesystem, so the bare relative default resolves
-// against the distroless working directory and bbolt.Open fails outright. In
-// production this points inside the mounted volume, /data/markov.db.
-func dbPath() string {
-	if p := os.Getenv("PEREGRINE_DB_PATH"); p != "" {
-		return p
-	}
-	return DBFile
-}
-
 // CleanDatabase iterates through the Markov bucket and removes spammy keys and
 // values. It is the -clean-db maintenance mode and never touches Discord.
+//
+// It takes the corpus path rather than reading PEREGRINE_DB_PATH itself. There
+// used to be a dbPath() helper here that resolved the environment on its own,
+// which meant two code paths independently decided where the corpus lives, and
+// nothing guaranteed they agreed. Cleaning a database that is not the one the bot
+// uses succeeds, reports a tidy summary, and changes nothing an operator cares
+// about, which is the most misleading outcome available. config.Load is now the
+// single resolver and this takes its answer.
 //
 // It returns an error instead of calling log.Fatalf so the deferred db.Close
 // runs. That mattered more here than on the startup path: this mode's whole
@@ -34,14 +27,14 @@ func dbPath() string {
 // naturally attempts next failed on the timeout rather than on the original
 // problem. M6 replaces this pass wholesale, against the composite-key layout
 // where the value is eight bytes and no read-modify-write is needed.
-func CleanDatabase() error {
-	log.Println("[CLEANUP] Opening database for cleaning...")
+func CleanDatabase(path string) error {
+	log.Printf("[CLEANUP] Opening database for cleaning: %s", path)
 	// The 5s timeout matters: bbolt takes an exclusive flock, so running this
 	// against a live bot used to block forever with no output. Now it fails and
 	// says why.
-	db, err := bbolt.Open(dbPath(), 0600, &bbolt.Options{Timeout: 5 * time.Second})
+	db, err := bbolt.Open(path, 0600, &bbolt.Options{Timeout: 5 * time.Second})
 	if err != nil {
-		return fmt.Errorf("open corpus at %s for cleaning (is the bot still running?): %w", dbPath(), err)
+		return fmt.Errorf("open corpus at %s for cleaning (is the bot still running?): %w", path, err)
 	}
 	defer func() { _ = db.Close() }()
 

@@ -29,7 +29,6 @@ import (
 	"log"
 	"math"
 	"math/rand"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -38,6 +37,7 @@ import (
 	"time"
 
 	"github.com/6586x57890143/peregrine/clustering"
+	"github.com/6586x57890143/peregrine/internal/config"
 	"github.com/6586x57890143/peregrine/voicenotes"
 	"github.com/6586x57890143/peregrine/wordgames"
 	"github.com/beevik/ntp"
@@ -45,39 +45,47 @@ import (
 	"go.etcd.io/bbolt"
 )
 
-// ----- CONFIG -----
+// Bucket names. These are the only members of the old CONFIG block that are
+// genuinely constant: they are the on-disk schema, not a tuning decision, and
+// changing one at runtime would just mean reading from a bucket nothing wrote.
+// M6 moves them into internal/storage unexported, which is also what stops
+// clustering owning storage-layer names as it does here.
 const (
-	DBFile                        = "markov.db"
-	MarkovBucket                  = "markov"
-	TopicBucket                   = "topics"
-	HistoryBucket                 = "history"
-	NameBucket                    = "names"
-	NameTopicBucket               = clustering.NameTopicBucket
-	TopicWordBucket               = "TopicWordBucket"
-	TopicClusterBucket            = clustering.TopicClusterBucket
-	ImageCacheBucket              = "ImageCacheBucket"
-	ConfigBucket                  = "ConfigBucket"
-	ConceptClusterBucket          = clustering.ConceptClusterBucket
-	StatsBucket                   = "stats"
-	LeaderboardBucket             = "LeaderboardBucket"
-	MaxHistory                    = 10000
-	MaxNGram                      = 5
-	AutonomyTick                  = 10 * time.Minute
-	RecentHours                   = 24 // 1 day
-	AutonomousPost                = false
-	LibraryStatusTick             = 5 * time.Minute
-	ContextWindow                 = 2000
-	BatchDelay                    = 500 * time.Millisecond        // pause between batch fetches
-	Creativity                    = 0.75                          // 0.0 = conservative, 1.0 = more daring & varied
-	CoherencyBalance              = 0.65                          // higher = favor coherence over novelty
-	PromptRelevanceBoost          = 15.0                          // weight for words in the prompt
-	EnableWordGames               = false                         // set to true to enable word games
-	WordGameFrequencyMode         = WordGameFrequencyModeInterval // WordGameFrequencyModeActivity or WordGameFrequencyModeInterval
-	WordGameFrequencyModeActivity = "activity"
-	WordGameFrequencyModeInterval = "interval"
-	WordGameIntervalMinutes       = 2
-	EnableTranscription           = true // set to false to disable voice transcription
+	MarkovBucket         = "markov"
+	TopicBucket          = "topics"
+	HistoryBucket        = "history"
+	NameBucket           = "names"
+	NameTopicBucket      = clustering.NameTopicBucket
+	TopicWordBucket      = "TopicWordBucket"
+	TopicClusterBucket   = clustering.TopicClusterBucket
+	ImageCacheBucket     = "ImageCacheBucket"
+	ConfigBucket         = "ConfigBucket"
+	ConceptClusterBucket = clustering.ConceptClusterBucket
+	StatsBucket          = "stats"
+	LeaderboardBucket    = "LeaderboardBucket"
 )
+
+// cfg is the loaded configuration, set once by Run before anything reads it.
+//
+// A package-level variable rather than a parameter threaded through 40 functions,
+// because those functions are being deleted milestone by milestone and rewriting
+// each signature twice is churn for no reader's benefit. As each subsystem moves
+// out of this package it takes its own config fields with it as struct fields on
+// a real type. Nothing here writes to it after Run sets it.
+//
+// Creativity is deliberately NOT here and gets no environment variable. It is
+// applied as an exponent of 1/(Creativity+0.01), so at its 0.75 default the
+// exponent is 1.316, which sharpens the distribution: the knob's arithmetic
+// inverts its own name and cannot reach the interesting half of its own range.
+// Exposing that to an operator would invite tuning something broken. M7 replaces
+// it with PEREGRINE_TEMPERATURE once the scoring is normalized and the dial
+// actually moves. ContextWindow and CoherencyBalance are gone entirely: they were
+// declared and never read.
+var cfg *config.Config
+
+// Creativity is the old inverse-temperature exponent, left as a constant because
+// it is not fit to be configuration. See the comment on cfg.
+const Creativity = 0.75
 
 // WordPosData tracks word statistics for positional weighting and name/topic associations
 type WordPosData struct {
@@ -131,7 +139,6 @@ type WeeklyStat struct {
 	LastTimestamp time.Time `json:"last_timestamp"`
 }
 
-
 var (
 	vocab    = make(map[string]int)
 	revVocab = make([]string, 0)
@@ -160,15 +167,12 @@ var activeWordGames = make(map[string]*wordgames.ScrambleGame)
 var wordGameMutex = &sync.Mutex{}
 
 // wordGamesAvailable records whether the dictionary actually loaded. Checked
-// alongside EnableWordGames so that a failed load degrades to "word games off"
+// alongside cfg.EnableWordGames so that a failed load degrades to "word games off"
 // rather than to a panic on an empty word list.
 var wordGamesAvailable bool
 var channelActivity = make(map[string][]time.Time)
 var activityMutex = &sync.Mutex{}
 var leaderboard *wordgames.Leaderboard
-
-// AutonomousPostingChannels defines a list of channel IDs where autonomous posts are allowed.
-var AutonomousPostingChannels = []string{}
 
 // ----- BIRD AGGRO -----
 var birdAggroTargetID string
@@ -217,11 +221,8 @@ var birdAggroMutex sync.Mutex
 var recentImageURLs []string
 var imageURLMutex sync.Mutex
 
-const maxRecentImageURLs = 100
-
 var discordCDNRegex = regexp.MustCompile(`^https?:\/\/cdn\.discordapp\.com\/\S+$`)
 var tenorRegex = regexp.MustCompile(`^https?:\/\/tenor\.com\/view\/\S+$`)
-var selfMentionKeywords = regexp.MustCompile(`(?i)\b(peregrine|bird)\b`)
 
 var stopWords = map[string]struct{}{
 	"a": {}, "about": {}, "above": {}, "after": {}, "again": {}, "against": {}, "all": {}, "am": {}, "an": {}, "and": {}, "any": {}, "are": {}, "as": {}, "at": {},
@@ -254,25 +255,27 @@ var lastWordGameTime time.Time
 // exclusive flock on markov.db held by a dying process, and the next start would
 // then block for the full five-second Open timeout for no visible reason.
 //
-// The signature grows in later milestones: M2 adds a *config.Config, M3 replaces
-// the goroutine soup below with core.Registry and RunLoop. It deliberately takes
-// no logger: every log call in this package is the stdlib log package, and
-// cmd/bot routes those through the slog handler with slog.SetDefault, so the
-// output is structured without 200 call-site edits in a milestone whose whole
-// point was to be reviewable as a rename.
-func Run(ctx context.Context) error {
+// M3 replaces the goroutine soup below with core.Registry and RunLoop. Run
+// deliberately takes no logger: every log call in this package is the stdlib log
+// package, and cmd/bot routes those through the slog handler with
+// slog.SetDefault, so the output is structured without 200 call-site edits.
+func Run(ctx context.Context, c *config.Config) error {
+	cfg = c
+
 	randgen = rand.New(rand.NewSource(time.Now().UnixNano())) // Initialize the global random number generator
 	lastWordGameTime = time.Now()                             // Initialize with current time on startup
 
-	BotToken = os.Getenv("DISCORD_BOT_TOKEN")
-	if BotToken == "" {
-		return fmt.Errorf("DISCORD_BOT_TOKEN environment variable not set")
+	// The token is checked here rather than in config.Load, so that maintenance
+	// modes which never touch Discord do not need a live credential to run.
+	if err := cfg.RequireToken(); err != nil {
+		return err
 	}
+	BotToken = cfg.Token
 
 	var err error
-	db, err = bbolt.Open(dbPath(), 0600, &bbolt.Options{Timeout: 5 * time.Second})
+	db, err = bbolt.Open(cfg.DBPath, 0600, &bbolt.Options{Timeout: 5 * time.Second})
 	if err != nil {
-		return fmt.Errorf("open corpus at %s: %w", dbPath(), err)
+		return fmt.Errorf("open corpus at %s: %w", cfg.DBPath, err)
 	}
 	// M3 replaces this with an explicit, ordered close that runs after every
 	// user of the store has stopped. Today a message still in flight during
@@ -304,7 +307,7 @@ func Run(ctx context.Context) error {
 	// generation, and every other behavior with it. A failure here disables word
 	// games and says so. PEREGRINE_WORDGAME_DICTIONARY overrides the embedded
 	// list; empty means use the embedded one.
-	if err := wordgames.LoadDictionary(os.Getenv("PEREGRINE_WORDGAME_DICTIONARY")); err != nil {
+	if err := wordgames.LoadDictionary(cfg.WordGameDictionary); err != nil {
 		log.Printf("[WARN] Word game dictionary failed to load, word games disabled: %v", err)
 		wordGamesAvailable = false
 	} else {
@@ -405,7 +408,7 @@ func Run(ctx context.Context) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		ticker := time.NewTicker(LibraryStatusTick)
+		ticker := time.NewTicker(cfg.StatusTick)
 		defer ticker.Stop()
 		for {
 			select {
@@ -421,7 +424,7 @@ func Run(ctx context.Context) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		ticker := time.NewTicker(AutonomyTick)
+		ticker := time.NewTicker(cfg.IngestTick)
 		defer ticker.Stop()
 		for {
 			select {
@@ -435,12 +438,14 @@ func Run(ctx context.Context) error {
 		}
 	}()
 
-	// Autonomous posting loop
-	if AutonomousPost {
+	// Autonomous posting loop. Its own ticker now: this shared the ingestion
+	// constant, so changing how often the bot backfilled history also changed how
+	// often it spoke unprompted.
+	if cfg.EnableAutonomousPost {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ticker := time.NewTicker(AutonomyTick)
+			ticker := time.NewTicker(cfg.AutonomousPostTick)
 			defer ticker.Stop()
 			for {
 				select {
@@ -453,11 +458,11 @@ func Run(ctx context.Context) error {
 		}()
 	}
 
-	// Bird Aggro hourly trigger
+	// Bird Aggro trigger
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		ticker := time.NewTicker(1 * time.Hour)
+		ticker := time.NewTicker(cfg.AggroTick)
 		defer ticker.Stop()
 		for {
 			select {
@@ -465,13 +470,12 @@ func Run(ctx context.Context) error {
 				birdAggroMutex.Lock()
 				// Only trigger if there's no current aggro
 				if birdAggroTargetID == "" || time.Now().After(birdAggroEndTime) {
-					// 20% chance to trigger aggro each hour
-					if randgen.Float64() < 0.20 {
+					if randgen.Float64() < cfg.AggroChance {
 						target := findRandomActiveUser(dg)
 						if target != "" {
 							birdAggroTargetID = target
-							birdAggroEndTime = time.Now().Add(20 * time.Minute)
-							log.Printf("[AGGRO] Bird aggro triggered on user %s for 20 minutes.", target)
+							birdAggroEndTime = time.Now().Add(cfg.AggroDuration)
+							log.Printf("[AGGRO] Bird aggro triggered on user %s for %v.", target, cfg.AggroDuration)
 							// Persist the new aggro state
 							_ = db.Update(func(tx *bbolt.Tx) error {
 								return saveAggroState(tx, AggroState{TargetID: birdAggroTargetID, EndTime: birdAggroEndTime})
@@ -490,7 +494,7 @@ func Run(ctx context.Context) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		ticker := time.NewTicker(1 * time.Hour) // Check every hour
+		ticker := time.NewTicker(cfg.LeaderboardTick)
 		defer ticker.Stop()
 		for {
 			select {
@@ -521,24 +525,29 @@ func Run(ctx context.Context) error {
 		}
 	}()
 
-	// Daily clustering pass
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		// Initial clustering on startup
-		performClustering()
+	// Daily clustering pass. Now skippable: it walks the whole corpus inside a
+	// write transaction, and bbolt has one writer process-wide, so on a large
+	// corpus this is the pass most likely to be the thing an operator wants to
+	// turn off while diagnosing stalled ingestion.
+	if cfg.EnableClustering {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Initial clustering on startup
+			performClustering()
 
-		ticker := time.NewTicker(24 * time.Hour)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				performClustering()
-			case <-stopSignal:
-				return
+			ticker := time.NewTicker(cfg.ClusteringTick)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					performClustering()
+				case <-stopSignal:
+					return
+				}
 			}
-		}
-	}()
+		}()
+	}
 
 	// Wait for shutdown. The signal handling moved to cmd/bot, which owns the
 	// signal.NotifyContext, so this is now the same wait whether the trigger was
@@ -1198,7 +1207,7 @@ func learnMessage(tx *bbolt.Tx, msg, msgID, botID string, author MentionedUser, 
 
 	// ... (Markov n-gram ingestion is the same)
 	totalNgrams := 0
-	for n := MaxNGram; n >= 1; n-- {
+	for n := cfg.MaxNGram; n >= 1; n-- {
 		if len(words) < n {
 			continue
 		}
@@ -1216,7 +1225,7 @@ func learnMessage(tx *bbolt.Tx, msg, msgID, botID string, author MentionedUser, 
 	}
 
 	_ = historyB.Put([]byte(msgID), []byte(msg))
-	_ = trimHistoryInTx(historyB, MaxHistory)
+	_ = trimHistoryInTx(historyB, cfg.MaxHistory)
 
 	log.Printf("[LEARNED] msg=%q | words=%d | ngrams=%d | history=%d | names=%d | took=%s",
 		msg, len(words), totalNgrams, historyB.Stats().KeyN, len(canonicalNames), time.Since(startTime))
@@ -1353,8 +1362,8 @@ func extractNamesFromMessage(s *discordgo.Session, m *discordgo.MessageCreate, g
 // ingestRecentMessagesIncremental walks guilds and ingests recent messages in parallel.
 func ingestRecentMessagesIncremental(s *discordgo.Session, stopCh <-chan struct{}) {
 	start := time.Now().UTC() // Use UTC for consistency
-	// ALWAYS look back the full `RecentHours` window.
-	ingestionCutoff := time.Now().UTC().Add(-time.Duration(RecentHours) * time.Hour)
+	// ALWAYS look back the full PEREGRINE_INGEST_LOOKBACK window.
+	ingestionCutoff := time.Now().UTC().Add(-cfg.IngestLookback)
 
 	guilds, err := s.UserGuilds(100, "", "", false)
 	if err != nil {
@@ -1390,7 +1399,7 @@ func processGuildIncremental(s *discordgo.Session, g discordgo.UserGuild, stopCh
 	var guildWg sync.WaitGroup // WaitGroup for channels within this guild
 
 	// Use a wider window to find channels that are generally active.
-	activeChannelCutoff := time.Now().UTC().Add(-time.Duration(RecentHours) * time.Hour)
+	activeChannelCutoff := time.Now().UTC().Add(-cfg.IngestLookback)
 	for _, chInfo := range getActiveChannels(s, g.ID, stopCh, activeChannelCutoff) {
 		select {
 		case <-stopCh:
@@ -1452,7 +1461,7 @@ func processChannelIncremental(s *discordgo.Session, ch *discordgo.Channel, stop
 
 		// Prepare for next page: fetch messages older than the current oldest.
 		beforeID = batch[len(batch)-1].ID
-		time.Sleep(BatchDelay) // Pacing to avoid rate limits
+		time.Sleep(cfg.IngestBatchDelay) // Pacing to avoid rate limits
 	}
 
 	// If no messages were pulled, nothing to do.
@@ -1743,7 +1752,7 @@ func findBestSeed(tx *bbolt.Tx, promptWords, recentWords, recognizedNames []stri
 	}
 
 	// 2. High Priority: Multi-word n-grams from the prompt.
-	for n := MaxNGram - 1; n >= 1; n-- {
+	for n := cfg.MaxNGram - 1; n >= 1; n-- {
 		for i := 0; i <= len(promptWords)-n; i++ {
 			key := toLowerCaseExceptURLs(strings.Join(promptWords[i:i+n], " "))
 			if markovB.Get([]byte(key)) != nil {
@@ -1838,7 +1847,7 @@ func findBestSeed(tx *bbolt.Tx, promptWords, recentWords, recognizedNames []stri
 	}
 
 	// 7. Low Priority: Recent context fallback.
-	for n := MaxNGram - 1; n >= 1; n-- {
+	for n := cfg.MaxNGram - 1; n >= 1; n-- {
 		for i := 0; i <= len(recentWords)-n; i++ {
 			key := toLowerCaseExceptURLs(strings.Join(recentWords[i:i+n], " "))
 			if markovB.Get([]byte(key)) != nil {
@@ -2170,7 +2179,7 @@ func pickPromptAwareNextWithSimilarity(
 
 		// prompt relevance boost (unchanged)
 		if _, ok := promptSet[lw]; ok {
-			score += PromptRelevanceBoost
+			score += cfg.PromptRelevanceBoost
 		}
 
 		// recent context nudge (stronger)
@@ -2432,8 +2441,8 @@ func generateSentenceAttempt(tx *bbolt.Tx, promptWords, recentWords []string, or
 		}
 
 		n := len(lastWords)
-		if n > MaxNGram-1 {
-			n = MaxNGram - 1
+		if n > cfg.MaxNGram-1 {
+			n = cfg.MaxNGram - 1
 		}
 
 		var next string
@@ -2482,7 +2491,7 @@ func generateSentenceAttempt(tx *bbolt.Tx, promptWords, recentWords []string, or
 
 		sentence = append(sentence, next)
 		lastWords = append(lastWords, next)
-		if len(lastWords) > MaxNGram-1 {
+		if len(lastWords) > cfg.MaxNGram-1 {
 			lastWords = lastWords[1:]
 		}
 		usedWords[toLowerCaseExceptURLs(next)]++
@@ -2566,7 +2575,7 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		globalConvMemory.AddMessage(m.Content)
 
 		// --- Word Game Event Logic ---
-		if EnableWordGames && wordGamesAvailable {
+		if cfg.EnableWordGames && wordGamesAvailable {
 			wordGameMutex.Lock()
 			if game, gameExists := activeWordGames[m.ChannelID]; gameExists {
 				// A game is active, check for a winning guess
@@ -2694,9 +2703,14 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 			sendMessage(s, m.ChannelID, leaderboard.Format()+"\n\n"+chatLeaderboard)
 		}
 		// --- Word Game Admin Command (for testing) ---
-		if EnableWordGames && wordGamesAvailable && strings.ToLower(m.Content) == "!wordgame" {
-			// Restrict this command to a specific user
-			if m.Author.ID == "184693515748507648" {
+		if cfg.EnableWordGames && wordGamesAvailable && strings.ToLower(m.Content) == "!wordgame" {
+			// The only authorization check in the codebase, and until M2 it was a
+			// user ID hardcoded in the source. It now fails CLOSED: an unset
+			// PEREGRINE_BOOTSTRAP_ADMIN_USER_ID refuses this command for
+			// everyone, never allows it for everyone. Getting that direction
+			// wrong on an empty string is how a missing variable turns an
+			// operator-only command into a public one.
+			if cfg.AdminUserID != "" && m.Author.ID == cfg.AdminUserID {
 				wordGameMutex.Lock()
 				if _, gameExists := activeWordGames[m.ChannelID]; gameExists {
 					sendMessage(s, m.ChannelID, "A word game is already in progress in this channel!")
@@ -2742,7 +2756,7 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 
 		if isTarget && !isExpired {
 			// Aggro is active. Perform API calls outside the lock.
-			err := s.MessageReactionAdd(m.ChannelID, m.ID, "🐦")
+			err := s.MessageReactionAdd(m.ChannelID, m.ID, cfg.AggroEmoji)
 			if err != nil {
 				log.Printf("[AGGRO] Failed to add reaction: %v", err)
 			}
@@ -2758,7 +2772,7 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 			_ = db.Update(func(tx *bbolt.Tx) error {
 				return saveAggroState(tx, AggroState{})
 			})
-			_ = s.MessageReactionRemove(m.ChannelID, m.ID, "🐦", s.State.User.ID)
+			_ = s.MessageReactionRemove(m.ChannelID, m.ID, cfg.AggroEmoji, s.State.User.ID)
 		}
 
 		// --- Determine flags ---
@@ -2790,7 +2804,7 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		flags["TEXT"] = len(strings.TrimSpace(m.Content)) > 0
 
 		// Check for self-mention keywords in text messages
-		if flags["TEXT"] && selfMentionKeywords.MatchString(m.Content) {
+		if flags["TEXT"] && cfg.SelfMention.MatchString(m.Content) {
 			flags["SELF_MENTION_KEYWORD"] = true
 		}
 
@@ -2908,7 +2922,7 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		}
 
 		// --- Handle voice attachments ---
-		if EnableTranscription && flags["VOICE"] {
+		if cfg.EnableTranscription && flags["VOICE"] {
 			for _, att := range m.Attachments {
 				ext := strings.ToLower(filepath.Ext(att.Filename))
 				if ext == ".ogg" || ext == ".mp3" || ext == ".wav" {
@@ -2938,89 +2952,36 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		}
 
 		// --- Capture image and Tenor URLs ---
-		ch, err := s.Channel(m.ChannelID)
-		if err != nil {
-			log.Printf("[WARN] Could not fetch channel info to check for NSFW status: %v", err)
-		} else if !ch.NSFW && !strings.Contains(strings.ToLower(ch.Name), "nsfw") {
-			imageURLMutex.Lock()
-
-			var candidateURLs []string
-
-			// 1. Check attachments first.
-			for _, att := range m.Attachments {
-				if strings.HasPrefix(att.ContentType, "image/") && discordCDNRegex.MatchString(att.URL) {
-					candidateURLs = append(candidateURLs, att.URL)
-				}
-			}
-
-			// 2. Scan message content for any URLs.
-			contentWords := tokenize(m.Content)
-			for _, word := range contentWords {
-				if discordCDNRegex.MatchString(word) || tenorRegex.MatchString(word) {
-					candidateURLs = append(candidateURLs, word)
-				}
-			}
-
-			var urlToCache string
-			if len(candidateURLs) > 0 {
-				// Randomly select one URL from the candidates to cache
-				urlToCache = candidateURLs[randgen.Intn(len(candidateURLs))]
-			}
-
-			// 3. If a URL was found (either from attachment or content), save it.
-			if urlToCache != "" {
-				var newUrlList []string
-				// Persist to DB and then reload the cache to ensure consistency
-				err := db.Update(func(tx *bbolt.Tx) error {
-					if err := saveImageURLToDB(tx, urlToCache); err != nil {
-						return fmt.Errorf("failed to save image URL to DB: %w", err)
-					}
-					if err := trimImageCacheInTx(tx, maxRecentImageURLs); err != nil {
-						return fmt.Errorf("failed to trim image cache: %w", err)
-					}
-
-					// After trimming, reload all URLs to ensure the in-memory slice is in sync
-					bucket := tx.Bucket([]byte(ImageCacheBucket))
-					if bucket == nil {
-						return fmt.Errorf("ImageCacheBucket not found during reload")
-					}
-					return bucket.ForEach(func(k, v []byte) error {
-						newUrlList = append(newUrlList, string(k))
-						return nil
-					})
-				})
-
-				if err != nil {
-					log.Printf("[WARN] DB operation for image cache failed: %v", err)
-				} else {
-					// Update in-memory cache ONLY if DB operation was successful
-					recentImageURLs = newUrlList
-					log.Printf("[IMG] Captured URL: %s, cache size: %d", urlToCache, len(recentImageURLs))
-				}
-			}
-			imageURLMutex.Unlock()
-		} else if ch != nil {
-			log.Printf("[INFO] Skipping image cache for NSFW-flagged or named channel #%s", ch.Name)
+		// Gated on the same switch as reposting, not just on the repost itself.
+		// The cache exists only to feed reposts, so with reposting off this would
+		// be storing other people's media URLs in the operator's database for no
+		// consumer at all: liability with no upside.
+		if cfg.EnableImageRepost {
+			captureImageURLs(s, m)
 		}
 
 		// --- Spontaneous image repost ---
-		// Apply repost chance to all messages, but prioritize non-direct interactions.
-		repostChance := 0.01 // Base 1% chance for direct messages
+		// Applies to all messages, but the ambient rate is deliberately the
+		// higher of the two: when the bot is already answering a mention it is
+		// contributing to the channel anyway, so an unrelated image on top of the
+		// reply is noise rather than chaos.
+		repostChance := cfg.ImageRepostDirect
 		if !flags["MENTIONED"] && !flags["REPLY_TO_BOT"] {
-			repostChance = 0.015 //
+			repostChance = cfg.ImageRepostChance
 		}
 
-		if randgen.Float64() < repostChance {
+		if cfg.EnableImageRepost && randgen.Float64() < repostChance {
 			imageURLMutex.Lock()
 			if len(recentImageURLs) > 0 {
 				urlToPost := recentImageURLs[randgen.Intn(len(recentImageURLs))]
 				imageURLMutex.Unlock() // Unlock before sending to avoid holding lock during network call
 
-				if _, err := s.ChannelMessageSend(m.ChannelID, urlToPost); err != nil {
-					log.Printf("[ERR] sending image repost failed: %v", err)
-				} else {
-					log.Printf("[REPOST] Spontaneously posted image: %s", urlToPost)
-				}
+				// Logged before the send, and worded as an attempt, because
+				// sendMessage returns nothing: it logs its own failure. Claiming
+				// success after a void call would report a repost that Discord
+				// refused as one that happened.
+				log.Printf("[REPOST] Reposting image: %s", urlToPost)
+				sendMessage(s, m.ChannelID, urlToPost)
 			} else {
 				imageURLMutex.Unlock()
 			}
@@ -3028,6 +2989,80 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 
 		log.Printf("[OK] handled msg from %s in %s | flags: %+v", m.Author.Username, time.Since(start), flags)
 	}()
+}
+
+// captureImageURLs caches one image or Tenor URL from a message so a later
+// repost has something to post. Extracted from messageCreate only so the
+// EnableImageRepost gate could wrap it as one statement; the body is unchanged.
+//
+// The s.Channel call here is a REST request on every message that carries a
+// candidate URL, purely to read the NSFW flag. It becomes a free s.State.Channel
+// lookup in M10 once IntentsGuilds is requested (SPEC.md section 8, finding 7).
+func captureImageURLs(s *discordgo.Session, m *discordgo.MessageCreate) {
+	ch, err := s.Channel(m.ChannelID)
+	if err != nil {
+		log.Printf("[WARN] Could not fetch channel info to check for NSFW status: %v", err)
+	} else if !ch.NSFW && !strings.Contains(strings.ToLower(ch.Name), "nsfw") {
+		imageURLMutex.Lock()
+
+		var candidateURLs []string
+
+		// 1. Check attachments first.
+		for _, att := range m.Attachments {
+			if strings.HasPrefix(att.ContentType, "image/") && discordCDNRegex.MatchString(att.URL) {
+				candidateURLs = append(candidateURLs, att.URL)
+			}
+		}
+
+		// 2. Scan message content for any URLs.
+		contentWords := tokenize(m.Content)
+		for _, word := range contentWords {
+			if discordCDNRegex.MatchString(word) || tenorRegex.MatchString(word) {
+				candidateURLs = append(candidateURLs, word)
+			}
+		}
+
+		var urlToCache string
+		if len(candidateURLs) > 0 {
+			// Randomly select one URL from the candidates to cache
+			urlToCache = candidateURLs[randgen.Intn(len(candidateURLs))]
+		}
+
+		// 3. If a URL was found (either from attachment or content), save it.
+		if urlToCache != "" {
+			var newUrlList []string
+			// Persist to DB and then reload the cache to ensure consistency
+			err := db.Update(func(tx *bbolt.Tx) error {
+				if err := saveImageURLToDB(tx, urlToCache); err != nil {
+					return fmt.Errorf("failed to save image URL to DB: %w", err)
+				}
+				if err := trimImageCacheInTx(tx, cfg.ImageCacheSize); err != nil {
+					return fmt.Errorf("failed to trim image cache: %w", err)
+				}
+
+				// After trimming, reload all URLs to ensure the in-memory slice is in sync
+				bucket := tx.Bucket([]byte(ImageCacheBucket))
+				if bucket == nil {
+					return fmt.Errorf("ImageCacheBucket not found during reload")
+				}
+				return bucket.ForEach(func(k, v []byte) error {
+					newUrlList = append(newUrlList, string(k))
+					return nil
+				})
+			})
+
+			if err != nil {
+				log.Printf("[WARN] DB operation for image cache failed: %v", err)
+			} else {
+				// Update in-memory cache ONLY if DB operation was successful
+				recentImageURLs = newUrlList
+				log.Printf("[IMG] Captured URL: %s, cache size: %d", urlToCache, len(recentImageURLs))
+			}
+		}
+		imageURLMutex.Unlock()
+	} else if ch != nil {
+		log.Printf("[INFO] Skipping image cache for NSFW-flagged or named channel #%s", ch.Name)
+	}
 }
 
 // -----------------------------------------------------------------------------
@@ -3103,7 +3138,7 @@ func autonomousPost(dg *discordgo.Session) {
 		if gptr == nil {
 			continue
 		}
-		channels := getActiveChannels(dg, gptr.ID, stopSignal, time.Now().Add(-time.Duration(RecentHours)*time.Hour))
+		channels := getActiveChannels(dg, gptr.ID, stopSignal, time.Now().Add(-cfg.IngestLookback))
 		if len(channels) == 0 {
 			log.Printf("[AUTONOMOUS] Guild %s has no active channels", gptr.Name)
 			continue
@@ -3128,14 +3163,14 @@ func autonomousPost(dg *discordgo.Session) {
 	}
 
 	// Chance to skip for "natural pacing" (applies to ALL autonomous posts)
-	skipChance := 0.90 // 90% chance to skip
+	skipChance := cfg.AutonomousSkipChance
 	if randgen.Float64() < skipChance {
 		log.Printf("[AUTONOMOUS] Skipping this cycle for natural pacing (chance %.2f)", skipChance)
 		return
 	}
 
 	// Only post word games as autonomous posts for now
-	if !EnableWordGames || !wordGamesAvailable {
+	if !cfg.EnableWordGames || !wordGamesAvailable {
 		return
 	}
 
@@ -3144,16 +3179,16 @@ func autonomousPost(dg *discordgo.Session) {
 	// off. Activity mode intentionally has no branch here, because for an
 	// autonomous post the global skip chance above already provides the pacing;
 	// only interval mode needs its own clock.
-	if WordGameFrequencyMode == WordGameFrequencyModeInterval {
-		if time.Since(lastWordGameTime) < time.Duration(WordGameIntervalMinutes)*time.Minute {
-			log.Printf("[AUTONOMOUS] Not time for a word game yet (next in %v minutes)", WordGameIntervalMinutes)
+	if cfg.WordGameMode == config.WordGameModeInterval {
+		if time.Since(lastWordGameTime) < cfg.WordGameInterval {
+			log.Printf("[AUTONOMOUS] Not time for a word game yet (next in %v)", cfg.WordGameInterval-time.Since(lastWordGameTime))
 			return
 		}
 		lastWordGameTime = time.Now()
 	}
 
 	// Only post word games in allowed channels
-	if !stringContains(AutonomousPostingChannels, bestChannel.ID) {
+	if !stringContains(cfg.AutonomousPostChannels, bestChannel.ID) {
 		log.Printf("[AUTONOMOUS] Channel %s not in allowed list for autonomous posting, skipping word game", bestChannel.Name)
 		return
 	}
