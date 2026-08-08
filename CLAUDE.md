@@ -57,6 +57,32 @@ Logging is bridged rather than converted. `cmd/bot` calls `slog.SetDefault`, whi
 
 `stopSignal` is still the internal shutdown broadcast, because a dozen functions take it as a `<-chan struct{}` parameter. `Run` waits on `ctx.Done()` and then closes it, which is what translates the one cancellation `cmd/bot` owns into the one every goroutine selects on. M3 replaces both with a real lifecycle.
 
+### `internal/text` and `internal/filter` are leaves and neither logs
+
+Both import nothing from this module and must stay that way, so the tokenizer that decides what the bot learns and the filters that decide what it drops are testable with no database, no session and no config.
+
+**Neither package logs.** The filters return a reason string alongside the verdict and the caller decides what to record. A leaf that writes to the log is a leaf you cannot test quietly, and the reason belongs to whoever chose to act on it.
+
+**`tokenRegex` contains a literal right single quote and that is load-bearing.** Discord clients substitute a curly apostrophe as you type, so without it `don't` tokenizes as `don` plus `t` and the corpus fills with fragments. It is the one deliberate exception to the plain-punctuation rule and CI's prose check is configured not to scan for it. `TestTokenizeCurlyApostropheRegression` is what fails if someone cleans it up.
+
+**`CleanSentence` takes an `EmojiResolver`, not a session.** That was the only thing it needed discordgo for, and taking the session would have dragged discordgo into a leaf and made the sentence cleaner untestable. `legacy.sessionEmoji` satisfies the interface structurally.
+
+**The slur list is an ordered slice, not a map.** As a map, iteration order was randomized, so overlapping patterns produced different output on different runs and the corpus recorded whichever won that time. Today's patterns are all `\b`-anchored whole words so none actually overlap; the slice is what makes a future overlapping addition predictable instead of random.
+
+**`internal/filter` is not the safety gate.** It is the mechanism. Its patterns match **raw** text, so they are evadable by construction: intra-word spacing, zero-width characters, combining marks and homoglyphs all pass. `TestSlurRulesAreEvadable` asserts that weakness on purpose, so nobody reads a green suite as evidence that raw matching suffices. Do not add evasion variants here; M5's normalizer folds the input first, which is what makes these patterns adequate rather than a sieve.
+
+**Replacement is a display operation and must never touch the learning path.** A laundered message still carries its structure, so learning it teaches the bot the sentence with a harmless word where the slur went. On the learning path the verdict has to be "drop the whole message".
+
+**Nothing may persist a `text.Interner` id.** Ids depend on insertion order, so an id written to the database means something different to the next process. This is not hypothetical: see the clustering note below.
+
+### Clustering currently does nothing, and that is a finding, not a design
+
+`clustering` persists cluster members **string-keyed**; the generation path unmarshals them into `map[int]float32`. Go parses integer map keys with `strconv`, so every cluster fails to unmarshal, and both consumers guard with `if err := json.Unmarshal(...); err == nil` and no `else`. The failure is completely silent.
+
+So the pass runs a full similarity walk over the corpus every 24 hours, inside a write transaction against bbolt's single writer, ending in a destructive `DeleteBucket` plus `CreateBucket`, and produces data that **has never once been read**. Both consumers are dead code: the concept-cluster seed branch and the cluster-based jump. `PEREGRINE_ENABLE_CLUSTERING` therefore defaults to **false** since M4. `SPEC.md` §8 finding 27 has the detail.
+
+The codec fix is small and deliberately deferred to M8, because turning the path on adds a seed branch firing at weight 50 inside a scorer that is not yet normalized, and M7's golden samples are what can judge whether it helps. The general lesson is worth keeping: an unmarshal guarded by `err == nil` with no `else` is indistinguishable from one that works, and only round-tripping the two real types tells you which you have.
+
 ### Lifecycle: what starts, in what order, and what stops first
 
 `cmd/bot` owns the process: config, logger, corpus, session, dispatcher, registry, shutdown. `internal/core` owns the mechanisms. Nothing in `core` imports a feature package and nothing may: services import `core`, and registration happens only in `cmd/bot`.
