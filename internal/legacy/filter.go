@@ -6,14 +6,23 @@ import (
 	"github.com/6586x57890143/peregrine/internal/filter"
 )
 
-// These are thin wrappers over internal/filter, kept so the call sites in this
-// package did not all have to change in the same commit that moved the logic out.
-// They exist for exactly one reason beyond the rename: internal/filter is a leaf
-// and does no logging, returning a reason string instead, and the log lines these
-// produce are the ones an operator already recognizes. M5 replaces all of them
-// with safety.CheckLearn and safety.CheckEmit at the two chokepoints, and then
-// these go away.
+// What remains here is what the safety gate does not cover, and the shrinkage is
+// the point.
+//
+// M4 left four thin wrappers over internal/filter. M5 replaced two of them:
+// filterIllegalContent and filterSlurs had no callers left once CheckLearn ran
+// inside learnMessage and CheckEmit ran at the generation exit, and the linter
+// reporting them as unused is how that was confirmed rather than assumed. The
+// laundering wrapper in particular is gone for good: replacement must never touch
+// the learning path, and after the gate exists a launder before the gate would
+// actively defeat it (SPEC.md section 4, A5).
+//
+// The two survivors are both called from -clean-db, which runs against the corpus
+// with no Service, no config and no gate, so it cannot use safety.CheckLearn. M6
+// replaces that pass entirely.
 
+// isSpammyContent is used by the -clean-db pass, and by the trim in learnMessage's
+// caller. internal/filter does no logging, so the log line lives here.
 func isSpammyContent(s string) bool {
 	spam, reason := filter.Spam(s)
 	if spam {
@@ -22,14 +31,8 @@ func isSpammyContent(s string) bool {
 	return spam
 }
 
-func filterIllegalContent(content string) bool {
-	blocked, category := filter.Illegal(content)
-	if blocked {
-		log.Printf("[FILTER] Message BLOCKED due to sensitive content category: %s", category)
-	}
-	return blocked
-}
-
-func filterSlurs(content string) string { return filter.ReplaceSlurs(content) }
-
+// containsSlur is used by the -clean-db pass to decide which existing keys to
+// remove. It matches raw text, which is adequate here and nowhere else: it is
+// cleaning a corpus that was written before the normalizer existed, so the entries
+// it finds are in whatever form they were learned in.
 func containsSlur(content string) bool { return filter.ContainsSlur(content) }

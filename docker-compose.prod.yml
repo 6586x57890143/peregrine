@@ -22,10 +22,22 @@ services:
       # that losing or accidentally removing that volume does not take the
       # backups with it.
       - ./backups:/backups
-      # The blocklist mount lands with the safety gate in M5, as
-      #   - ./blocklist.txt:/blocklist.txt:ro
-      # Absent until the code reads it, because a bind with a missing source
-      # file makes Docker create a directory at that path instead.
+      # The blocklist, read-only, as data rather than baked into the image so the
+      # operator can edit it mid-incident and restart, with no rebuild and no
+      # public diff. Set PEREGRINE_BLOCKLIST_PATH=/blocklist.txt in .env to use it.
+      #
+      # UNCOMMENT THIS BEFORE RUNNING IN A LIVE CHANNEL. The bot starts without it
+      # and warns, falling back to the built-in baseline in internal/filter, but
+      # the operator list is where the threat and illegal-content patterns live and
+      # it is the only part of the ruleset that is editable without a deploy.
+      #
+      # Left commented rather than enabled because a bind mount whose SOURCE does
+      # not exist makes Docker silently create a DIRECTORY at that path. The loader
+      # then fails to read a directory as a file, which looks like a parser bug
+      # rather than a missing file. Create /home/deploy/peregrine/blocklist.txt on
+      # the host first, mode 0600.
+      #
+      # - ./blocklist.txt:/blocklist.txt:ro
     restart: unless-stopped
     # bbolt mmaps the whole corpus. Mapped clean pages are reclaimable, so a
     # 1 GB corpus does not need 1 GB of resident memory, but a write

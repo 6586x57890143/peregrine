@@ -26,6 +26,7 @@ import (
 	"github.com/6586x57890143/peregrine/internal/config"
 	"github.com/6586x57890143/peregrine/internal/core"
 	"github.com/6586x57890143/peregrine/internal/legacy"
+	"github.com/6586x57890143/peregrine/internal/safety"
 )
 
 func main() {
@@ -139,6 +140,17 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 		return err
 	}
 
+	// The safety gate, built before the session so a bad ruleset stops the process
+	// before it can connect to anything.
+	gate, err := buildGate(cfg, log)
+	if err != nil {
+		return err
+	}
+	if cfg.PauseAllWrites {
+		log.Warn("PEREGRINE_PAUSE_ALL_WRITES is set: every outbound message is refused process-wide. " +
+			"Reading and learning continue.")
+	}
+
 	session, err := core.NewSession(cfg.Token)
 	if err != nil {
 		return err
@@ -151,6 +163,7 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 		Logger:     log,
 		Store:      store,
 		Dispatcher: dispatcher,
+		Gate:       gate,
 	}, log)
 	registry.Register(legacy.New())
 
@@ -219,6 +232,58 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 // being killed rather than by us, which is the one outcome worth engineering
 // against: bbolt survives it, but the final leaderboard write does not.
 const shutdownBudget = 8 * time.Second
+
+// buildGate loads the blocklist and constructs the safety gate.
+//
+// A configured path that fails to load is FATAL, and that is the whole design.
+// Continuing with an empty ruleset would mean running with fewer rules than the
+// operator believes, and an incomplete blocklist is indistinguishable from a
+// working one right up until the bot posts something that has to be answered for.
+// So a missing file, an unreadable file, a malformed line, an uncompilable pattern
+// and an empty file all stop the process here.
+//
+// An UNSET path is allowed, and that is a deliberate asymmetry rather than a hole.
+// A developer running against a scratch corpus should not have to invent a slur
+// list before the bot will start, and the built-in baseline in internal/filter
+// still applies either way. It is loud about it: running with no operator list in a
+// hostile channel is a choice, and this makes it a visible one.
+func buildGate(cfg *config.Config, log *slog.Logger) (*safety.Gate, error) {
+	if cfg.BlocklistPath == "" {
+		log.Warn("PEREGRINE_BLOCKLIST_PATH is not set: running with the built-in baseline only. " +
+			"The operator blocklist is where threat and illegal-content patterns live, and it is " +
+			"the only part of the ruleset that can be edited without a deploy. Do not run in a " +
+			"hostile channel like this.")
+		return safety.NewGate(nil, log, cfg.PauseAllWrites), nil
+	}
+
+	blocklist, err := safety.LoadBlocklist(cfg.BlocklistPath)
+	if err != nil {
+		// One record per problem, same reason as the configuration errors above:
+		// slog quotes a multi-line value, and an operator fixing a list mid-incident
+		// should see every bad line at once.
+		problems := unwrapJoined(err)
+		for _, p := range problems {
+			log.Error("blocklist", "err", p)
+		}
+		return nil, fmt.Errorf("blocklist at %s is unusable (%d problem(s) reported above): refusing to "+
+			"start with an incomplete ruleset, because that is indistinguishable from a working one "+
+			"until it is too late", cfg.BlocklistPath, len(problems))
+	}
+
+	counts := blocklist.CountByCategory()
+	log.Info("blocklist loaded",
+		"path", cfg.BlocklistPath,
+		"rules", blocklist.Len(),
+		"slur", counts[safety.CategorySlur],
+		"illegal", counts[safety.CategoryIllegal],
+		"spam", counts[safety.CategorySpam])
+	if counts[safety.CategoryIllegal] == 0 {
+		log.Warn("the blocklist has no illegal-category rules, so nothing pages the operator. " +
+			"That category is for content where the exposure is legal rather than reputational.")
+	}
+
+	return safety.NewGate(blocklist, log, cfg.PauseAllWrites), nil
+}
 
 // unwrapJoined flattens an errors.Join into its parts so each can be logged
 // separately. Returns a one-element slice for anything else, so the caller never
