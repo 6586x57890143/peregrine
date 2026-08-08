@@ -161,17 +161,32 @@ jobs:
       # The check lives in a step rather than the job's `if:` because the
       # secrets context is not available in a job-level conditional; only
       # github, needs, vars and inputs are.
+      #
+      # DEPLOY_ENABLED is a separate, deliberate hold rather than part of the
+      # same check. The deploy runs `docker compose up -d`, so without it every
+      # merge to main starts the bot, which silently reverses the decision to
+      # keep an unmoderated bot out of a live channel until the safety gate in
+      # M5 exists (SPEC.md section 4, finding A1). A `docker compose stop` done
+      # by hand does not survive the next merge; a variable does.
+      #
+      # It defaults to holding rather than deploying, because an unset variable
+      # should not be what puts a bot with no output filter into a real server.
+      # Set the repository variable DEPLOY_ENABLED to "true" when M5 lands.
       - name: Check VPS is configured
         id: vps
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          DEPLOY_ENABLED: ${{ vars.DEPLOY_ENABLED }}
         run: |
-          if [ -n "$VPS_HOST" ] && [ -n "$VPS_SSH_KEY" ]; then
-            echo "configured=true" >> "$GITHUB_OUTPUT"
-          else
+          if [ -z "$VPS_HOST" ] || [ -z "$VPS_SSH_KEY" ]; then
             echo "configured=false" >> "$GITHUB_OUTPUT"
             echo "::notice::Skipping deploy: VPS_HOST and/or VPS_SSH_KEY are not set in this repository's secrets. The image was still built and pushed to GHCR."
+          elif [ "$DEPLOY_ENABLED" != "true" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping deploy: repository variable DEPLOY_ENABLED is not \"true\". This is the deliberate hold described in SPEC.md until the M5 safety gate lands. The image was still built and pushed to GHCR."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Copy prod compose file to VPS
