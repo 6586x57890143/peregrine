@@ -28,7 +28,7 @@ import (
 	"fmt"
 	"log"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -38,6 +38,7 @@ import (
 
 	"github.com/6586x57890143/peregrine/clustering"
 	"github.com/6586x57890143/peregrine/internal/config"
+	"github.com/6586x57890143/peregrine/internal/core"
 	"github.com/6586x57890143/peregrine/voicenotes"
 	"github.com/6586x57890143/peregrine/wordgames"
 	"github.com/beevik/ntp"
@@ -155,11 +156,29 @@ func addToVocab(s string) int {
 }
 
 // ----- GLOBALS -----
+//
+// All of these are assigned once, by Service.Init, and read everywhere. They are
+// the shape the pre-restructure code had and they go away with the subsystems
+// that use them.
+//
+// Two are gone as of M3 and are worth naming so they are not reintroduced.
+//
+// stopSignal was a package-level channel closed on shutdown, which a dozen
+// functions selected on. Cancellation now arrives as a context.Context parameter,
+// so there is one mechanism rather than two and a test can stop a loop without
+// touching package state.
+//
+// wg was a package-level WaitGroup that startup Added to and shutdown Waited on,
+// and that the per-message handler ALSO Added to. An Add racing a Wait at zero
+// panics, so a message arriving during shutdown could take the process down on
+// its way out (SPEC.md section 8, finding 4). Background loops now use the
+// Service's own WaitGroup, which only RunLoop touches and only during Start, and
+// per-message work goes through core.Dispatcher, whose Adds all happen before any
+// event can arrive.
 var db *bbolt.DB
-var BotToken string
+var dg *discordgo.Session
+var dispatcher *core.Dispatcher
 var botID string
-var stopSignal = make(chan struct{})
-var wg sync.WaitGroup // Declare a global WaitGroup
 
 var transcriptionQueue chan TranscriptionJob // A queue for voice transcription jobs
 
@@ -241,51 +260,64 @@ var stopWords = map[string]struct{}{
 }
 
 // ----- ENTRYPOINT -----
-var randgen *rand.Rand // Declare a global random number generator
+// There is deliberately no package-level *rand.Rand any more.
+//
+// There used to be one, seeded once in main and then called from every
+// per-message goroutine, the aggro ticker, the autonomous poster and the image
+// reposter. A *rand.Rand is not safe for concurrent use, so that was a live data
+// race on the bot's hottest path (SPEC.md section 8, finding 3): its internal
+// state could be read and written simultaneously, which corrupts the generator
+// and, under the race detector CI runs, fails the build.
+//
+// math/rand/v2's top-level functions are goroutine-safe and auto-seeded, so the
+// fix is to have no shared generator at all rather than to wrap one in a mutex.
+// Auto-seeding also removes the time.Now().UnixNano() seed, which was the
+// conventional but wrong way to get randomness that differs per process.
 
 // lastWordGameTime tracks the last time a word game was posted in interval mode.
 var lastWordGameTime time.Time
 
-// Run is what used to be main(). It blocks until ctx is cancelled, then shuts
-// down and returns.
+// Service is everything peregrine does, as one core.Service.
 //
-// It returns an error rather than calling log.Fatal so that the deferred
-// db.Close below actually runs on a startup failure. Under log.Fatal it did not:
-// os.Exit skips defers, so failing between bbolt.Open and dg.Open left the
-// exclusive flock on markov.db held by a dying process, and the next start would
-// then block for the full five-second Open timeout for no visible reason.
+// One service, deliberately. The registry is load-bearing from the first commit
+// rather than a seam waiting for a user, and each later milestone lifts one
+// subsystem out of here into its own service registered alongside this one, so
+// this service shrinks the same way the package does.
 //
-// M3 replaces the goroutine soup below with core.Registry and RunLoop. Run
-// deliberately takes no logger: every log call in this package is the stdlib log
-// package, and cmd/bot routes those through the slog handler with
-// slog.SetDefault, so the output is structured without 200 call-site edits.
-func Run(ctx context.Context, c *config.Config) error {
-	cfg = c
+// It holds almost no state of its own because the code it wraps still uses
+// package-level variables (db, dg, cfg, leaderboard, and the rest). Those move
+// onto real types as their subsystems move out. What the type does own is the
+// lifecycle: what starts, in what order, and what has to finish before the corpus
+// closes.
+type Service struct {
+	deps core.Deps
 
-	randgen = rand.New(rand.NewSource(time.Now().UnixNano())) // Initialize the global random number generator
-	lastWordGameTime = time.Now()                             // Initialize with current time on startup
+	// loops tracks the background tickers so Shutdown can wait for them. Only
+	// RunLoop ever Adds to it, and only during Start, which is the invariant that
+	// makes the finding-4 panic impossible here as well as in the Dispatcher.
+	loops       sync.WaitGroup
+	cancelLoops context.CancelFunc
+}
 
-	// The token is checked here rather than in config.Load, so that maintenance
-	// modes which never touch Discord do not need a live credential to run.
-	if err := cfg.RequireToken(); err != nil {
-		return err
-	}
-	BotToken = cfg.Token
+// New returns the legacy service. It does no work: everything that can fail
+// happens in Init, where a failure aborts startup with an explanation.
+func New() *Service { return &Service{} }
 
-	var err error
-	db, err = bbolt.Open(cfg.DBPath, 0600, &bbolt.Options{Timeout: 5 * time.Second})
-	if err != nil {
-		return fmt.Errorf("open corpus at %s: %w", cfg.DBPath, err)
-	}
-	// M3 replaces this with an explicit, ordered close that runs after every
-	// user of the store has stopped. Today a message still in flight during
-	// shutdown can reach a closed database, because this defer races the
-	// per-message goroutines.
-	defer func() { _ = db.Close() }()
-
-	// Ensure buckets exist
-	if err := db.Update(func(tx *bbolt.Tx) error {
-		for _, b := range []string{MarkovBucket, TopicBucket, HistoryBucket, NameBucket, NameTopicBucket, TopicWordBucket, TopicClusterBucket, ImageCacheBucket, ConfigBucket, ConceptClusterBucket, StatsBucket, LeaderboardBucket} {
+// EnsureBuckets creates the buckets this package expects, if they do not already
+// exist.
+//
+// Exported and called from cmd/bot rather than from Init because both the bot and
+// the -clean-db maintenance mode need the corpus to be well formed, and only one
+// of them runs a Service. M6 moves this inside internal/storage.Open, where it
+// belongs, along with the schema_version key that makes "these buckets exist" and
+// "these buckets are the layout this binary understands" different questions.
+func EnsureBuckets(store *bbolt.DB) error {
+	if err := store.Update(func(tx *bbolt.Tx) error {
+		for _, b := range []string{
+			MarkovBucket, TopicBucket, HistoryBucket, NameBucket, NameTopicBucket,
+			TopicWordBucket, TopicClusterBucket, ImageCacheBucket, ConfigBucket,
+			ConceptClusterBucket, StatsBucket, LeaderboardBucket,
+		} {
 			if _, err := tx.CreateBucketIfNotExists([]byte(b)); err != nil {
 				return err
 			}
@@ -294,12 +326,21 @@ func Run(ctx context.Context, c *config.Config) error {
 	}); err != nil {
 		return fmt.Errorf("create buckets: %w", err)
 	}
+	return nil
+}
 
-	dg, err := discordgo.New("Bot " + BotToken)
-	if err != nil {
-		return fmt.Errorf("create discord session: %w", err)
-	}
-	dg.Identify.Intents = discordgo.IntentsGuildMessages | discordgo.IntentsMessageContent
+func (s *Service) Name() string { return "legacy" }
+
+// Init loads persistent state and registers the gateway handler. No gateway or
+// REST calls belong here: the session is not connected yet.
+func (s *Service) Init(deps core.Deps) error {
+	s.deps = deps
+	cfg = deps.Config
+	db = deps.Store
+	dispatcher = deps.Dispatcher
+	dg = deps.Session
+
+	lastWordGameTime = time.Now() // Initialize with current time on startup
 
 	// Load the word game dictionary. Deliberately not fatal: word games are one
 	// optional feature, and taking the whole bot down because a 64 KB word list
@@ -362,6 +403,26 @@ func Run(ctx context.Context, c *config.Config) error {
 		log.Printf("[INFO] Loaded %d image URLs from DB.", len(loadedURLs))
 	}
 
+	// The gateway handler is registered here rather than in Start, because
+	// discordgo begins dispatching inside Open and Open happens between Init and
+	// Start. Registering in Start would drop every message that arrived in that
+	// window.
+	dg.AddHandler(messageCreate)
+
+	// Buffered so a burst of voice notes does not block the handler that queues
+	// them. M12 gives this a real bound and a context.
+	transcriptionQueue = make(chan TranscriptionJob, 100)
+
+	return nil
+}
+
+// Start launches the background work. The gateway is connected and READY by the
+// time this runs, which is why the bot's own identity is resolved here rather
+// than in Init.
+func (s *Service) Start(ctx context.Context) error {
+	loopCtx, cancel := context.WithCancel(ctx)
+	s.cancelLoops = cancel
+
 	user, err := dg.User("@me")
 	if err != nil {
 		return fmt.Errorf("get bot user: %w", err)
@@ -369,222 +430,176 @@ func Run(ctx context.Context, c *config.Config) error {
 	botID = user.ID
 	log.Printf("[INFO] Bot ID: %s", botID)
 
-	dg.AddHandler(messageCreate)
-	if err := dg.Open(); err != nil {
-		// The overwhelmingly common cause is the Message Content privileged
-		// intent not being ticked in the Developer Portal, which Discord reports
-		// as "disallowed intents". Worth knowing because under restart:
-		// unless-stopped it presents as a silent crash loop.
-		return fmt.Errorf("open discord session (is the Message Content intent enabled?): %w", err)
-	}
-	log.Println("[INFO] Bot running")
-
-	// Initialize the transcription queue and start the worker
-	transcriptionQueue = make(chan TranscriptionJob, 100) // Buffer up to 100 jobs
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		transcriptionWorker(dg)
-	}()
-
-	// Initial incremental ingestion
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		log.Println("[AUTO] Starting initial autonomous ingestion...")
-		ingestRecentMessagesIncremental(dg, stopSignal)
-		log.Println("[AUTO] Initial autonomous ingestion finished.")
-	}()
-
-	// Immediate status & health monitor
-	printLibraryStatus()
-	wg.Add(1)
-	go func() {
-		defer wg.Done() // Signal that monitorPerformance is complete
-		monitorPerformance(dg)
-	}()
-
-	// Periodic library status
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		ticker := time.NewTicker(cfg.StatusTick)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				printLibraryStatus()
-			case <-stopSignal:
-				return
-			}
-		}
-	}()
-
-	// Autonomous ingestion loop
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		ticker := time.NewTicker(cfg.IngestTick)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
+	// Every one of these was a hand-rolled goroutine building its own ticker and
+	// selecting on a shared stop channel: nine copies of the same three lines,
+	// each subtly different, and any panic inside one of them killed the process.
+	// core.RunLoop owns the shape now, and each iteration is panic-isolated so an
+	// optional behavior failing disables that behavior and nothing else.
+	loops := []core.Loop{
+		{
+			Name:      "status",
+			Every:     cfg.StatusTick,
+			Immediate: true, // wanted at startup: it is the first sign of life
+			Fn:        func(context.Context) { printLibraryStatus() },
+		},
+		{
+			Name:      "ingest",
+			Every:     cfg.IngestTick,
+			Immediate: true, // the original code ran one backfill before the loop
+			Fn: func(ctx context.Context) {
 				log.Println("[AUTO] Starting autonomous ingestion...")
-				ingestRecentMessagesIncremental(dg, stopSignal)
+				ingestRecentMessagesIncremental(ctx, dg)
 				log.Println("[AUTO] Autonomous ingestion finished.")
-			case <-stopSignal:
-				return
-			}
-		}
-	}()
-
-	// Autonomous posting loop. Its own ticker now: this shared the ingestion
-	// constant, so changing how often the bot backfilled history also changed how
-	// often it spoke unprompted.
+			},
+		},
+		{
+			Name:  "aggro",
+			Every: cfg.AggroTick,
+			Fn:    func(ctx context.Context) { maybeTriggerAggro(ctx, dg) },
+		},
+		{
+			Name:  "leaderboard-reset",
+			Every: cfg.LeaderboardTick,
+			Fn:    func(context.Context) { maybeResetLeaderboard() },
+		},
+	}
 	if cfg.EnableAutonomousPost {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			ticker := time.NewTicker(cfg.AutonomousPostTick)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					autonomousPost(dg)
-				case <-stopSignal:
-					return
-				}
-			}
-		}()
+		loops = append(loops, core.Loop{
+			Name:  "autonomous-post",
+			Every: cfg.AutonomousPostTick,
+			Fn:    func(ctx context.Context) { autonomousPost(ctx, dg) },
+		})
 	}
-
-	// Bird Aggro trigger
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		ticker := time.NewTicker(cfg.AggroTick)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				birdAggroMutex.Lock()
-				// Only trigger if there's no current aggro
-				if birdAggroTargetID == "" || time.Now().After(birdAggroEndTime) {
-					if randgen.Float64() < cfg.AggroChance {
-						target := findRandomActiveUser(dg)
-						if target != "" {
-							birdAggroTargetID = target
-							birdAggroEndTime = time.Now().Add(cfg.AggroDuration)
-							log.Printf("[AGGRO] Bird aggro triggered on user %s for %v.", target, cfg.AggroDuration)
-							// Persist the new aggro state
-							_ = db.Update(func(tx *bbolt.Tx) error {
-								return saveAggroState(tx, AggroState{TargetID: birdAggroTargetID, EndTime: birdAggroEndTime})
-							})
-						}
-					}
-				}
-				birdAggroMutex.Unlock()
-			case <-stopSignal:
-				return
-			}
-		}
-	}()
-
-	// Weekly leaderboard reset
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		ticker := time.NewTicker(cfg.LeaderboardTick)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				reset, err := isTimeToResetLeaderboard()
-				if err != nil {
-					log.Printf("[LEADERBOARD] Error checking reset time: %v", err)
-					continue
-				}
-				if reset {
-					leaderboard.Mutex.Lock()
-					now := time.Now().UTC()
-					// Final check to ensure we only reset once per week
-					if now.Sub(leaderboard.LastReset) > 24*time.Hour {
-						log.Println("[LEADERBOARD] It's a new week! Resetting the leaderboard.")
-						leaderboard.WeekStartDate = now
-						leaderboard.LastReset = now
-						leaderboard.Scores = make(map[string]wordgames.LeaderboardEntry)
-						_ = db.Update(func(tx *bbolt.Tx) error {
-							return saveLeaderboard(tx, leaderboard)
-						})
-					}
-					leaderboard.Mutex.Unlock()
-				}
-			case <-stopSignal:
-				return
-			}
-		}
-	}()
-
-	// Daily clustering pass. Now skippable: it walks the whole corpus inside a
-	// write transaction, and bbolt has one writer process-wide, so on a large
-	// corpus this is the pass most likely to be the thing an operator wants to
-	// turn off while diagnosing stalled ingestion.
 	if cfg.EnableClustering {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			// Initial clustering on startup
-			performClustering()
-
-			ticker := time.NewTicker(cfg.ClusteringTick)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					performClustering()
-				case <-stopSignal:
-					return
-				}
-			}
-		}()
+		// Skippable because it walks the whole corpus inside a write transaction
+		// and bbolt has one writer process-wide, making it the pass most worth
+		// turning off while diagnosing stalled ingestion.
+		loops = append(loops, core.Loop{
+			Name:      "clustering",
+			Every:     cfg.ClusteringTick,
+			Immediate: true,
+			Fn:        func(context.Context) { performClustering() },
+		})
+	}
+	for _, l := range loops {
+		core.RunLoop(loopCtx, &s.loops, s.deps.Logger, l)
 	}
 
-	// Wait for shutdown. The signal handling moved to cmd/bot, which owns the
-	// signal.NotifyContext, so this is now the same wait whether the trigger was
-	// SIGTERM from Docker, Ctrl-C, or a caller cancelling ctx in a test.
-	<-ctx.Done()
+	// Not a RunLoop: this one blocks on a queue rather than a ticker. It is
+	// registered with the same WaitGroup so Shutdown waits for an in-flight
+	// transcription the same way it waits for a tick.
+	s.loops.Add(1)
+	go func() {
+		defer s.loops.Done()
+		transcriptionWorker(loopCtx, dg)
+	}()
 
-	log.Println("[INFO] Caught shutdown signal, shutting down gracefully...")
+	// Kept separate from the status loop because it reports on a different cadence
+	// and M13 turns it into a real health service.
+	s.loops.Add(1)
+	go func() {
+		defer s.loops.Done()
+		monitorPerformance(loopCtx, dg)
+	}()
 
-	// stopSignal is still the internal broadcast, because roughly a dozen
-	// functions take it as a <-chan struct{} parameter and converting them all
-	// to ctx is M3's job, not a rename's. Closing it here is what translates the
-	// one cancellation cmd/bot knows about into the one every goroutine below is
-	// selecting on.
-	close(stopSignal)
+	log.Println("[INFO] Bot running")
+	return nil
+}
 
-	// Wait for all goroutines to finish their work. Still unbounded and still
-	// racy: messageCreate calls wg.Add on this same WaitGroup, so an Add that
-	// lands after the counter hits zero panics, and in-flight handlers keep using
-	// db and dg after this returns (SPEC.md section 8, finding 4). M3 replaces it
-	// with a bounded dispatcher and a 10-second drain.
-	wg.Wait()
-	log.Println("[INFO] All goroutines finished.")
-
-	// Close the Discord session
-	if dg != nil {
-		_ = dg.Close()
+// Shutdown stops the loops and waits for them, then saves the leaderboard.
+//
+// The wait is what the old code got wrong. It closed a stop channel and called
+// wg.Wait on a WaitGroup the message handler was also Adding to, so shutdown
+// could panic, and when it did not, wg.Wait returning still did not mean handlers
+// were done: they kept using the corpus and the session while shutdown moved on
+// to closing both. Here the only Adds happened during Start, the wait is bounded
+// by ctx, and cmd/bot closes the store strictly after this returns.
+func (s *Service) Shutdown(ctx context.Context) error {
+	if s.cancelLoops != nil {
+		s.cancelLoops()
 	}
 
-	// Save the leaderboard before closing the DB
+	done := make(chan struct{})
+	go func() {
+		s.loops.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		log.Println("[INFO] Background loops finished.")
+	case <-ctx.Done():
+		// Reported rather than waited out. The container has a fixed budget
+		// before SIGKILL, and losing an orderly close of the corpus to a stuck
+		// loop is the worse trade.
+		log.Println("[WARN] Shutdown deadline reached with background loops still running.")
+	}
+
+	// Last write before cmd/bot closes the store.
+	if leaderboard != nil {
+		if err := db.Update(func(tx *bbolt.Tx) error {
+			return saveLeaderboard(tx, leaderboard)
+		}); err != nil {
+			return fmt.Errorf("save leaderboard: %w", err)
+		}
+	}
+	return nil
+}
+
+// maybeTriggerAggro is the body of what was an inline ticker goroutine. Extracted
+// unchanged so the loop table above reads as a list of behaviors.
+func maybeTriggerAggro(ctx context.Context, dg *discordgo.Session) {
+	birdAggroMutex.Lock()
+	defer birdAggroMutex.Unlock()
+
+	// Only trigger if there's no current aggro
+	if birdAggroTargetID != "" && !time.Now().After(birdAggroEndTime) {
+		return
+	}
+	if rand.Float64() >= cfg.AggroChance {
+		return
+	}
+	target := findRandomActiveUser(ctx, dg)
+	if target == "" {
+		return
+	}
+	birdAggroTargetID = target
+	birdAggroEndTime = time.Now().Add(cfg.AggroDuration)
+	log.Printf("[AGGRO] Bird aggro triggered on user %s for %v.", target, cfg.AggroDuration)
+	// Persist the new aggro state
+	if err := db.Update(func(tx *bbolt.Tx) error {
+		return saveAggroState(tx, AggroState{TargetID: birdAggroTargetID, EndTime: birdAggroEndTime})
+	}); err != nil {
+		log.Printf("[ERR] Failed to persist aggro state: %v", err)
+	}
+}
+
+// maybeResetLeaderboard is likewise the body of a former inline ticker.
+func maybeResetLeaderboard() {
+	reset, err := isTimeToResetLeaderboard()
+	if err != nil {
+		log.Printf("[LEADERBOARD] Error checking reset time: %v", err)
+		return
+	}
+	if !reset {
+		return
+	}
+	leaderboard.Mutex.Lock()
+	defer leaderboard.Mutex.Unlock()
+
+	now := time.Now().UTC()
+	// Final check to ensure we only reset once per week
+	if now.Sub(leaderboard.LastReset) <= 24*time.Hour {
+		return
+	}
+	log.Println("[LEADERBOARD] It's a new week! Resetting the leaderboard.")
+	leaderboard.WeekStartDate = now
+	leaderboard.LastReset = now
+	leaderboard.Scores = make(map[string]wordgames.LeaderboardEntry)
 	if err := db.Update(func(tx *bbolt.Tx) error {
 		return saveLeaderboard(tx, leaderboard)
 	}); err != nil {
-		log.Printf("[ERR] Failed to save leaderboard: %v", err)
+		log.Printf("[ERR] Failed to persist leaderboard reset: %v", err)
 	}
-
-	log.Println("[INFO] Shutdown complete.")
-	return nil
 }
 
 // learnOrUpdateName finds the canonical name for a user and updates aliases.
@@ -659,7 +674,7 @@ func isRecognizedName(token string) (canonicalName string, exists bool) {
 }
 
 // getActiveChannels returns all text channels in a guild that have recent activity.
-func getActiveChannels(s *discordgo.Session, guildID string, stopCh <-chan struct{}, cutoff time.Time) []ActiveChannelInfo {
+func getActiveChannels(ctx context.Context, s *discordgo.Session, guildID string, cutoff time.Time) []ActiveChannelInfo {
 	channels, err := s.GuildChannels(guildID)
 	if err != nil {
 		if restErr, ok := err.(*discordgo.RESTError); ok && restErr.Response != nil && restErr.Response.StatusCode == 403 {
@@ -676,7 +691,7 @@ func getActiveChannels(s *discordgo.Session, guildID string, stopCh <-chan struc
 
 	for _, c := range channels {
 		select {
-		case <-stopCh:
+		case <-ctx.Done():
 			log.Printf("[INFO] Channel scanning stopped by shutdown signal.")
 			return nil // Return early if shutdown signal received
 		default:
@@ -1360,7 +1375,7 @@ func extractNamesFromMessage(s *discordgo.Session, m *discordgo.MessageCreate, g
 }
 
 // ingestRecentMessagesIncremental walks guilds and ingests recent messages in parallel.
-func ingestRecentMessagesIncremental(s *discordgo.Session, stopCh <-chan struct{}) {
+func ingestRecentMessagesIncremental(ctx context.Context, s *discordgo.Session) {
 	start := time.Now().UTC() // Use UTC for consistency
 	// ALWAYS look back the full PEREGRINE_INGEST_LOOKBACK window.
 	ingestionCutoff := time.Now().UTC().Add(-cfg.IngestLookback)
@@ -1386,7 +1401,7 @@ func ingestRecentMessagesIncremental(s *discordgo.Session, stopCh <-chan struct{
 		go func(guild discordgo.UserGuild) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			processGuildIncremental(s, guild, stopCh, ingestionCutoff)
+			processGuildIncremental(ctx, s, guild, ingestionCutoff)
 		}(g)
 	}
 
@@ -1395,14 +1410,14 @@ func ingestRecentMessagesIncremental(s *discordgo.Session, stopCh <-chan struct{
 }
 
 // processGuildIncremental processes active channels for a guild.
-func processGuildIncremental(s *discordgo.Session, g discordgo.UserGuild, stopCh <-chan struct{}, ingestionCutoff time.Time) {
+func processGuildIncremental(ctx context.Context, s *discordgo.Session, g discordgo.UserGuild, ingestionCutoff time.Time) {
 	var guildWg sync.WaitGroup // WaitGroup for channels within this guild
 
 	// Use a wider window to find channels that are generally active.
 	activeChannelCutoff := time.Now().UTC().Add(-cfg.IngestLookback)
-	for _, chInfo := range getActiveChannels(s, g.ID, stopCh, activeChannelCutoff) {
+	for _, chInfo := range getActiveChannels(ctx, s, g.ID, activeChannelCutoff) {
 		select {
-		case <-stopCh:
+		case <-ctx.Done():
 			log.Printf("[INFO] Guild %s ingestion stopped by shutdown signal.", g.Name)
 			guildWg.Wait() // Wait for any already launched channel goroutines
 			return
@@ -1412,14 +1427,14 @@ func processGuildIncremental(s *discordgo.Session, g discordgo.UserGuild, stopCh
 		go func(ch *discordgo.Channel) {
 			defer guildWg.Done()
 			// Pass the more precise ingestionCutoff for fetching messages.
-			processChannelIncremental(s, ch, stopCh, ingestionCutoff)
+			processChannelIncremental(ctx, s, ch, ingestionCutoff)
 		}(chInfo.Channel)
 	}
 	guildWg.Wait() // Wait for all channels in this guild to finish
 }
 
 // processChannelIncremental fetches messages incrementally and learns them.
-func processChannelIncremental(s *discordgo.Session, ch *discordgo.Channel, stopCh <-chan struct{}, cutoff time.Time) {
+func processChannelIncremental(ctx context.Context, s *discordgo.Session, ch *discordgo.Channel, cutoff time.Time) {
 	start := time.Now()
 	total, errors, skipped := 0, 0, 0
 	var allMessages []*discordgo.Message
@@ -1428,7 +1443,7 @@ func processChannelIncremental(s *discordgo.Session, ch *discordgo.Channel, stop
 	// Loop to fetch all messages *before* the last oldest one we've seen.
 	for {
 		select {
-		case <-stopCh:
+		case <-ctx.Done():
 			log.Printf("[INFO] Channel #%s processing stopped by shutdown signal.", ch.Name)
 			return
 		default:
@@ -1674,27 +1689,27 @@ func applyEdgyStyle(s string, isAboutName bool) string {
 	lengthFactor := math.Min(1.0, float64(len(fields))/20.0) // Max intensity at ~20 words
 	chance *= (0.7 + 0.6*lengthFactor)                       // Scale chance between 70% and 130% of base
 
-	if randgen.Float64() < chance {
-		styleType := randgen.Intn(4) // 0: opener, 1: closer, 2: interjection, 3: meta-comment
+	if rand.Float64() < chance {
+		styleType := rand.IntN(4) // 0: opener, 1: closer, 2: interjection, 3: meta-comment
 
 		switch styleType {
 		case 0:
-			s = openers[randgen.Intn(len(openers))] + " " + s
+			s = openers[rand.IntN(len(openers))] + " " + s
 		case 1:
-			s += " " + closers[randgen.Intn(len(closers))]
+			s += " " + closers[rand.IntN(len(closers))]
 		case 2:
 			// Insert a mid-sentence interjection
 			if len(fields) > 3 {
-				insertPos := 1 + randgen.Intn(len(fields)-2) // Avoid very beginning or end
-				interjection := interjections[randgen.Intn(len(interjections))]
+				insertPos := 1 + rand.IntN(len(fields)-2) // Avoid very beginning or end
+				interjection := interjections[rand.IntN(len(interjections))]
 				fields = append(fields[:insertPos], append([]string{interjection}, fields[insertPos:]...)...)
 				s = strings.Join(fields, " ")
 			}
 		case 3:
 			// Insert a meta-comment
 			if len(fields) > 2 {
-				insertPos := 1 + randgen.Intn(len(fields)-1) // Avoid very beginning
-				metaComment := metaComments[randgen.Intn(len(metaComments))]
+				insertPos := 1 + rand.IntN(len(fields)-1) // Avoid very beginning
+				metaComment := metaComments[rand.IntN(len(metaComments))]
 				// Append to the previous word to avoid extra spaces
 				fields[insertPos-1] += metaComment
 				s = strings.Join(fields, " ")
@@ -1877,7 +1892,7 @@ func findBestSeed(tx *bbolt.Tx, promptWords, recentWords, recognizedNames []stri
 		total += c.weight
 	}
 	if total > 0 {
-		r_val := randgen.Float64() * total
+		r_val := rand.Float64() * total
 		for _, c := range candidates {
 			r_val -= c.weight
 			if r_val <= 0 {
@@ -2241,7 +2256,7 @@ func pickPromptAwareNextWithSimilarity(
 		}
 
 		// stochastic jitter to reduce deterministic loops
-		score *= 0.9 + 0.2*randgen.Float64() // ±10% variation
+		score *= 0.9 + 0.2*rand.Float64() // ±10% variation
 
 		// Penalize the <end> token heavily if the sentence is short.
 		if lw == "<end>" && curPos < 0.4 { // curPos is an approximation of sentence progress (0.0 to 1.0)
@@ -2284,7 +2299,7 @@ func pickPromptAwareNextWithSimilarity(
 	for i := range cands {
 		w := math.Pow(cands[i].weight, 1.0/(Creativity+0.01))
 		if i == 0 {
-			w *= 1.0 + 0.05*randgen.Float64()
+			w *= 1.0 + 0.05*rand.Float64()
 		}
 		weights[i] = w
 		total += w
@@ -2294,7 +2309,7 @@ func pickPromptAwareNextWithSimilarity(
 		return cands[len(cands)-1].word
 	}
 
-	r_val := randgen.Float64() * total
+	r_val := rand.Float64() * total
 	for i := range cands {
 		r_val -= weights[i]
 		if r_val <= 0 {
@@ -2431,8 +2446,8 @@ func generateSentenceAttempt(tx *bbolt.Tx, promptWords, recentWords []string, or
 	lastWords := append([]string{}, words...)
 
 	// Set generation boundaries
-	minWords := 5 + randgen.Intn(4) // Set a dynamic minimum length (5-8 words)
-	maxWords := 30 + randgen.Intn(15)
+	minWords := 5 + rand.IntN(4) // Set a dynamic minimum length (5-8 words)
+	maxWords := 30 + rand.IntN(15)
 
 	// Generate words iteratively
 	for i := 0; i < maxWords; i++ {
@@ -2548,447 +2563,463 @@ func deleteMessage(s *discordgo.Session, channelID, messageID string) {
 	}
 }
 
+// messageCreate is the gateway handler. It does the cheapest possible rejection
+// and then hands the work to the dispatcher.
+//
+// It used to call wg.Add(1) on the same WaitGroup the shutdown path waited on and
+// then spawn a goroutine per message, which was two bugs and a cost: an Add
+// racing a Wait at zero panics, wg.Wait returning did not mean handlers had
+// finished with the database, and goroutines-per-message is unbounded on a channel
+// that can burst (SPEC.md section 8, finding 4).
+//
+// A dropped message is logged rather than retried. discordgo dispatches every
+// event on its own goroutine, so blocking here to wait for queue space would grow
+// goroutines without bound and turn a slow corpus into unbounded memory use.
+// Best-effort is the honest semantics for chat.
 func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 	if m.Author.Bot {
 		return
 	}
 
-	wg.Add(1) // Add to WaitGroup
-	go func() {
-		defer wg.Done() // Decrement WaitGroup when done
-		start := time.Now()
-		log.Printf("[MSG] from %s: %q", m.Author.Username, m.Content)
+	if !dispatcher.Submit(func(context.Context) { handleMessage(s, m) }) {
+		log.Printf("[QUEUE] dropped message from %s: work queue full (%d dropped so far)",
+			m.Author.Username, dispatcher.Dropped())
+	}
+}
 
-		// CRITICAL: Block spam and illegal content first.
-		if isSpammyContent(m.Content) {
-			log.Printf("[FILTER] Spammy message from %s blocked, no processing will occur.", m.Author.Username)
-			return // Silently drop the message.
+func handleMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
+	start := time.Now()
+	log.Printf("[MSG] from %s: %q", m.Author.Username, m.Content)
+
+	// CRITICAL: Block spam and illegal content first.
+	if isSpammyContent(m.Content) {
+		log.Printf("[FILTER] Spammy message from %s blocked, no processing will occur.", m.Author.Username)
+		return // Silently drop the message.
+	}
+	if filterIllegalContent(m.Content) {
+		return
+	}
+
+	// Apply the slur filter (replacement).
+	m.Content = filterSlurs(m.Content)
+
+	// Add message to conversation memory
+	globalConvMemory.AddMessage(m.Content)
+
+	// --- Word Game Event Logic ---
+	if cfg.EnableWordGames && wordGamesAvailable {
+		wordGameMutex.Lock()
+		if game, gameExists := activeWordGames[m.ChannelID]; gameExists {
+			// A game is active, check for a winning guess
+			if game.CheckGuess(m.Content) {
+				solveTime := time.Since(game.StartTime)
+				winnerUsername := m.Author.Username
+				if m.Member != nil && m.Member.Nick != "" {
+					winnerUsername = m.Member.Nick
+				}
+
+				// Announce winner and set it for delayed deletion
+				winMessage, err := s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("🎉 **%s** guessed the word **%s** in %.2f seconds!", winnerUsername, game.OriginalWord, solveTime.Seconds()))
+				if err == nil {
+					go func(channelID, messageID string) {
+						time.Sleep(30 * time.Second)
+						deleteMessage(s, channelID, messageID)
+					}(m.ChannelID, winMessage.ID)
+				}
+
+				// Update and save leaderboard
+				leaderboard.AddWin(m.Author.ID, winnerUsername)
+				_ = db.Update(func(tx *bbolt.Tx) error {
+					return saveLeaderboard(tx, leaderboard)
+				})
+
+				// Clean up messages
+				_ = s.ChannelMessageDelete(m.ChannelID, game.MessageID) // Delete original puzzle
+				_ = s.ChannelMessageDelete(m.ChannelID, m.ID)           // Delete the winning message
+
+				// End the game
+				delete(activeWordGames, m.ChannelID)
+			}
+		} else {
+			// No game is active, check if we should start one based on activity
+			activityMutex.Lock()
+			now := time.Now()
+			// Prune old timestamps
+			newTimestamps := []time.Time{}
+			for _, ts := range channelActivity[m.ChannelID] {
+				if now.Sub(ts) < 5*time.Minute {
+					newTimestamps = append(newTimestamps, ts)
+				}
+			}
+			newTimestamps = append(newTimestamps, now)
+			channelActivity[m.ChannelID] = newTimestamps
+
+			// Check for trigger condition
+			// Needs at least 5 messages in the last 5 minutes, then a 2.5% chance per message
+			if len(newTimestamps) >= 5 && rand.Float64() < 0.025 {
+				game, err := wordgames.NewScrambleGame()
+				if err != nil {
+					log.Printf("[WORDGAME] Failed to create new game: %v", err)
+				} else {
+					msg, err := s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("✨ **Word Scramble!** ✨\n\nUnscramble this word: **%s**", game.ScrambledWord))
+					if err == nil {
+						game.MessageID = msg.ID
+						activeWordGames[m.ChannelID] = game
+						channelActivity[m.ChannelID] = []time.Time{} // Reset activity after starting
+						log.Printf("[WORDGAME] Started a new game in channel %s.", m.ChannelID)
+						go func(channelID, messageID, originalWord string) {
+							time.Sleep(60 * time.Second)
+							wordGameMutex.Lock()
+							defer wordGameMutex.Unlock()
+							if g, exists := activeWordGames[channelID]; exists && g.MessageID == messageID {
+								timeoutMsg, err := s.ChannelMessageSend(channelID, fmt.Sprintf("Time's up! The word was **%s**.", originalWord))
+								if err == nil {
+									go func(cid, mid string) {
+										time.Sleep(30 * time.Second)
+										deleteMessage(s, cid, mid)
+									}(channelID, timeoutMsg.ID)
+								}
+								deleteMessage(s, channelID, messageID)
+								delete(activeWordGames, channelID)
+								log.Printf("[WORDGAME] Game timed out in channel %s.", channelID)
+							}
+						}(m.ChannelID, msg.ID, game.OriginalWord)
+					}
+				}
+			}
+			activityMutex.Unlock()
 		}
-		if filterIllegalContent(m.Content) {
+		wordGameMutex.Unlock()
+	}
+
+	// --- Leaderboard Command ---
+	if strings.ToLower(m.Content) == "!leaderboard" {
+		var userScores map[string]int
+		err := db.View(func(tx *bbolt.Tx) error {
+			var loadErr error
+			userScores, loadErr = loadAllUserStats(tx)
+			return loadErr
+		})
+
+		if err != nil {
+			log.Printf("[LEADERBOARD] Error loading user stats: %v", err)
+			sendMessage(s, m.ChannelID, "Could not generate chat leaderboard.")
 			return
 		}
 
-		// Apply the slur filter (replacement).
-		m.Content = filterSlurs(m.Content)
-
-		// Add message to conversation memory
-		globalConvMemory.AddMessage(m.Content)
-
-		// --- Word Game Event Logic ---
-		if cfg.EnableWordGames && wordGamesAvailable {
-			wordGameMutex.Lock()
-			if game, gameExists := activeWordGames[m.ChannelID]; gameExists {
-				// A game is active, check for a winning guess
-				if game.CheckGuess(m.Content) {
-					solveTime := time.Since(game.StartTime)
-					winnerUsername := m.Author.Username
-					if m.Member != nil && m.Member.Nick != "" {
-						winnerUsername = m.Member.Nick
-					}
-
-					// Announce winner and set it for delayed deletion
-					winMessage, err := s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("🎉 **%s** guessed the word **%s** in %.2f seconds!", winnerUsername, game.OriginalWord, solveTime.Seconds()))
-					if err == nil {
-						go func(channelID, messageID string) {
-							time.Sleep(30 * time.Second)
-							deleteMessage(s, channelID, messageID)
-						}(m.ChannelID, winMessage.ID)
-					}
-
-					// Update and save leaderboard
-					leaderboard.AddWin(m.Author.ID, winnerUsername)
-					_ = db.Update(func(tx *bbolt.Tx) error {
-						return saveLeaderboard(tx, leaderboard)
-					})
-
-					// Clean up messages
-					_ = s.ChannelMessageDelete(m.ChannelID, game.MessageID) // Delete original puzzle
-					_ = s.ChannelMessageDelete(m.ChannelID, m.ID)           // Delete the winning message
-
-					// End the game
-					delete(activeWordGames, m.ChannelID)
+		nameScores := make(map[string]int)
+		for userID, score := range userScores {
+			// Try to get member to use nickname
+			member, err := s.GuildMember(m.GuildID, userID)
+			var displayName string
+			if err == nil {
+				if member.Nick != "" {
+					displayName = member.Nick
+				} else {
+					displayName = member.User.Username
 				}
 			} else {
-				// No game is active, check if we should start one based on activity
-				activityMutex.Lock()
-				now := time.Now()
-				// Prune old timestamps
-				newTimestamps := []time.Time{}
-				for _, ts := range channelActivity[m.ChannelID] {
-					if now.Sub(ts) < 5*time.Minute {
-						newTimestamps = append(newTimestamps, ts)
-					}
+				// Fallback to fetching user if member not found (e.g., user left server)
+				user, userErr := s.User(userID)
+				if userErr != nil {
+					log.Printf("[LEADERBOARD] Could not find user/member for ID %s: %v", userID, userErr)
+					displayName = userID // fallback to ID
+				} else {
+					displayName = user.Username
 				}
-				newTimestamps = append(newTimestamps, now)
-				channelActivity[m.ChannelID] = newTimestamps
+			}
+			nameScores[displayName] = score
+		}
 
-				// Check for trigger condition
-				// Needs at least 5 messages in the last 5 minutes, then a 2.5% chance per message
-				if len(newTimestamps) >= 5 && randgen.Float64() < 0.025 {
-					game, err := wordgames.NewScrambleGame()
-					if err != nil {
-						log.Printf("[WORDGAME] Failed to create new game: %v", err)
-					} else {
-						msg, err := s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("✨ **Word Scramble!** ✨\n\nUnscramble this word: **%s**", game.ScrambledWord))
-						if err == nil {
-							game.MessageID = msg.ID
-							activeWordGames[m.ChannelID] = game
-							channelActivity[m.ChannelID] = []time.Time{} // Reset activity after starting
-							log.Printf("[WORDGAME] Started a new game in channel %s.", m.ChannelID)
-							go func(channelID, messageID, originalWord string) {
-								time.Sleep(60 * time.Second)
-								wordGameMutex.Lock()
-								defer wordGameMutex.Unlock()
-								if g, exists := activeWordGames[channelID]; exists && g.MessageID == messageID {
-									timeoutMsg, err := s.ChannelMessageSend(channelID, fmt.Sprintf("Time's up! The word was **%s**.", originalWord))
-									if err == nil {
-										go func(cid, mid string) {
-											time.Sleep(30 * time.Second)
-											deleteMessage(s, cid, mid)
-										}(channelID, timeoutMsg.ID)
-									}
-									deleteMessage(s, channelID, messageID)
-									delete(activeWordGames, channelID)
-									log.Printf("[WORDGAME] Game timed out in channel %s.", channelID)
+		chatLeaderboard := wordgames.FormatChatLeaderboard(nameScores)
+		sendMessage(s, m.ChannelID, leaderboard.Format()+"\n\n"+chatLeaderboard)
+	}
+	// --- Word Game Admin Command (for testing) ---
+	if cfg.EnableWordGames && wordGamesAvailable && strings.ToLower(m.Content) == "!wordgame" {
+		// The only authorization check in the codebase, and until M2 it was a
+		// user ID hardcoded in the source. It now fails CLOSED: an unset
+		// PEREGRINE_BOOTSTRAP_ADMIN_USER_ID refuses this command for
+		// everyone, never allows it for everyone. Getting that direction
+		// wrong on an empty string is how a missing variable turns an
+		// operator-only command into a public one.
+		if cfg.AdminUserID != "" && m.Author.ID == cfg.AdminUserID {
+			wordGameMutex.Lock()
+			if _, gameExists := activeWordGames[m.ChannelID]; gameExists {
+				sendMessage(s, m.ChannelID, "A word game is already in progress in this channel!")
+			} else {
+				game, err := wordgames.NewScrambleGame()
+				if err != nil {
+					log.Printf("[WORDGAME] Failed to create new game: %v", err)
+				} else {
+					msg, err := s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("✨ **Word Scramble!** ✨\n\nUnscramble this word: **%s**", game.ScrambledWord))
+					if err == nil {
+						game.MessageID = msg.ID
+						activeWordGames[m.ChannelID] = game
+						log.Printf("[WORDGAME] Started a new game in channel %s.", m.ChannelID)
+						go func(channelID, messageID, originalWord string) {
+							time.Sleep(60 * time.Second)
+							wordGameMutex.Lock()
+							defer wordGameMutex.Unlock()
+							if g, exists := activeWordGames[channelID]; exists && g.MessageID == messageID {
+								timeoutMsg, err := s.ChannelMessageSend(channelID, fmt.Sprintf("Time's up! The word was **%s**.", originalWord))
+								if err == nil {
+									go func(cid, mid string) {
+										time.Sleep(30 * time.Second)
+										deleteMessage(s, cid, mid)
+									}(channelID, timeoutMsg.ID)
 								}
-							}(m.ChannelID, msg.ID, game.OriginalWord)
-						}
+								deleteMessage(s, channelID, messageID)
+								delete(activeWordGames, channelID)
+								log.Printf("[WORDGAME] Game timed out in channel %s.", channelID)
+							}
+						}(m.ChannelID, msg.ID, game.OriginalWord)
 					}
 				}
-				activityMutex.Unlock()
 			}
 			wordGameMutex.Unlock()
 		}
+	}
 
-		// --- Leaderboard Command ---
-		if strings.ToLower(m.Content) == "!leaderboard" {
-			var userScores map[string]int
-			err := db.View(func(tx *bbolt.Tx) error {
-				var loadErr error
-				userScores, loadErr = loadAllUserStats(tx)
-				return loadErr
-			})
+	// --- Bird Aggro Check ---
+	birdAggroMutex.Lock()
+	isTarget := m.Author.ID == birdAggroTargetID
+	isExpired := time.Now().After(birdAggroEndTime)
+	birdAggroMutex.Unlock() // Unlock immediately after reading shared state.
 
-			if err != nil {
-				log.Printf("[LEADERBOARD] Error loading user stats: %v", err)
-				sendMessage(s, m.ChannelID, "Could not generate chat leaderboard.")
-				return
-			}
-
-			nameScores := make(map[string]int)
-			for userID, score := range userScores {
-				// Try to get member to use nickname
-				member, err := s.GuildMember(m.GuildID, userID)
-				var displayName string
-				if err == nil {
-					if member.Nick != "" {
-						displayName = member.Nick
-					} else {
-						displayName = member.User.Username
-					}
-				} else {
-					// Fallback to fetching user if member not found (e.g., user left server)
-					user, userErr := s.User(userID)
-					if userErr != nil {
-						log.Printf("[LEADERBOARD] Could not find user/member for ID %s: %v", userID, userErr)
-						displayName = userID // fallback to ID
-					} else {
-						displayName = user.Username
-					}
-				}
-				nameScores[displayName] = score
-			}
-
-			chatLeaderboard := wordgames.FormatChatLeaderboard(nameScores)
-			sendMessage(s, m.ChannelID, leaderboard.Format()+"\n\n"+chatLeaderboard)
+	if isTarget && !isExpired {
+		// Aggro is active. Perform API calls outside the lock.
+		err := s.MessageReactionAdd(m.ChannelID, m.ID, cfg.AggroEmoji)
+		if err != nil {
+			log.Printf("[AGGRO] Failed to add reaction: %v", err)
 		}
-		// --- Word Game Admin Command (for testing) ---
-		if cfg.EnableWordGames && wordGamesAvailable && strings.ToLower(m.Content) == "!wordgame" {
-			// The only authorization check in the codebase, and until M2 it was a
-			// user ID hardcoded in the source. It now fails CLOSED: an unset
-			// PEREGRINE_BOOTSTRAP_ADMIN_USER_ID refuses this command for
-			// everyone, never allows it for everyone. Getting that direction
-			// wrong on an empty string is how a missing variable turns an
-			// operator-only command into a public one.
-			if cfg.AdminUserID != "" && m.Author.ID == cfg.AdminUserID {
-				wordGameMutex.Lock()
-				if _, gameExists := activeWordGames[m.ChannelID]; gameExists {
-					sendMessage(s, m.ChannelID, "A word game is already in progress in this channel!")
-				} else {
-					game, err := wordgames.NewScrambleGame()
-					if err != nil {
-						log.Printf("[WORDGAME] Failed to create new game: %v", err)
-					} else {
-						msg, err := s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("✨ **Word Scramble!** ✨\n\nUnscramble this word: **%s**", game.ScrambledWord))
-						if err == nil {
-							game.MessageID = msg.ID
-							activeWordGames[m.ChannelID] = game
-							log.Printf("[WORDGAME] Started a new game in channel %s.", m.ChannelID)
-							go func(channelID, messageID, originalWord string) {
-								time.Sleep(60 * time.Second)
-								wordGameMutex.Lock()
-								defer wordGameMutex.Unlock()
-								if g, exists := activeWordGames[channelID]; exists && g.MessageID == messageID {
-									timeoutMsg, err := s.ChannelMessageSend(channelID, fmt.Sprintf("Time's up! The word was **%s**.", originalWord))
-									if err == nil {
-										go func(cid, mid string) {
-											time.Sleep(30 * time.Second)
-											deleteMessage(s, cid, mid)
-										}(channelID, timeoutMsg.ID)
-									}
-									deleteMessage(s, channelID, messageID)
-									delete(activeWordGames, channelID)
-									log.Printf("[WORDGAME] Game timed out in channel %s.", channelID)
-								}
-							}(m.ChannelID, msg.ID, game.OriginalWord)
-						}
-					}
-				}
-				wordGameMutex.Unlock()
-			}
-		}
-
-		// --- Bird Aggro Check ---
+	} else if isTarget && isExpired {
+		// Aggro has expired. Update shared state and persist.
+		log.Printf("[AGGRO] Aggro expired for %s, clearing...", m.Author.Username)
 		birdAggroMutex.Lock()
-		isTarget := m.Author.ID == birdAggroTargetID
-		isExpired := time.Now().After(birdAggroEndTime)
-		birdAggroMutex.Unlock() // Unlock immediately after reading shared state.
+		birdAggroTargetID = ""
+		birdAggroEndTime = time.Time{}
+		birdAggroMutex.Unlock()
 
-		if isTarget && !isExpired {
-			// Aggro is active. Perform API calls outside the lock.
-			err := s.MessageReactionAdd(m.ChannelID, m.ID, cfg.AggroEmoji)
-			if err != nil {
-				log.Printf("[AGGRO] Failed to add reaction: %v", err)
-			}
-		} else if isTarget && isExpired {
-			// Aggro has expired. Update shared state and persist.
-			log.Printf("[AGGRO] Aggro expired for %s, clearing...", m.Author.Username)
-			birdAggroMutex.Lock()
-			birdAggroTargetID = ""
-			birdAggroEndTime = time.Time{}
-			birdAggroMutex.Unlock()
+		// Perform DB update and reaction removal outside the lock.
+		_ = db.Update(func(tx *bbolt.Tx) error {
+			return saveAggroState(tx, AggroState{})
+		})
+		_ = s.MessageReactionRemove(m.ChannelID, m.ID, cfg.AggroEmoji, s.State.User.ID)
+	}
 
-			// Perform DB update and reaction removal outside the lock.
-			_ = db.Update(func(tx *bbolt.Tx) error {
-				return saveAggroState(tx, AggroState{})
-			})
-			_ = s.MessageReactionRemove(m.ChannelID, m.ID, cfg.AggroEmoji, s.State.User.ID)
+	// --- Determine flags ---
+	flags := make(map[string]bool)
+
+	// Mentioned the bot
+	if strings.Contains(m.Content, "<@"+botID+">") || strings.Contains(m.Content, "<@!"+botID+">") {
+		flags["MENTIONED"] = true
+	}
+
+	// Reply to bot
+	if m.MessageReference != nil && m.MessageReference.MessageID != "" && m.MessageReference.ChannelID != "" {
+		if refMsg, err := s.ChannelMessage(m.MessageReference.ChannelID, m.MessageReference.MessageID); err == nil && refMsg.Author.ID == botID {
+			flags["REPLY_TO_BOT"] = true
 		}
+	}
 
-		// --- Determine flags ---
-		flags := make(map[string]bool)
-
-		// Mentioned the bot
-		if strings.Contains(m.Content, "<@"+botID+">") || strings.Contains(m.Content, "<@!"+botID+">") {
-			flags["MENTIONED"] = true
+	// Check attachments for voice/audio
+	flags["VOICE"] = false
+	for _, att := range m.Attachments {
+		// Discord voice messages are always .ogg and named "voice-message.ogg"
+		if strings.ToLower(att.Filename) == "voice-message.ogg" && strings.ToLower(filepath.Ext(att.Filename)) == ".ogg" {
+			flags["VOICE"] = true
+			break
 		}
+	}
 
-		// Reply to bot
-		if m.MessageReference != nil && m.MessageReference.MessageID != "" && m.MessageReference.ChannelID != "" {
-			if refMsg, err := s.ChannelMessage(m.MessageReference.ChannelID, m.MessageReference.MessageID); err == nil && refMsg.Author.ID == botID {
-				flags["REPLY_TO_BOT"] = true
-			}
-		}
+	// Check if the message contains text
+	flags["TEXT"] = len(strings.TrimSpace(m.Content)) > 0
 
-		// Check attachments for voice/audio
-		flags["VOICE"] = false
-		for _, att := range m.Attachments {
-			// Discord voice messages are always .ogg and named "voice-message.ogg"
-			if strings.ToLower(att.Filename) == "voice-message.ogg" && strings.ToLower(filepath.Ext(att.Filename)) == ".ogg" {
-				flags["VOICE"] = true
-				break
-			}
-		}
+	// Check for self-mention keywords in text messages
+	if flags["TEXT"] && cfg.SelfMention.MatchString(m.Content) {
+		flags["SELF_MENTION_KEYWORD"] = true
+	}
 
-		// Check if the message contains text
-		flags["TEXT"] = len(strings.TrimSpace(m.Content)) > 0
+	// --- Handle text messages ---
+	if flags["TEXT"] && (flags["MENTIONED"] || flags["REPLY_TO_BOT"] || flags["SELF_MENTION_KEYWORD"]) {
+		replyStart := time.Now()
 
-		// Check for self-mention keywords in text messages
-		if flags["TEXT"] && cfg.SelfMention.MatchString(m.Content) {
-			flags["SELF_MENTION_KEYWORD"] = true
-		}
+		promptForGeneration := m.Content
+		isRoast := false
 
-		// --- Handle text messages ---
-		if flags["TEXT"] && (flags["MENTIONED"] || flags["REPLY_TO_BOT"] || flags["SELF_MENTION_KEYWORD"]) {
-			replyStart := time.Now()
-
-			promptForGeneration := m.Content
-			isRoast := false
-
-			// If a self-mention keyword is detected and the bot wasn't directly addressed,
-			// override the prompt to encourage a self-referential roast.
-			if flags["SELF_MENTION_KEYWORD"] && !flags["MENTIONED"] && !flags["REPLY_TO_BOT"] {
-				promptForGeneration = "<START> peregrine"
-				isRoast = true // Always roast when self-mentioning without direct address
-				log.Printf("[INFO] Activating 'roast' mode due to self-mention keyword. Using prompt: %q", promptForGeneration)
-			} else if flags["MENTIONED"] || flags["REPLY_TO_BOT"] {
-				// If directly mentioned or replied to, there's still a chance for a roast.
-				roastChance := 0.10 // Base 10% chance for a roast
-				// (Optional: Add logic here to increase roastChance if the message sentiment is negative)
-				if randgen.Float64() < roastChance {
-					isRoast = true
-					log.Printf("[INFO] Activating 'roast' mode for direct interaction.")
-				}
-			}
-
-			reply, err := generateSentenceWithContext(s, promptForGeneration, isRoast, &globalConvMemory)
-			if err != nil {
-				log.Printf("[ERR] reply generation failed: %v", err)
-			} else if reply != "" {
-				// Always reply directly when the bot is triggered by a message.
-				if _, err := s.ChannelMessageSendReply(m.ChannelID, reply, &discordgo.MessageReference{MessageID: m.ID, ChannelID: m.ChannelID}); err != nil {
-					log.Printf("[ERR] sending reply failed: %v", err)
-				} else {
-					log.Printf("[RESP] replied to %s in %s: %q", m.Author.Username, time.Since(replyStart), reply)
-
-					// --- Reinforcement Learning ---
-					// The bot learns its own successful, contextually-generated replies.
-					// This creates a feedback loop, reinforcing the associations that led to a good response.
-					go func(replyContent string) {
-						botUser, err := s.User("@me")
-						if err != nil {
-							log.Printf("[WARN] Could not get bot user for self-learning: %v", err)
-							return
-						}
-						botAsMention := MentionedUser{
-							Name:     botUser.Username,
-							UserID:   botUser.ID,
-							Username: botUser.Username,
-						}
-						// Learn the bot's own reply, associating it with the users mentioned in the original prompt.
-						// This teaches the bot what a good, on-topic response looks like.
-						_ = db.Update(func(tx *bbolt.Tx) error {
-							mentionedInPrompt := extractNamesFromMessage(s, m, m.GuildID)
-							if err := learnMessage(tx, replyContent, m.ID, botID, botAsMention, mentionedInPrompt); err != nil {
-								return fmt.Errorf("self-learning failed: %w", err)
-							}
-							return nil
-						})
-					}(reply)
-				}
+		// If a self-mention keyword is detected and the bot wasn't directly addressed,
+		// override the prompt to encourage a self-referential roast.
+		if flags["SELF_MENTION_KEYWORD"] && !flags["MENTIONED"] && !flags["REPLY_TO_BOT"] {
+			promptForGeneration = "<START> peregrine"
+			isRoast = true // Always roast when self-mentioning without direct address
+			log.Printf("[INFO] Activating 'roast' mode due to self-mention keyword. Using prompt: %q", promptForGeneration)
+		} else if flags["MENTIONED"] || flags["REPLY_TO_BOT"] {
+			// If directly mentioned or replied to, there's still a chance for a roast.
+			roastChance := 0.10 // Base 10% chance for a roast
+			// (Optional: Add logic here to increase roastChance if the message sentiment is negative)
+			if rand.Float64() < roastChance {
+				isRoast = true
+				log.Printf("[INFO] Activating 'roast' mode for direct interaction.")
 			}
 		}
 
-		// --- Extract and store names ---
-		if flags["TEXT"] {
-			mentionedUsers := extractNamesFromMessage(s, m, m.GuildID)
-			if len(mentionedUsers) > 0 {
-				_ = db.Update(func(tx *bbolt.Tx) error {
-					for _, user := range mentionedUsers {
-						_, err := learnOrUpdateName(tx, user.Name, user.UserID, user.Username)
-						if err != nil {
-							log.Printf("[WARN] Failed to learn name '%s' during extraction: %v", user.Name, err)
-						}
+		reply, err := generateSentenceWithContext(s, promptForGeneration, isRoast, &globalConvMemory)
+		if err != nil {
+			log.Printf("[ERR] reply generation failed: %v", err)
+		} else if reply != "" {
+			// Always reply directly when the bot is triggered by a message.
+			if _, err := s.ChannelMessageSendReply(m.ChannelID, reply, &discordgo.MessageReference{MessageID: m.ID, ChannelID: m.ChannelID}); err != nil {
+				log.Printf("[ERR] sending reply failed: %v", err)
+			} else {
+				log.Printf("[RESP] replied to %s in %s: %q", m.Author.Username, time.Since(replyStart), reply)
+
+				// --- Reinforcement Learning ---
+				// The bot learns its own successful, contextually-generated replies.
+				// This creates a feedback loop, reinforcing the associations that led to a good response.
+				go func(replyContent string) {
+					botUser, err := s.User("@me")
+					if err != nil {
+						log.Printf("[WARN] Could not get bot user for self-learning: %v", err)
+						return
 					}
-					return nil
-				})
+					botAsMention := MentionedUser{
+						Name:     botUser.Username,
+						UserID:   botUser.ID,
+						Username: botUser.Username,
+					}
+					// Learn the bot's own reply, associating it with the users mentioned in the original prompt.
+					// This teaches the bot what a good, on-topic response looks like.
+					_ = db.Update(func(tx *bbolt.Tx) error {
+						mentionedInPrompt := extractNamesFromMessage(s, m, m.GuildID)
+						if err := learnMessage(tx, replyContent, m.ID, botID, botAsMention, mentionedInPrompt); err != nil {
+							return fmt.Errorf("self-learning failed: %w", err)
+						}
+						return nil
+					})
+				}(reply)
 			}
 		}
+	}
 
-		// --- Learn the message ---
-		if flags["TEXT"] {
-			mentionedUsers := extractNamesFromMessage(s, m, m.GuildID)
-
-			// Create a representation of the author to learn their own message content.
-			authorAsMention := MentionedUser{
-				Name:     m.Author.Username,
-				UserID:   m.Author.ID,
-				Username: m.Author.Username,
-			}
-			if m.Member != nil && m.Member.Nick != "" {
-				// Prefer nickname for association if available.
-				authorAsMention.Name = m.Member.Nick
-			}
-
-			// Avoid duplicating the author if they were already processed (e.g., mentioned themselves).
-			isAuthorProcessed := false
-			for _, u := range mentionedUsers {
-				if u.UserID == m.Author.ID {
-					isAuthorProcessed = true
-					break
-				}
-			}
-			if !isAuthorProcessed {
-				mentionedUsers = append(mentionedUsers, authorAsMention)
-			}
-
-			// Learn the message in a new transaction to avoid conflicts with ongoing processing
+	// --- Extract and store names ---
+	if flags["TEXT"] {
+		mentionedUsers := extractNamesFromMessage(s, m, m.GuildID)
+		if len(mentionedUsers) > 0 {
 			_ = db.Update(func(tx *bbolt.Tx) error {
-				if err := learnMessage(tx, m.Content, m.ID, botID, authorAsMention, mentionedUsers); err != nil {
-					return fmt.Errorf("learning failed: %w", err)
+				for _, user := range mentionedUsers {
+					_, err := learnOrUpdateName(tx, user.Name, user.UserID, user.Username)
+					if err != nil {
+						log.Printf("[WARN] Failed to learn name '%s' during extraction: %v", user.Name, err)
+					}
 				}
 				return nil
 			})
 		}
+	}
 
-		// --- Handle voice attachments ---
-		if cfg.EnableTranscription && flags["VOICE"] {
-			for _, att := range m.Attachments {
-				ext := strings.ToLower(filepath.Ext(att.Filename))
-				if ext == ".ogg" || ext == ".mp3" || ext == ".wav" {
-					// Send placeholder immediately
-					placeholder, err := s.ChannelMessageSendReply(
-						m.ChannelID,
-						"🔊 transcription in progress...",
-						&discordgo.MessageReference{MessageID: m.ID, ChannelID: m.ChannelID},
-					)
-					if err != nil {
-						log.Printf("[VOICE] Failed to send placeholder message: %v", err)
-						continue
-					}
+	// --- Learn the message ---
+	if flags["TEXT"] {
+		mentionedUsers := extractNamesFromMessage(s, m, m.GuildID)
 
-					// Add a job to the transcription queue
-					transcriptionQueue <- TranscriptionJob{
-						URL:           att.URL,
-						AuthorID:      m.Author.ID,
-						MsgID:         m.ID,
-						ChannelID:     m.ChannelID,
-						PlaceholderID: placeholder.ID,
-						Author:        m.Author,
-						Member:        m.Member,
-					}
+		// Create a representation of the author to learn their own message content.
+		authorAsMention := MentionedUser{
+			Name:     m.Author.Username,
+			UserID:   m.Author.ID,
+			Username: m.Author.Username,
+		}
+		if m.Member != nil && m.Member.Nick != "" {
+			// Prefer nickname for association if available.
+			authorAsMention.Name = m.Member.Nick
+		}
+
+		// Avoid duplicating the author if they were already processed (e.g., mentioned themselves).
+		isAuthorProcessed := false
+		for _, u := range mentionedUsers {
+			if u.UserID == m.Author.ID {
+				isAuthorProcessed = true
+				break
+			}
+		}
+		if !isAuthorProcessed {
+			mentionedUsers = append(mentionedUsers, authorAsMention)
+		}
+
+		// Learn the message in a new transaction to avoid conflicts with ongoing processing
+		_ = db.Update(func(tx *bbolt.Tx) error {
+			if err := learnMessage(tx, m.Content, m.ID, botID, authorAsMention, mentionedUsers); err != nil {
+				return fmt.Errorf("learning failed: %w", err)
+			}
+			return nil
+		})
+	}
+
+	// --- Handle voice attachments ---
+	if cfg.EnableTranscription && flags["VOICE"] {
+		for _, att := range m.Attachments {
+			ext := strings.ToLower(filepath.Ext(att.Filename))
+			if ext == ".ogg" || ext == ".mp3" || ext == ".wav" {
+				// Send placeholder immediately
+				placeholder, err := s.ChannelMessageSendReply(
+					m.ChannelID,
+					"🔊 transcription in progress...",
+					&discordgo.MessageReference{MessageID: m.ID, ChannelID: m.ChannelID},
+				)
+				if err != nil {
+					log.Printf("[VOICE] Failed to send placeholder message: %v", err)
+					continue
+				}
+
+				// Add a job to the transcription queue
+				transcriptionQueue <- TranscriptionJob{
+					URL:           att.URL,
+					AuthorID:      m.Author.ID,
+					MsgID:         m.ID,
+					ChannelID:     m.ChannelID,
+					PlaceholderID: placeholder.ID,
+					Author:        m.Author,
+					Member:        m.Member,
 				}
 			}
 		}
+	}
 
-		// --- Capture image and Tenor URLs ---
-		// Gated on the same switch as reposting, not just on the repost itself.
-		// The cache exists only to feed reposts, so with reposting off this would
-		// be storing other people's media URLs in the operator's database for no
-		// consumer at all: liability with no upside.
-		if cfg.EnableImageRepost {
-			captureImageURLs(s, m)
+	// --- Capture image and Tenor URLs ---
+	// Gated on the same switch as reposting, not just on the repost itself.
+	// The cache exists only to feed reposts, so with reposting off this would
+	// be storing other people's media URLs in the operator's database for no
+	// consumer at all: liability with no upside.
+	if cfg.EnableImageRepost {
+		captureImageURLs(s, m)
+	}
+
+	// --- Spontaneous image repost ---
+	// Applies to all messages, but the ambient rate is deliberately the
+	// higher of the two: when the bot is already answering a mention it is
+	// contributing to the channel anyway, so an unrelated image on top of the
+	// reply is noise rather than chaos.
+	repostChance := cfg.ImageRepostDirect
+	if !flags["MENTIONED"] && !flags["REPLY_TO_BOT"] {
+		repostChance = cfg.ImageRepostChance
+	}
+
+	if cfg.EnableImageRepost && rand.Float64() < repostChance {
+		imageURLMutex.Lock()
+		if len(recentImageURLs) > 0 {
+			urlToPost := recentImageURLs[rand.IntN(len(recentImageURLs))]
+			imageURLMutex.Unlock() // Unlock before sending to avoid holding lock during network call
+
+			// Logged before the send, and worded as an attempt, because
+			// sendMessage returns nothing: it logs its own failure. Claiming
+			// success after a void call would report a repost that Discord
+			// refused as one that happened.
+			log.Printf("[REPOST] Reposting image: %s", urlToPost)
+			sendMessage(s, m.ChannelID, urlToPost)
+		} else {
+			imageURLMutex.Unlock()
 		}
+	}
 
-		// --- Spontaneous image repost ---
-		// Applies to all messages, but the ambient rate is deliberately the
-		// higher of the two: when the bot is already answering a mention it is
-		// contributing to the channel anyway, so an unrelated image on top of the
-		// reply is noise rather than chaos.
-		repostChance := cfg.ImageRepostDirect
-		if !flags["MENTIONED"] && !flags["REPLY_TO_BOT"] {
-			repostChance = cfg.ImageRepostChance
-		}
-
-		if cfg.EnableImageRepost && randgen.Float64() < repostChance {
-			imageURLMutex.Lock()
-			if len(recentImageURLs) > 0 {
-				urlToPost := recentImageURLs[randgen.Intn(len(recentImageURLs))]
-				imageURLMutex.Unlock() // Unlock before sending to avoid holding lock during network call
-
-				// Logged before the send, and worded as an attempt, because
-				// sendMessage returns nothing: it logs its own failure. Claiming
-				// success after a void call would report a repost that Discord
-				// refused as one that happened.
-				log.Printf("[REPOST] Reposting image: %s", urlToPost)
-				sendMessage(s, m.ChannelID, urlToPost)
-			} else {
-				imageURLMutex.Unlock()
-			}
-		}
-
-		log.Printf("[OK] handled msg from %s in %s | flags: %+v", m.Author.Username, time.Since(start), flags)
-	}()
+	log.Printf("[OK] handled msg from %s in %s | flags: %+v", m.Author.Username, time.Since(start), flags)
 }
 
 // captureImageURLs caches one image or Tenor URL from a message so a later
@@ -3025,7 +3056,7 @@ func captureImageURLs(s *discordgo.Session, m *discordgo.MessageCreate) {
 		var urlToCache string
 		if len(candidateURLs) > 0 {
 			// Randomly select one URL from the candidates to cache
-			urlToCache = candidateURLs[randgen.Intn(len(candidateURLs))]
+			urlToCache = candidateURLs[rand.IntN(len(candidateURLs))]
 		}
 
 		// 3. If a URL was found (either from attachment or content), save it.
@@ -3070,7 +3101,7 @@ func captureImageURLs(s *discordgo.Session, m *discordgo.MessageCreate) {
 // -----------------------------------------------------------------------------
 
 // findRandomActiveUser finds a random user who has posted in the most active channel recently.
-func findRandomActiveUser(s *discordgo.Session) string {
+func findRandomActiveUser(ctx context.Context, s *discordgo.Session) string {
 	guilds, err := s.UserGuilds(100, "", "", false)
 	if err != nil || len(guilds) == 0 {
 		log.Println("[AGGRO] No guilds available to find active user:", err)
@@ -3086,7 +3117,7 @@ func findRandomActiveUser(s *discordgo.Session) string {
 		if gptr == nil {
 			continue
 		}
-		channels := getActiveChannels(s, gptr.ID, stopSignal, activityCutoff)
+		channels := getActiveChannels(ctx, s, gptr.ID, activityCutoff)
 		for _, chInfo := range channels {
 			batch, err := s.ChannelMessages(chInfo.Channel.ID, 100, "", "", "")
 			if err != nil {
@@ -3112,7 +3143,7 @@ func findRandomActiveUser(s *discordgo.Session) string {
 	}
 
 	// Select a random user from the pool of active users
-	return activeUsers[randgen.Intn(len(activeUsers))]
+	return activeUsers[rand.IntN(len(activeUsers))]
 }
 
 // -----------------------------------------------------------------------------
@@ -3120,7 +3151,7 @@ func findRandomActiveUser(s *discordgo.Session) string {
 // -----------------------------------------------------------------------------
 
 // autonomousPost picks an active channel and posts a generated message occasionally.
-func autonomousPost(dg *discordgo.Session) {
+func autonomousPost(ctx context.Context, dg *discordgo.Session) {
 	start := time.Now()
 	log.Println("[AUTONOMOUS] Starting autonomous post cycle...")
 
@@ -3138,7 +3169,7 @@ func autonomousPost(dg *discordgo.Session) {
 		if gptr == nil {
 			continue
 		}
-		channels := getActiveChannels(dg, gptr.ID, stopSignal, time.Now().Add(-cfg.IngestLookback))
+		channels := getActiveChannels(ctx, dg, gptr.ID, time.Now().Add(-cfg.IngestLookback))
 		if len(channels) == 0 {
 			log.Printf("[AUTONOMOUS] Guild %s has no active channels", gptr.Name)
 			continue
@@ -3164,7 +3195,7 @@ func autonomousPost(dg *discordgo.Session) {
 
 	// Chance to skip for "natural pacing" (applies to ALL autonomous posts)
 	skipChance := cfg.AutonomousSkipChance
-	if randgen.Float64() < skipChance {
+	if rand.Float64() < skipChance {
 		log.Printf("[AUTONOMOUS] Skipping this cycle for natural pacing (chance %.2f)", skipChance)
 		return
 	}
@@ -3219,7 +3250,7 @@ func autonomousPost(dg *discordgo.Session) {
 }
 
 // transcriptionWorker processes voice transcription jobs from a queue.
-func transcriptionWorker(s *discordgo.Session) {
+func transcriptionWorker(ctx context.Context, s *discordgo.Session) {
 	log.Println("[INFO] Transcription worker started.")
 	for {
 		select {
@@ -3257,7 +3288,7 @@ func transcriptionWorker(s *discordgo.Session) {
 			if err != nil {
 				log.Printf("[VOICE] Failed to learn transcript for message %s: %v", job.MsgID, err)
 			}
-		case <-stopSignal:
+		case <-ctx.Done():
 			log.Println("[INFO] Transcription worker stopped.")
 			return
 		}
@@ -3316,9 +3347,9 @@ func printLibraryStatus() {
 }
 
 // monitorPerformance periodically probes the Discord API and logs notable latency.
-func monitorPerformance(dg *discordgo.Session) {
+func monitorPerformance(ctx context.Context, dg *discordgo.Session) {
 	// small startup jitter so multiple instances don't align
-	time.Sleep(time.Duration(randgen.Intn(1000)) * time.Millisecond)
+	time.Sleep(time.Duration(rand.IntN(1000)) * time.Millisecond)
 
 	ticker := time.NewTicker(2 * time.Minute)
 	defer ticker.Stop()
@@ -3342,7 +3373,7 @@ func monitorPerformance(dg *discordgo.Session) {
 			if latency > latencyLogThreshold {
 				log.Printf("[HEALTH] ⚠️ Discord API latency high: %s", latency)
 			}
-		case <-stopSignal:
+		case <-ctx.Done():
 			log.Println("[INFO] Performance monitor stopped by shutdown signal.")
 			return
 		}
