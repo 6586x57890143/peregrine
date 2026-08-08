@@ -85,13 +85,16 @@ Properties that shape the design rather than merely inform it:
 
 The current layout stores a JSON `map[string]int` as the *value* of each prefix key. So the key `"the"` holds a map of every word that has ever followed "the", read, decoded, mutated, re-encoded and rewritten in full on **every occurrence of the word "the"**. That is the root performance defect, and it has a pathological special case: the ingestion loop runs the n-gram order down to 1, and at order 1 the prefix slice is empty, so the key is the empty string and **the entire vocabulary accumulates into a single database key**. Nothing reads it: every reader constructs a prefix of at least one word. It is pure write amplification and the dominant reason the corpus reached 128 MiB.
 
-Target:
+As shipped in M6a:
 
 ```
-bucket "markov"
-  key   = <prefix bytes> 0x00 <next token bytes>
-  value = 8-byte big-endian uint64 count
+bucket "ngram"       key = <prefix> 0x00 <next>              value = count u64 | authors u32
+bucket "ngram_auth"  key = <prefix> 0x00 <next> 0x00 <uid>   value = presence
 ```
+
+The value is twelve bytes rather than eight, because the distinct-author count lives
+alongside the frequency: generation reads both together on every candidate, so
+splitting them would double the reads on the hot path.
 
 `0x00` is a safe separator because the tokenizer can only emit URLs, mentions, emotes, shortcodes and runs of letters, digits, symbols and apostrophes, none of which contain a NUL. The codec asserts this and returns an error rather than writing an ambiguous key. `0x00` also sorts below space, so a seek on `"the\x00"` cannot wander into `"the cat\x00..."`. `IncSuccessor` becomes one 8-byte get, an add and one 8-byte put: constant work, no decode, no whole-map rewrite. The ingestion loop starts at order 2, so the empty prefix cannot be produced, and `PEREGRINE_MAX_NGRAM` validates a minimum of 2. Unigram frequency already lives correctly in the `topics` bucket, one key per word.
 
@@ -105,7 +108,7 @@ bucket "kn_pre"    key = <token> 0x00 <preceding ctx>   value = presence
 bucket "kn_pre_n"  key = <token>                        value = N1+(. token)   distinct predecessors
 ```
 
-`kn_succ` is the interpolation normalizer. It is derivable with a cursor count, but that is O(successors) on every lookup, so it is stored and maintained incrementally. `kn_pre` is a presence set whose only job is to make `kn_pre_n` correct, since a distinct-predecessor count cannot be maintained without knowing whether a given predecessor was already seen. This is the honest cost of KN: roughly one extra read and two extra writes per n-gram per message, against a presence value of zero bytes. Worth paying, because §3.1 removes far more write volume than this adds.
+`kn_succ` is the interpolation normalizer. It is derivable with a cursor count, but that is O(successors) on every lookup, so it is stored and maintained incrementally. `kn_pre` is a presence set whose only job is to make `kn_pre_n` correct, since a distinct-predecessor count cannot be maintained without knowing whether a given predecessor was already seen. **Its value is one byte, not zero.** bbolt`s `Bucket.Get` returns nil both for a key that does not exist and for a key stored with an empty value, so `Get(k) == nil` cannot tell those apart; with a zero-length value every presence check reported absent and both this count and the author count counted occurrences instead of distinct things. Three tests caught it. This is the honest cost of KN: roughly one extra read and two extra writes per n-gram per message, against a presence value of zero bytes. Worth paying, because §3.1 removes far more write volume than this adds.
 
 `kn_pre` grows with distinct (token, context) pairs and is the fastest-growing structure in the database. It will need a pruning policy. Deliberately not in M6: get it correct and measure first, because a wrong prune corrupts the continuation counts that KN's entire benefit rests on.
 
@@ -360,7 +363,8 @@ Small, mergeable PRs. `go build ./...`, `go vet ./...`, `golangci-lint run`, `go
 | 3 | `internal/core` lifecycle | `Service`/`Registry`/`Deps` and `WatchReady` ported; `IntentsGuilds` added, which makes custom emote output possible for the first time; bounded `Dispatcher` with drop accounting; `RunLoop` replacing nine background goroutines; ordered shutdown under one 8s budget; `stopSignal` and the shared WaitGroup deleted in favour of `ctx`; `math/rand/v2` replacing the shared generator; `core` at 94% coverage. Closes 3, 4, and the intent half of 7 | **done** |
 | 4 | `internal/text` and `internal/filter` | Both packages are leaves and neither logs; the filters return a reason and the caller decides what to record. Regexes hoisted to package scope, slur map becomes an ordered slice, `ContainsSlur` stops allocating a rewritten string to answer a yes/no question, `CleanSentence` takes an `EmojiResolver` instead of a session, per-call `text.Interner` replaces the global vocabulary. Found and recorded finding 27, and flipped `PEREGRINE_ENABLE_CLUSTERING` to default false as a result. Closes 2, 16, 22 | **done** |
 | 5 | `internal/safety` | Normalizer (case-fold, NFKD, strip marks and format characters, fold Cyrillic/Greek confusables and leet, collapse whitespace, join spaced single-letter runs, cap repeats); blocklist as data from `PEREGRINE_BLOCKLIST_PATH`, three categories, failing closed with every bad line reported by line number; `CheckLearn` **inside** `learnMessage` with an AST test that fails if it leaves; `CheckEmit` at the generation exit, silent on rejection; reject-not-launder made unexpressible; `PAUSE_ALL_WRITES`; rejection counters and logging that never records the offending text. `internal/safety` at 96%. Closes A1, A2, A5 and A4's mechanism. **Highest-value row** | **done** |
-| 6 | `internal/corpus` and `internal/storage` | Composite-key codecs; the three KN indexes; distinct-author counts; `schema_version`; `Reader`/`Writer` seam; timestamp-only history; counter-based chronological trims; per-author purge; `dbtest`; `maintenance`. Closes 1, 5, 10, 11, 18 | |
+| 6a | `internal/corpus`, `internal/storage`, `internal/dbtest`, `internal/maintenance` | The layer itself: composite-key codecs with a NUL assertion; the three KN indexes maintained incrementally; distinct-author counts as a presence set; `schema_version` refusing a pre-M6 corpus; `Reader`/`Writer` bound to a transaction so nothing outside storage can reach a `*bbolt.DB`; timestamp-only history keyed by fixed-width snowflake; counter-based trims; per-author purge; in-process backup and compaction. `dbtest` with no skip path. 30+ tests against a real bbolt file | **done** |
+| 6b | Switch the bot onto the seam | Rewire `internal/legacy`'s roughly sixty bucket-access sites onto `Reader`/`Writer`, delete its bucket constants and its `*bbolt.DB`, point `-clean-db` at `internal/maintenance` and add `-compact` and `-purge-author`. This is the commit that actually closes 1, 5, 10, 11 and 18 in the running bot, because until legacy holds a `Store` instead of a `DB` the nested transaction is still writable | |
 | 7 | `internal/markov`: the engine | Interpolated KN with `mu`; log-space additive scoring; temperature and top-k/top-p; dead scoring deleted; author-diversity gate; consolidated persona; short length model; per-channel memory; co-occurrence window; `math/rand/v2`. Closes 12, A6, and §5.1 | |
 | 8 | `internal/clustering` | Made pure, content-hashed IDs, diff-based persistence, nil-bucket guard, **the string-keyed/int-keyed codec mismatch in finding 27 fixed so a cluster can be read at all**, and `PEREGRINE_ENABLE_CLUSTERING` returned to defaulting true once M7 golden samples show the clusters help. Closes 15, 27 | |
 | 9 | `internal/ingest` | Per-channel high-water cursors with `afterID` paging; `errgroup.SetLimit` at both levels. Closes 13, 14 | |
