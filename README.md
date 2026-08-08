@@ -6,7 +6,9 @@ Sibling project to [merlin](../merlin), whose deployment conventions this repo f
 
 ## Status
 
-Mid-restructure. The bot works and runs, but it is being taken from a single 3,200-line `main.go` to a proper package layout one subsystem at a time, with a catalogue of known defects being closed along the way. See `SPEC.md` §8 for the defect list and §9 for the milestone order. **Milestone 0 (repo hygiene, docs, CI/CD) is complete; the code restructure has not started.**
+Mid-restructure. The bot works and runs, but it is being taken from a single 3,200-line `main.go` to a proper package layout one subsystem at a time, with a catalogue of known defects being closed along the way. See `SPEC.md` §8 for the defect list and §9 for the milestone order.
+
+**Milestones 0 (repo hygiene, docs, CI/CD) and 1 (the `cmd/bot` entrypoint) are complete.** The entrypoint is real; the code behind it is not yet. Everything except `main`'s own startup and shutdown still sits unchanged in `internal/legacy`, which each later milestone empties one subsystem at a time.
 
 Two things worth knowing before running it anywhere real:
 
@@ -17,7 +19,7 @@ Two things worth knowing before running it anywhere real:
 
 ```sh
 cp .env.example .env          # set DISCORD_BOT_TOKEN
-go run .
+go run ./cmd/bot
 ```
 
 In the Discord Developer Portal the application needs the **Message Content** privileged intent ticked, under Bot. Without it Discord refuses the connection and the bot cannot read the messages it exists to learn from.
@@ -40,7 +42,7 @@ Everything is environment variables; there is no config file. `.env.example` doc
 ## Maintenance
 
 ```sh
-go run . -clean-db     # strip spammy and slur-bearing keys from the corpus
+go run ./cmd/bot -clean-db     # strip spammy and slur-bearing keys from the corpus
 ```
 
 Runs against the corpus and never touches Discord. It respects `PEREGRINE_DB_PATH`. Running it while the bot is live fails within five seconds with a clear message rather than hanging, because bbolt holds an exclusive lock on the file.

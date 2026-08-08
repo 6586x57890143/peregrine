@@ -7,6 +7,7 @@ toolchain go1.24.6
 require (
 	github.com/beevik/ntp v1.5.0
 	github.com/bwmarrin/discordgo v0.29.0
+	github.com/joho/godotenv v1.5.1
 	go.etcd.io/bbolt v1.4.3
 )
 
