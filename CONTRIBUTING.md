@@ -32,9 +32,11 @@ grep -rnI --exclude-dir=.git -e "$em" -e "$ell" -e "$ldq" -e "$rdq" .
 
 ## Things that will get a PR sent back
 
+**Adding new code to `internal/legacy`.** That package is a holding pen for the pre-restructure `main.go` and it only shrinks. New code goes in the package the milestone table assigns it to; if no package exists for it yet, that is a sign the milestone it belongs to has not landed. The one thing that legitimately changes in `legacy` is code being *deleted* as it moves out.
+
 **Adding a check at a call site instead of a chokepoint.** See `SPEC.md` §1.3. The moderation in this bot was defeated for its entire life because the filters lived in one of four callers of `learnMessage` instead of inside it. Any check that must not be bypassable goes at the funnel.
 
-**Reaching past a guard.** Once `internal/discordguard` exists, sends go through it, not through `s.ChannelMessage*`. It owns mention suppression and the outbound safety gate, and a direct call silently opts out of both. Today's `sendMessage`/`editMessage`/`deleteMessage` helpers in `main.go` are its stand-in; use those.
+**Reaching past a guard.** Once `internal/discordguard` exists, sends go through it, not through `s.ChannelMessage*`. It owns mention suppression and the outbound safety gate, and a direct call silently opts out of both. Today's `sendMessage`/`editMessage`/`deleteMessage` helpers in `internal/legacy/legacy.go` are its stand-in; use those.
 
 **Opening a nested bbolt transaction.** A `db.View` inside another transaction can deadlock the process unrecoverably. After M6 the `Reader`/`Writer` seam makes this unwritable; before then, check by hand.
 
