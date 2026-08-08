@@ -61,9 +61,10 @@ var allBuckets = []string{
 
 // Meta keys.
 const (
-	metaSchemaVersion = "schema_version"
-	metaHistoryCount  = "count:history"
-	metaImageCount    = "count:image"
+	metaSchemaVersion   = "schema_version"
+	metaHistoryCount    = "count:history"
+	metaImageCount      = "count:image"
+	metaMessagesLearned = "count:messages_learned"
 )
 
 // SchemaVersion is the on-disk layout this binary understands.

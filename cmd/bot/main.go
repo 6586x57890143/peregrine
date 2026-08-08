@@ -21,12 +21,13 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
-	"go.etcd.io/bbolt"
 
 	"github.com/6586x57890143/peregrine/internal/config"
 	"github.com/6586x57890143/peregrine/internal/core"
 	"github.com/6586x57890143/peregrine/internal/legacy"
+	"github.com/6586x57890143/peregrine/internal/maintenance"
 	"github.com/6586x57890143/peregrine/internal/safety"
+	"github.com/6586x57890143/peregrine/internal/storage"
 )
 
 func main() {
@@ -74,8 +75,30 @@ func runGuarded(log *slog.Logger, level *slog.LevelVar) (err error) {
 }
 
 func run(log *slog.Logger, level *slog.LevelVar) error {
-	cleanDB := flag.Bool("clean-db", false, "Remove spammy and slur-bearing keys from the corpus, then exit. Never touches Discord.")
+	// The value is deliberately unused: mode selection is by whether the flag was
+	// passed, checked below, so `-clean-db=false` is still a request to clean rather
+	// than a request to start the bot. A boolean flag whose false value silently means
+	// "do something else entirely" is not a thing an operator can reason about.
+	_ = flag.Bool("clean-db", false,
+		"Remove spammy and blocklisted n-grams from the corpus, then exit. Never touches Discord.")
+	compactTo := flag.String("compact", "",
+		"Copy the corpus to this path, reclaiming free pages, then exit. bbolt's file never "+
+			"shrinks, so this is the only way to get space back after -clean-db.")
+	purgeAuthor := flag.String("purge-author", "",
+		"Remove one Discord user ID's contribution to author-diversity counts, then exit. "+
+			"The surgical alternative to discarding a corpus one bad actor has poisoned.")
 	flag.Parse()
+
+	// Which maintenance flags were PASSED, rather than which have a non-empty value.
+	//
+	// The difference is not pedantic. `-purge-author ""`, or `-purge-author "$UID"` with
+	// UID unset, is a command an operator issues during an incident, and treating the
+	// empty value as "no mode requested" made it silently start the bot instead: the
+	// most dangerous possible interpretation of a typo, since the whole point of the
+	// mode is that it does not touch Discord. Passing the flag now selects the mode, and
+	// the empty ID is refused by the mode itself with an explanation.
+	passed := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { passed[f.Name] = true })
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -105,11 +128,10 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 	// Maintenance modes run against the corpus and exit. They deliberately do
 	// not open a Discord session and need no token, which is why config.Load does
 	// not require one: an operator cleaning a poisoned corpus should not need a
-	// live credential to do it. bbolt holds an exclusive flock, so this fails
+	// live credential to do it. bbolt holds an exclusive flock, so these fail
 	// within five seconds against a live bot rather than hanging.
-	if *cleanDB {
-		log.Info("running maintenance mode", "mode", "clean-db", "corpus", cfg.DBPath)
-		return legacy.CleanDatabase(cfg.DBPath)
+	if passed["clean-db"] || passed["compact"] || passed["purge-author"] {
+		return runMaintenance(cfg, log, passed, *compactTo, *purgeAuthor)
 	}
 
 	// SIGTERM is the one that matters in production: it is what `docker stop`
@@ -127,18 +149,19 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 	// raced them: a handler still in flight could reach a closed database. Owning
 	// the open and the close at the outermost level is what makes the ordering
 	// below statable at all.
-	store, err := bbolt.Open(cfg.DBPath, 0600, &bbolt.Options{Timeout: 5 * time.Second})
+	//
+	// storage.Open also refuses a corpus whose schema_version it does not
+	// recognize, which is what turns "the layout changed in M6" from silently
+	// reading garbage into a startup error that says to start the corpus over.
+	store, err := storage.Open(cfg.DBPath)
 	if err != nil {
-		return fmt.Errorf("open corpus at %s: %w", cfg.DBPath, err)
+		return err
 	}
 	defer func() {
 		if err := store.Close(); err != nil {
 			log.Error("closing corpus", "err", err)
 		}
 	}()
-	if err := legacy.EnsureBuckets(store); err != nil {
-		return err
-	}
 
 	// The safety gate, built before the session so a bad ruleset stops the process
 	// before it can connect to anything.
@@ -225,6 +248,79 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 
 	log.Info("shutdown complete", "dropped_events", dispatcher.Dropped())
 	return nil
+}
+
+// runMaintenance owns the modes that operate on the corpus and never touch Discord.
+//
+// It opens and closes the store itself, so the bot path's ordering is not entangled
+// with a mode that exits immediately. All three take the already-open store rather
+// than a path, because two code paths independently resolving PEREGRINE_DB_PATH is
+// how you clean a database that is not the one the bot uses, which succeeds, reports
+// a tidy summary, and changes nothing the operator cares about.
+//
+// More than one mode at a time is refused rather than ordered. Compacting a corpus
+// that a clean pass in the same invocation has just emptied is a plausible thing to
+// want and an ambiguous thing to write, so the operator states the sequence.
+func runMaintenance(cfg *config.Config, log *slog.Logger, passed map[string]bool, compactTo, purgeAuthor string) error {
+	modes := 0
+	for _, name := range []string{"clean-db", "compact", "purge-author"} {
+		if passed[name] {
+			modes++
+		}
+	}
+	if modes > 1 {
+		return errors.New("pass one maintenance mode at a time: -clean-db, -compact and " +
+			"-purge-author each take the whole corpus, and the order they should run in is " +
+			"the operator's decision, not a default")
+	}
+
+	// Checked before the corpus is opened, so an obviously incomplete command fails
+	// without taking bbolt's exclusive flock on the way.
+	if passed["compact"] && compactTo == "" {
+		return errors.New("-compact needs a destination path. It writes a new file rather than " +
+			"replacing the corpus in place, so that a compaction that goes wrong costs nothing")
+	}
+
+	store, err := storage.Open(cfg.DBPath)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			log.Error("closing corpus", "err", err)
+		}
+	}()
+
+	switch {
+	case passed["clean-db"]:
+		// The clean pass builds the gate, so it removes what the OPERATOR's blocklist
+		// covers and not merely the built-in baseline. That is most of the point:
+		// adding a pattern to the blocklist does not retroact, and this is the only
+		// thing that applies it to what is already in the corpus.
+		gate, err := buildGate(cfg, log)
+		if err != nil {
+			return err
+		}
+		log.Info("running maintenance mode", "mode", "clean-db", "corpus", cfg.DBPath)
+		res, err := maintenance.Clean(store, gate, log)
+		if err != nil {
+			return err
+		}
+		if res.Removed > 0 {
+			log.Info("the corpus file has not shrunk; bbolt frees pages for reuse but never "+
+				"returns them to the filesystem", "next", "-compact <path>")
+		}
+		return nil
+
+	case compactTo != "":
+		log.Info("running maintenance mode", "mode", "compact", "corpus", cfg.DBPath, "destination", compactTo)
+		return maintenance.Compact(store, compactTo, log)
+
+	default:
+		log.Info("running maintenance mode", "mode", "purge-author", "corpus", cfg.DBPath, "author", purgeAuthor)
+		_, err := maintenance.PurgeAuthor(store, purgeAuthor, log)
+		return err
+	}
 }
 
 // shutdownBudget is deliberately under Docker's default ten seconds between

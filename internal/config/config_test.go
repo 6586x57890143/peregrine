@@ -63,7 +63,6 @@ func TestLoadDefaults(t *testing.T) {
 		{"IngestLookback", cfg.IngestLookback, 24 * time.Hour},
 		{"IngestBatchDelay", cfg.IngestBatchDelay, 500 * time.Millisecond},
 		{"StatusTick", cfg.StatusTick, 5 * time.Minute},
-		{"ClusteringTick", cfg.ClusteringTick, 24 * time.Hour},
 		{"LeaderboardTick", cfg.LeaderboardTick, time.Hour},
 		{"AggroTick", cfg.AggroTick, time.Hour},
 		{"AggroChance", cfg.AggroChance, 0.20},
@@ -75,7 +74,6 @@ func TestLoadDefaults(t *testing.T) {
 		{"AutonomousSkipChance", cfg.AutonomousSkipChance, 0.90},
 		{"WordGameMode", cfg.WordGameMode, WordGameModeInterval},
 		{"WordGameInterval", cfg.WordGameInterval, 2 * time.Minute},
-		{"EnableClustering", cfg.EnableClustering, false},
 		// Both safety defaults are permissive-looking and are checked here so that
 		// changing either is a visible decision. An unset blocklist path is allowed
 		// (cmd/bot warns loudly), and writes are not paused by default because the

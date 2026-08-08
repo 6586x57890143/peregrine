@@ -1,3 +1,28 @@
+// Package clustering has NO CALLERS as of M6b, and is kept only as the input to M8.
+//
+// It is not dead by accident and it is not wired up waiting to be switched on. Three
+// things are true of it at once:
+//
+//  1. It has never worked. Cluster members are persisted with string keys and
+//     unmarshalled into map[int]float32, so every cluster fails to decode, and both
+//     consumers guarded that with `if err := json.Unmarshal(...); err == nil` and no
+//     else. It ran a full similarity walk every 24 hours inside a write transaction,
+//     against bbolt's single writer, ending in a destructive DeleteBucket plus
+//     CreateBucket, and produced data nothing has ever read (SPEC.md section 8,
+//     finding 27).
+//  2. It cannot be called any more. It takes a *bbolt.DB, and since M6b nothing
+//     outside internal/storage can hold one. That is deliberate: a consumer with a
+//     handle can nest a transaction, which is an unrecoverable hang (finding 1).
+//  3. It reads the name-topic bucket as a JSON map keyed by name, which the
+//     composite-key layout does not store, so it would find nothing even with the
+//     codec fixed.
+//
+// What is worth keeping is the algorithm: the heap-driven agglomerative merge and the
+// sparse cosine similarity, which run outside any transaction and are the part M8
+// moves into internal/clustering as a pure function over corpus types, with
+// content-hashed IDs and diff-based persistence through storage's blob API. The
+// member representation has to change with it, because interner ids depend on
+// insertion order and therefore mean nothing across processes.
 package clustering
 
 import (
