@@ -8,7 +8,7 @@ Sibling project to [merlin](../merlin), whose deployment conventions this repo f
 
 Mid-restructure. The bot works and runs, but it is being taken from a single 3,200-line `main.go` to a proper package layout one subsystem at a time, with a catalogue of known defects being closed along the way. See `SPEC.md` §8 for the defect list and §9 for the milestone order.
 
-**Milestones 0 through 4 are complete:** repo hygiene and CI/CD, the `cmd/bot` entrypoint, `internal/config`, the `internal/core` lifecycle, and `internal/text` plus `internal/filter`. The entrypoint, configuration, process lifecycle, tokenizer and filters are real; the generation engine and the safety gate are not yet. What is left sits in `internal/legacy`, which each later milestone empties one subsystem at a time.
+**Milestones 0 through 5 are complete:** repo hygiene and CI/CD, the `cmd/bot` entrypoint, `internal/config`, the `internal/core` lifecycle, `internal/text` plus `internal/filter`, and `internal/safety`. The entrypoint, configuration, process lifecycle, tokenizer, filters and both safety gates are real; the corpus layout and the generation engine are not yet. What is left sits in `internal/legacy`, which each later milestone empties one subsystem at a time.
 
 All three crash bugs are now closed: the shutdown WaitGroup race that could panic on exit (M3), the `*rand.Rand` shared across every message goroutine (M3), and the global vocabulary map written concurrently, which was a Go runtime *fatal error* rather than a recoverable panic (M4).
 
@@ -16,8 +16,10 @@ M3 also added the `GUILDS` intent, so the bot can use the server's own custom em
 
 Two things worth knowing before running it anywhere real:
 
-- **The safety gate is not in yet** (M5). Until it lands, moderation is bypassable: the historical backfill path learns messages the live filter blocked, unfiltered, minutes later. See `SPEC.md` §4 A1. Do not point this at a hostile channel yet.
+- **The safety gate is in as of M5**, and it is the reason the bot is closer to deployable than it was. `CheckLearn` sits inside `learnMessage`, so the backfill path that used to re-learn blocked messages minutes later is covered by construction; `CheckEmit` sits at the generation exit. Matching happens against a normalized form, so spacing, leet, homoglyphs, combining marks and zero-width characters no longer walk through. **Set `PEREGRINE_BLOCKLIST_PATH` before pointing it at a hostile channel:** without it the bot runs on the built-in baseline only and warns loudly at startup, and the operator list is where the threat and illegal-content patterns live.
 - **The corpus format changes in M6.** Anything learned before then is discarded rather than migrated, deliberately. See `SPEC.md` §3.4.
+
+Still open before this is genuinely safe to leave running: mentions are not suppressed (finding 8, M10), the corpus can still be poisoned by repetition because generation does not yet require author diversity (A6, M7), and `CheckEmit` covers the generation exit rather than all thirteen send sites (M10).
 
 ## Quick start
 

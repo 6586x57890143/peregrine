@@ -14,12 +14,17 @@ services:
       - .env
     volumes:
       - corpus:/data
-      # The blocklist mount lands with the safety gate in M5, as
-      #   - ./blocklist.txt:/blocklist.txt:ro
-      # It is deliberately absent until the code reads it: a bind whose source
-      # file does not exist makes Docker silently create a DIRECTORY at that
-      # path, which then fails to parse as a blocklist in a way that looks like
-      # a bug in the parser rather than a missing file.
+      # The blocklist, read-only, as data rather than baked into the image so the
+      # operator can edit it mid-incident without a rebuild. Uncomment once
+      # ./blocklist.txt exists, and set PEREGRINE_BLOCKLIST_PATH=/blocklist.txt.
+      #
+      # Still commented out rather than enabled by default, and the reason is a
+      # Docker behaviour worth knowing: a bind mount whose SOURCE does not exist
+      # makes Docker silently create a DIRECTORY at that path. The bot would then
+      # fail to open a directory as a file, which reads as a bug in the loader
+      # rather than as a missing file. Copy blocklist.example.txt first.
+      #
+      # - ./blocklist.txt:/blocklist.txt:ro
     restart: unless-stopped
 
 volumes:
