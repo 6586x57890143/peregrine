@@ -23,7 +23,7 @@ jobs:
     # "these tests silently skipped and nobody noticed" failure mode that
     # motivated merlin's service container cannot occur.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
@@ -63,7 +63,7 @@ jobs:
       contents: read
       pull-requests: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: gitleaks/gitleaks-action@v3
@@ -84,7 +84,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: No generated-text punctuation
         run: |
           # Patterns are written as UTF-8 byte escapes, not literal characters,
@@ -113,7 +113,7 @@ jobs:
     # model and a bundled ffmpeg; without the ignore file every build here ships
     # all of it into the builder context.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
       - name: Build image (no push)
         uses: docker/build-push-action@v7
@@ -127,7 +127,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
@@ -150,7 +150,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Skip cleanly rather than fail when the VPS secrets are not configured.
       # Without this the job fails on every single push to main until someone
