@@ -39,6 +39,7 @@ import (
 	"github.com/6586x57890143/peregrine/clustering"
 	"github.com/6586x57890143/peregrine/internal/config"
 	"github.com/6586x57890143/peregrine/internal/core"
+	"github.com/6586x57890143/peregrine/internal/text"
 	"github.com/6586x57890143/peregrine/voicenotes"
 	"github.com/6586x57890143/peregrine/wordgames"
 	"github.com/beevik/ntp"
@@ -138,21 +139,6 @@ type TranscriptionJob struct {
 type WeeklyStat struct {
 	Count         int       `json:"count"`
 	LastTimestamp time.Time `json:"last_timestamp"`
-}
-
-var (
-	vocab    = make(map[string]int)
-	revVocab = make([]string, 0)
-)
-
-func addToVocab(s string) int {
-	if idx, ok := vocab[s]; ok {
-		return idx
-	}
-	idx := len(revVocab)
-	vocab[s] = idx
-	revVocab = append(revVocab, s)
-	return idx
 }
 
 // ----- GLOBALS -----
@@ -1530,138 +1516,52 @@ func processChannelIncremental(ctx context.Context, s *discordgo.Session, ch *di
 //  Tokenizing & generation
 // -----------------------------------------------------------------------------
 
-// tokenRegex tokenizes words, punctuation, URLs, mentions, and emojis.
-var tokenRegex = regexp.MustCompile(`(?:https?|steam):\/\/\S+|<@!?&?\d+>|<#\d+>|<a?:\w+:\d+>|:\w+:|[\p{L}\p{N}\p{So}'’]+`)
-var urlRegex = regexp.MustCompile(`^(?:https?|steam):\/\/\S+$`)
-var emoteRegex = regexp.MustCompile(`^<a?:\w+:\d+>$`)
-var shortcodeRegex = regexp.MustCompile(`^:(\w+):$`)
+// The tokenizer, the similarity measure and the sentence cleaner now live in
+// internal/text, which is a leaf: no bbolt, no discordgo, no config. These
+// wrappers exist so the roughly seventy call sites in this package did not all
+// have to change in the same commit that moved the logic out. They disappear as
+// each subsystem moves.
+//
+// The regexes moved with them and are compiled once at package scope. Two were
+// being compiled per call, and the punctuation stripper inside the sentence
+// cleaner was compiled once per token per sentence, which is a regex compile on
+// the hot path of every single reply (SPEC.md section 8, finding 16).
 
-// tokenize splits a message into tokens, preserving URL casing and lowercasing others.
-// It uses a bytes.Buffer for efficient string building.
-func tokenize(msg string) []string {
-	tokens := tokenRegex.FindAllString(msg, -1)
-	processedTokens := make([]string, 0, len(tokens))
+func tokenize(msg string) []string { return text.Tokenize(msg) }
 
-	for _, token := range tokens {
-		if urlRegex.MatchString(token) {
-			processedTokens = append(processedTokens, token) // Keep URL case for URLs
-		} else {
-			processedTokens = append(processedTokens, strings.ToLower(token)) // Lowercase other tokens
+func toLowerCaseExceptURLs(s string) string { return text.LowerExceptURLs(s) }
+
+func sentenceSimilarity(a, b string) float64 { return text.Similarity(a, b) }
+
+// sessionEmoji resolves a :shortcode: against the guilds the session can see.
+//
+// This is the seam that took discordgo out of the sentence cleaner: internal/text
+// declares the minimal EmojiResolver interface it needs, and this satisfies it
+// structurally, so the cleaner is testable with a two-line fake instead of a
+// gateway connection.
+//
+// It walks s.State.Guilds, which was empty for the entire life of this bot because
+// the session never requested IntentsGuilds, so the resolver had never once
+// succeeded and peregrine had never spoken in the server's own emotes. M3 requests
+// the intent; this is the code that finally benefits (SPEC.md section 8, finding 7).
+type sessionEmoji struct{ s *discordgo.Session }
+
+func (e sessionEmoji) ResolveEmoji(name string) (string, bool) {
+	if e.s == nil || e.s.State == nil {
+		return "", false
+	}
+	for _, guild := range e.s.State.Guilds {
+		for _, emoji := range guild.Emojis {
+			if emoji.Name == name {
+				return emoji.MessageFormat(), true
+			}
 		}
 	}
-	return processedTokens
+	return "", false
 }
 
-// toLowerCaseExceptURLs converts a string to lowercase, but preserves the case of identified URLs.
-// This is an optimized helper to avoid repeated regex matching and string allocations
-// when only part of a token needs lowercasing.
-func toLowerCaseExceptURLs(input string) string {
-	if urlRegex.MatchString(input) {
-		return input
-	}
-	return strings.ToLower(input)
-}
-
-// sentenceSimilarity computes a simple Jaccard-like similarity on token sets.
-func sentenceSimilarity(a, b string) float64 {
-	wa := tokenize(a)
-	wb := tokenize(b)
-	setA := make(map[string]struct{})
-	setB := make(map[string]struct{})
-	for _, w := range wa {
-		setA[w] = struct{}{}
-	}
-	for _, w := range wb {
-		setB[w] = struct{}{}
-	}
-	inter := 0
-	for w := range setA {
-		if _, ok := setB[w]; ok {
-			inter++
-		}
-	}
-	union := len(setA) + len(setB) - inter
-	if union == 0 {
-		return 0
-	}
-	return float64(inter) / float64(union)
-}
-
-// cleanSentence preserves special tokens (URLs, mentions, emojis) while cleaning punctuation from regular words.
 func cleanSentence(s *discordgo.Session, str string) string {
-	str = strings.TrimSpace(str)
-	if str == "" {
-		return str
-	}
-
-	tokens := tokenize(str)
-	cleanedTokens := make([]string, 0, len(tokens))
-	var lastToken string
-
-	for _, token := range tokens {
-		// Resolve emote shortcodes
-		if matches := shortcodeRegex.FindStringSubmatch(token); len(matches) == 2 {
-			emojiName := matches[1]
-			var foundEmoji string
-			// Search for the emoji in all guilds the bot is in.
-			for _, guild := range s.State.Guilds {
-				for _, emoji := range guild.Emojis {
-					if emoji.Name == emojiName {
-						foundEmoji = emoji.MessageFormat()
-						break
-					}
-				}
-				if foundEmoji != "" {
-					break
-				}
-			}
-
-			resolvedToken := toLowerCaseExceptURLs(token) // Use helper to process token
-			if foundEmoji != "" {
-				resolvedToken = foundEmoji
-			}
-
-			if resolvedToken != lastToken {
-				cleanedTokens = append(cleanedTokens, resolvedToken)
-				lastToken = resolvedToken
-			}
-			continue
-		}
-
-		// Preserve URLs, mentions, and full emotes.
-		isSpecial := urlRegex.MatchString(token) || strings.HasPrefix(token, "<@") || strings.HasPrefix(token, "<#") || emoteRegex.MatchString(token)
-		if isSpecial {
-			transformedToken := token
-			// FxEmbed transformation for Twitter/X links.
-			if urlRegex.MatchString(token) {
-				if strings.Contains(transformedToken, "://x.com/") || strings.Contains(transformedToken, "://twitter.com/") {
-					transformedToken = strings.Replace(transformedToken, "://x.com/", "://fxtwitter.com/", 1)
-					transformedToken = strings.Replace(transformedToken, "://twitter.com/", "://fxtwitter.com/", 1)
-				}
-			}
-
-			// Avoid immediate duplicates of special tokens.
-			if transformedToken != lastToken {
-				cleanedTokens = append(cleanedTokens, transformedToken)
-				lastToken = transformedToken
-			}
-			continue
-		}
-
-		// For regular words, remove any punctuation.
-		cleanedWord := regexp.MustCompile(`[.,!?]`).ReplaceAllString(token, "")
-		if cleanedWord == "" {
-			continue
-		}
-
-		// Avoid immediate duplicates of regular words.
-		if cleanedWord != lastToken {
-			cleanedTokens = append(cleanedTokens, cleanedWord)
-			lastToken = cleanedWord
-		}
-	}
-
-	return strings.Join(cleanedTokens, " ")
+	return text.CleanSentence(str, sessionEmoji{s: s})
 }
 
 // applyEdgyStyle adds a configurable, context-aware "edgy" flavor to sentences.
@@ -1720,7 +1620,7 @@ func applyEdgyStyle(s string, isAboutName bool) string {
 }
 
 // findBestSeed analyzes the prompt and context to find the highest-quality starting seed.
-func findBestSeed(tx *bbolt.Tx, promptWords, recentWords, recognizedNames []string) string {
+func findBestSeed(tx *bbolt.Tx, in *text.Interner, promptWords, recentWords, recognizedNames []string) string {
 	type candidate struct {
 		key    int
 		weight float64
@@ -1745,7 +1645,7 @@ func findBestSeed(tx *bbolt.Tx, promptWords, recentWords, recognizedNames []stri
 	// 1. High Priority: Use Concept Clusters for seed generation
 	if conceptClusterB := tx.Bucket([]byte(clustering.ConceptClusterBucket)); conceptClusterB != nil {
 		for _, word := range promptWords {
-			wordIdx, ok := vocab[word]
+			wordIdx, ok := in.ID(word)
 			if !ok {
 				continue
 			}
@@ -1771,7 +1671,7 @@ func findBestSeed(tx *bbolt.Tx, promptWords, recentWords, recognizedNames []stri
 		for i := 0; i <= len(promptWords)-n; i++ {
 			key := toLowerCaseExceptURLs(strings.Join(promptWords[i:i+n], " "))
 			if markovB.Get([]byte(key)) != nil {
-				addCandidate(addToVocab(key), float64(n*30))
+				addCandidate(in.Intern(key), float64(n*30))
 			}
 		}
 	}
@@ -1790,7 +1690,7 @@ func findBestSeed(tx *bbolt.Tx, promptWords, recentWords, recognizedNames []stri
 						log.Printf("[WARN] findBestSeed: failed to unmarshal cluster data for key %s: %v", k, err)
 						continue
 					}
-					addCandidate(addToVocab(associatedTopic), 25.0+math.Sqrt(float64(clusterData.Count)))
+					addCandidate(in.Intern(associatedTopic), 25.0+math.Sqrt(float64(clusterData.Count)))
 				}
 			}
 		}
@@ -1808,7 +1708,7 @@ func findBestSeed(tx *bbolt.Tx, promptWords, recentWords, recognizedNames []stri
 				}
 				for associatedWord, data := range wordAssoc {
 					if associatedWord != topic && data.Count > 1 {
-						addCandidate(addToVocab(associatedWord), 18.0+math.Sqrt(float64(data.Count)))
+						addCandidate(in.Intern(associatedWord), 18.0+math.Sqrt(float64(data.Count)))
 					}
 				}
 			}
@@ -1830,7 +1730,7 @@ func findBestSeed(tx *bbolt.Tx, promptWords, recentWords, recognizedNames []stri
 						log.Printf("[WARN] findBestSeed: failed to unmarshal cluster data for key %s: %v", k, err)
 						continue
 					}
-					addCandidate(addToVocab(associatedTopic), 15.0+math.Sqrt(float64(clusterData.Count)))
+					addCandidate(in.Intern(associatedTopic), 15.0+math.Sqrt(float64(clusterData.Count)))
 				}
 			}
 		}
@@ -1846,7 +1746,7 @@ func findBestSeed(tx *bbolt.Tx, promptWords, recentWords, recognizedNames []stri
 			} else {
 				for topic, data := range topicAssoc {
 					if markovB.Get([]byte(topic)) != nil {
-						addCandidate(addToVocab(topic), 10.0+math.Sqrt(float64(data.Count)))
+						addCandidate(in.Intern(topic), 10.0+math.Sqrt(float64(data.Count)))
 					}
 				}
 			}
@@ -1857,7 +1757,7 @@ func findBestSeed(tx *bbolt.Tx, promptWords, recentWords, recognizedNames []stri
 	for _, word := range promptWords {
 		lw := toLowerCaseExceptURLs(word)
 		if markovB.Get([]byte(lw)) != nil {
-			addCandidate(addToVocab(lw), 15.0)
+			addCandidate(in.Intern(lw), 15.0)
 		}
 	}
 
@@ -1866,7 +1766,7 @@ func findBestSeed(tx *bbolt.Tx, promptWords, recentWords, recognizedNames []stri
 		for i := 0; i <= len(recentWords)-n; i++ {
 			key := toLowerCaseExceptURLs(strings.Join(recentWords[i:i+n], " "))
 			if markovB.Get([]byte(key)) != nil {
-				addCandidate(addToVocab(key), float64(n))
+				addCandidate(in.Intern(key), float64(n))
 			}
 		}
 	}
@@ -1896,13 +1796,13 @@ func findBestSeed(tx *bbolt.Tx, promptWords, recentWords, recognizedNames []stri
 		for _, c := range candidates {
 			r_val -= c.weight
 			if r_val <= 0 {
-				return revVocab[c.key]
+				return in.Word(c.key)
 			}
 		}
-		return revVocab[candidates[len(candidates)-1].key]
+		return in.Word(candidates[len(candidates)-1].key)
 	}
 
-	return revVocab[candidates[0].key]
+	return in.Word(candidates[0].key)
 }
 
 // performClustering runs an agglomerative clustering algorithm to merge and refine concepts.
@@ -1914,7 +1814,7 @@ func performClustering() {
 }
 
 // findJumpWord attempts to find a related word when generation hits a dead end.
-func findJumpWord(tx *bbolt.Tx, promptWords, currentWords, recognizedNames []string) string {
+func findJumpWord(tx *bbolt.Tx, in *text.Interner, promptWords, currentWords, recognizedNames []string) string {
 	nameTopicB := tx.Bucket([]byte(clustering.NameTopicBucket))
 	topicWordB := tx.Bucket([]byte(TopicWordBucket))
 	if topicWordB == nil || nameTopicB == nil {
@@ -1951,7 +1851,7 @@ func findJumpWord(tx *bbolt.Tx, promptWords, currentWords, recognizedNames []str
 	// 2. Concept Cluster Pivot: If we're stuck, try to jump to a related concept.
 	if conceptClusterB := tx.Bucket([]byte(clustering.ConceptClusterBucket)); conceptClusterB != nil {
 		for _, word := range currentWords {
-			wordIdx, ok := vocab[word]
+			wordIdx, ok := in.ID(word)
 			if !ok {
 				continue
 			}
@@ -1963,8 +1863,8 @@ func findJumpWord(tx *bbolt.Tx, promptWords, currentWords, recognizedNames []str
 						// Found a cluster, pick a random member to jump to
 						for memberIdx := range cluster.Members {
 							if memberIdx != wordIdx { // Avoid jumping to the same word
-								log.Printf("[INFO] Generation stuck, jumping via concept cluster: '%s' -> '%s'", word, revVocab[memberIdx])
-								return revVocab[memberIdx]
+								log.Printf("[INFO] Generation stuck, jumping via concept cluster: '%s' -> '%s'", word, in.Word(memberIdx))
+								return in.Word(memberIdx)
 							}
 						}
 					}
@@ -2044,6 +1944,7 @@ func pickPromptAwareNextWithSimilarity(
 	maxWords int, // NEW: pass max words for this sentence
 	currentTopic string, // NEW: pass current topic
 	coreTopics map[int]float64, // For Topic Gravity
+	in *text.Interner, // per-call token interner; see internal/text.Interner
 	currentSentence []string, // NEW: Pass current sentence for immediate repetition check
 ) string {
 	nextMap, _ := getNextMap(prefix)
@@ -2088,7 +1989,7 @@ func pickPromptAwareNextWithSimilarity(
 		}
 		// Cache associations for core prompt topics (for Topic Gravity)
 		for topicIdx := range coreTopics {
-			topic := revVocab[topicIdx]
+			topic := in.Word(topicIdx)
 			if _, exists := topicWordAssocCache[topic]; !exists {
 				if v := topicWordB.Get([]byte(topic)); v != nil {
 					var wordAssoc map[string]WordPosData
@@ -2107,7 +2008,7 @@ func pickPromptAwareNextWithSimilarity(
 		// --- Topic Gravity (New Sophisticated Version) ---
 		topicGravity := 1.0
 		for topicIdx, significance := range coreTopics {
-			topic := revVocab[topicIdx]
+			topic := in.Word(topicIdx)
 			if wordAssoc, ok := topicWordAssocCache[topic]; ok {
 				if data, ok := wordAssoc[lw]; ok {
 					// 1. Strength Score: How strong is the link between the topic and this candidate word?
@@ -2369,6 +2270,20 @@ func generateSentenceWithContext(s *discordgo.Session, prompt string, isRoast bo
 
 // generateSentenceAttempt is a helper that contains the core sentence generation logic.
 func generateSentenceAttempt(tx *bbolt.Tx, promptWords, recentWords []string, originalPrompt string, isRoast bool) ([]string, []string, map[string]WordPosData) {
+	// One interner per attempt, created here and discarded with the attempt.
+	//
+	// This replaces a package-level map and slice that every per-message goroutine
+	// wrote to with no synchronization, which is a concurrent map write: in Go that
+	// is a runtime fatal error, not a panic, so no recover and no deferred database
+	// close (SPEC.md section 8, finding 2). It was also never pruned, so it held
+	// every distinct token the process had ever seen.
+	//
+	// Per-attempt is correct rather than merely safe: the ids only have to be
+	// consistent within the one attempt that uses them, because nothing persists
+	// them. Nothing may start persisting them either, for the reason recorded on
+	// text.Interner.
+	in := text.NewInterner()
+
 	sentence := []string{}
 	usedWords := make(map[string]int)
 	generatedNgrams := make(map[string]struct{}) // Track generated n-grams
@@ -2398,7 +2313,7 @@ func generateSentenceAttempt(tx *bbolt.Tx, promptWords, recentWords []string, or
 				_ = json.Unmarshal(v, &count)
 			}
 			// Use the log of the count to get a significance score that doesn't grow too quickly.
-			coreTopics[addToVocab(w)] = math.Log(float64(count) + 1)
+			coreTopics[in.Intern(w)] = math.Log(float64(count) + 1)
 		}
 	}
 
@@ -2427,7 +2342,7 @@ func generateSentenceAttempt(tx *bbolt.Tx, promptWords, recentWords []string, or
 	}
 
 	// Determine seed using the new intelligent algorithm
-	seed := findBestSeed(tx, promptWords, recentWords, recognizedNames)
+	seed := findBestSeed(tx, in, promptWords, recentWords, recognizedNames)
 	if seed == "" || seed == "<START>" {
 		if len(promptWords) > 0 {
 			seed = promptWords[0]
@@ -2479,7 +2394,8 @@ func generateSentenceAttempt(tx *bbolt.Tx, promptWords, recentWords []string, or
 				maxWords,      // NEW: pass max words
 				currentTopic,  // NEW: pass current topic
 				coreTopics,    // Pass core topics for Topic Gravity
-				sentence,      // Pass current sentence for immediate repetition check
+				in,
+				sentence, // Pass current sentence for immediate repetition check
 			)
 			if next != "" {
 				break
@@ -2495,7 +2411,7 @@ func generateSentenceAttempt(tx *bbolt.Tx, promptWords, recentWords []string, or
 
 		if next == "" {
 			// Creative Jump: If we hit a dead end, try to find a related word to jump to.
-			jumpWord := findJumpWord(tx, promptWords, sentence, recognizedNames)
+			jumpWord := findJumpWord(tx, in, promptWords, sentence, recognizedNames)
 			if jumpWord != "" {
 				next = jumpWord
 			} else {

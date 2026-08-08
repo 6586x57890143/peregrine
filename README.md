@@ -8,9 +8,11 @@ Sibling project to [merlin](../merlin), whose deployment conventions this repo f
 
 Mid-restructure. The bot works and runs, but it is being taken from a single 3,200-line `main.go` to a proper package layout one subsystem at a time, with a catalogue of known defects being closed along the way. See `SPEC.md` §8 for the defect list and §9 for the milestone order.
 
-**Milestones 0 (repo hygiene, docs, CI/CD), 1 (the `cmd/bot` entrypoint), 2 (`internal/config`) and 3 (`internal/core` lifecycle) are complete.** The entrypoint, the configuration and the process lifecycle are real; the bot's actual behavior is not yet. Everything else still sits unchanged in `internal/legacy`, which each later milestone empties one subsystem at a time.
+**Milestones 0 through 4 are complete:** repo hygiene and CI/CD, the `cmd/bot` entrypoint, `internal/config`, the `internal/core` lifecycle, and `internal/text` plus `internal/filter`. The entrypoint, configuration, process lifecycle, tokenizer and filters are real; the generation engine and the safety gate are not yet. What is left sits in `internal/legacy`, which each later milestone empties one subsystem at a time.
 
-M3 closed the two crash bugs: the shutdown WaitGroup race that could panic the process on exit, and the `*rand.Rand` shared across every message goroutine. It also added the `GUILDS` intent, which means the bot can use the server's own custom emotes for the first time; that resolver had never once succeeded.
+All three crash bugs are now closed: the shutdown WaitGroup race that could panic on exit (M3), the `*rand.Rand` shared across every message goroutine (M3), and the global vocabulary map written concurrently, which was a Go runtime *fatal error* rather than a recoverable panic (M4).
+
+M3 also added the `GUILDS` intent, so the bot can use the server's own custom emotes for the first time; that resolver had never once succeeded. M4 found that the same is true of concept clustering, for a different reason, and turned it off by default: see `SPEC.md` §8 finding 27.
 
 Two things worth knowing before running it anywhere real:
 
