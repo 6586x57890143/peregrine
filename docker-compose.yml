@@ -1,0 +1,26 @@
+# Local development. Builds from the working tree instead of pulling a
+# published image; see docker-compose.prod.yml for what runs on the VPS.
+#
+# Unlike merlin there is no database service to depend on: bbolt is an embedded
+# pure-Go library, so the corpus is a file inside this container's volume and
+# there is nothing to wait for at startup and no connect-retry loop.
+services:
+  bot:
+    build: .
+    read_only: true
+    cap_drop:
+      - ALL
+    env_file:
+      - .env
+    volumes:
+      - corpus:/data
+      # The blocklist mount lands with the safety gate in M5, as
+      #   - ./blocklist.txt:/blocklist.txt:ro
+      # It is deliberately absent until the code reads it: a bind whose source
+      # file does not exist makes Docker silently create a DIRECTORY at that
+      # path, which then fails to parse as a blocklist in a way that looks like
+      # a bug in the parser rather than a missing file.
+    restart: unless-stopped
+
+volumes:
+  corpus:

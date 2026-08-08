@@ -1,0 +1,36 @@
+# Secrets and operator-local config. Only .env.example is committed.
+.env
+
+# The blocklist is data, not source. Committing an explicit slur and
+# illegal-content pattern list would turn this repo into a searchable copy of
+# one, and would make every addition a rebuild plus a public diff instead of
+# an edit the operator can make during an incident. Only the example is
+# committed; see SPEC.md's safety section.
+blocklist.txt
+
+# The corpus. bbolt keeps everything in one file, it reaches hundreds of MB
+# within weeks, and it holds learned user content, so it is neither
+# committable nor something anyone should be able to fetch from the repo.
+# Production starts empty on a named volume; see docker-compose.prod.yml.
+markov.db
+markov.db.lock
+*.db.tmp
+backups/
+
+# Whisper model and the ffmpeg/whisper binaries. ggml-small.bin is 465 MiB,
+# well over GitHub's hard 100 MiB per-file limit, so a commit containing it
+# cannot be pushed at all and the only remedy is rewriting history. ffmpeg.exe
+# is another 96 MiB. Transcription is a Windows-local development feature and
+# these assets are fetched by hand; see README's transcription section.
+voicenotes/models/
+voicenotes/bin/
+voicenotes/audio/
+
+# Build output
+/bin/
+/dist/
+/peregrine
+/peregrine.exe
+
+*.log
+AI_CODE_REVIEW.md

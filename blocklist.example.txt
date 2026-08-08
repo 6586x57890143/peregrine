@@ -1,0 +1,44 @@
+# Copy to blocklist.txt and populate. The real file is gitignored on purpose:
+# see PEREGRINE_BLOCKLIST_PATH in .env.example and the safety section of SPEC.md.
+#
+# FORMAT
+#   <category> <TAB or spaces> <pattern>
+#
+# Blank lines and lines starting with # are ignored. Patterns are Go regexps,
+# matched case-insensitively against the NORMALIZED form of the text, never the
+# raw form. Normalization applies NFKC, strips zero-width characters and
+# combining marks, folds confusable homoglyphs to ASCII, and collapses repeated
+# characters and intra-word separators.
+#
+# Write patterns against that normalized form. This is the whole reason the
+# normalizer exists: the previous filter matched raw text with \b boundaries and
+# only [i1]/[a@]/[o0] leet classes, so "n i g g a", a Cyrillic lookalike, or a
+# zero-width joiner walked straight through it. You do not need to enumerate
+# leet variants or spacing tricks here; the normalizer already removed them.
+#
+# CATEGORIES
+#   slur     Dropped on learn, blocked on emit. The bulk of the list.
+#   illegal  Same, plus an operator alert. For content where the operator's
+#            exposure is legal rather than reputational: threats of violence,
+#            and CSAM-adjacent terms. Populate this deliberately and keep it
+#            narrow, because every entry here pages a human.
+#   spam     Dropped on learn only. Not blocked on emit, because these are
+#            nuisance patterns rather than harm: advertising, invite spam.
+#
+# BOTH DIRECTIONS, AND WHY THAT IS NOT REDUNDANT
+# Entries apply to learning AND to generation. Filtering the corpus cannot bound
+# the output even in principle: a Markov chain composes novel sequences from
+# n-grams learned separately, so fragments that were individually innocuous can
+# join into something the operator has to answer for. Input filtering lowers the
+# rate; only the output gate bounds the result.
+
+# --- examples, non-explicit, replace with the real list -------------------
+
+slur      \bexamplesluronex?\b
+slur      \banotherexampleslur\b
+
+illegal   \b(kill|shoot|stab)\s+(you|him|her|them|everyone)\b
+illegal   \bhow\s+to\s+(build|make)\s+a\s+(bomb|pipe\s*bomb)\b
+
+spam      \b(discord\.gg|discordapp\.com/invite)/\S+
+spam      \bfree\s+(nitro|robux|vbucks)\b

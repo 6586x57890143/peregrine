@@ -1,0 +1,58 @@
+services:
+  bot:
+    # Pinned to the exact commit CI built, not :latest. Rolling back is then
+    # editing one line in deployed-tag.env and re-running compose, instead of
+    # hoping a mutable tag still points where you think it does. The default
+    # keeps a hand-run `docker compose up` working on a host that has never
+    # been deployed to. See README's Runbook.
+    image: ghcr.io/6586x57890143/peregrine:${PEREGRINE_IMAGE_TAG:-latest}
+    read_only: true
+    cap_drop:
+      - ALL
+    env_file:
+      - .env
+    volumes:
+      # The corpus. A named volume rather than a bind so its ownership matches
+      # the image's nonroot uid, which is what /data was chowned to in the
+      # Dockerfile. PEREGRINE_DB_PATH must point inside here: with
+      # read_only: true a relative path resolves against the distroless working
+      # directory and bbolt.Open fails.
+      - corpus:/data
+      # Backups deliberately land on a host bind, OUTSIDE the corpus volume, so
+      # that losing or accidentally removing that volume does not take the
+      # backups with it.
+      - ./backups:/backups
+      # The blocklist mount lands with the safety gate in M5, as
+      #   - ./blocklist.txt:/blocklist.txt:ro
+      # Absent until the code reads it, because a bind with a missing source
+      # file makes Docker create a directory at that path instead.
+    restart: unless-stopped
+    # bbolt mmaps the whole corpus. Mapped clean pages are reclaimable, so a
+    # 1 GB corpus does not need 1 GB of resident memory, but a write
+    # transaction dirties pages that do count against this limit. Raise it if
+    # the corpus grows past a few hundred MB, and watch for the OOM killer
+    # rather than guessing.
+    mem_limit: 512m
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+# No pgbackup sidecar, and the omission is deliberate rather than an oversight.
+# Merlin's works because pg_dump is a client asking the server for a consistent
+# snapshot. There is no equivalent for bbolt, and the naive translation is
+# actively dangerous: bbolt is a single mmap'd file updated by copy-on-write
+# page writes plus a meta-page flip at commit, so a byte-level `cp` taken from
+# outside the process can capture a state between the page write and the flip,
+# or mid-remap while the file is being grown. The result either fails to open
+# or opens and silently presents a torn state, and it will usually appear to
+# work, which is the worst property a backup can have. A sidecar cannot take a
+# proper snapshot either, because bbolt holds an exclusive flock on the file.
+#
+# The correct mechanism is in-process and lives in the bot: a read transaction
+# calling tx.CopyFile, which is consistent by construction and does not block
+# writers. See PEREGRINE_BACKUP_* in .env.example.
+volumes:
+  corpus:
