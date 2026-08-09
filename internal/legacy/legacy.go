@@ -38,6 +38,7 @@ import (
 	"github.com/6586x57890143/peregrine/internal/config"
 	"github.com/6586x57890143/peregrine/internal/core"
 	"github.com/6586x57890143/peregrine/internal/corpus"
+	"github.com/6586x57890143/peregrine/internal/markov"
 	"github.com/6586x57890143/peregrine/internal/safety"
 	"github.com/6586x57890143/peregrine/internal/storage"
 	"github.com/6586x57890143/peregrine/internal/text"
@@ -62,19 +63,38 @@ import (
 // out of this package it takes its own config fields with it as struct fields on
 // a real type. Nothing here writes to it after Run sets it.
 //
-// Creativity is deliberately NOT here and gets no environment variable. It is
-// applied as an exponent of 1/(Creativity+0.01), so at its 0.75 default the
-// exponent is 1.316, which sharpens the distribution: the knob's arithmetic
-// inverts its own name and cannot reach the interesting half of its own range.
-// Exposing that to an operator would invite tuning something broken. M7 replaces
-// it with PEREGRINE_TEMPERATURE once the scoring is normalized and the dial
-// actually moves. ContextWindow and CoherencyBalance are gone entirely: they were
-// declared and never read.
+// The Creativity constant that used to sit here is GONE as of M7a, along with the
+// scoring it was an exponent of. It was applied as pow(score, 1/(Creativity+0.01)),
+// so at its 0.75 default the exponent was 1.316, which sharpened the distribution:
+// the knob's arithmetic inverted its own name and could never reach the half of its
+// own range that would add chaos. M2 deliberately refused to promote it for that
+// reason, and PEREGRINE_TEMPERATURE replaces it now that the scoring underneath is a
+// normalized log-probability and the dial actually moves. There is deliberately no
+// PEREGRINE_CREATIVITY. ContextWindow and CoherencyBalance are gone entirely: they
+// were declared and never read.
 var cfg *config.Config
 
-// Creativity is the old inverse-temperature exponent, left as a constant because
-// it is not fit to be configuration. See the comment on cfg.
-const Creativity = 0.75
+// genParams turns the config into the engine's dials.
+//
+// There is deliberately no package-level *markov.Generator, and the reason is the
+// seam rather than style: a Generator holds a markov.Corpus, which here is a
+// *storage.Reader BOUND TO ONE TRANSACTION. A Generator that outlived its
+// transaction would hold a Reader whose transaction had closed, which is the class of
+// bug the Reader type exists to make unwritable. So a Generator is constructed inside
+// each store.View, which costs one small struct allocation per reply and cannot be
+// wrong.
+func genParams() markov.Params {
+	return markov.Params{
+		MaxNGram:           cfg.MaxNGram,
+		Temperature:        cfg.Temperature,
+		TopK:               cfg.TopK,
+		TopP:               cfg.TopP,
+		KNDiscount:         cfg.KNDiscount,
+		KNRawMix:           cfg.KNRawMix,
+		MinDistinctAuthors: cfg.MinDistinctAuthors,
+		PromptRelevance:    cfg.PromptRelevanceBoost,
+	}
+}
 
 // Four local types are gone here, and they are worth naming because each was a
 // duplicate of something internal/corpus now owns.
@@ -1391,7 +1411,11 @@ func tokenize(msg string) []string { return text.Tokenize(msg) }
 
 func toLowerCaseExceptURLs(s string) string { return text.LowerExceptURLs(s) }
 
-func sentenceSimilarity(a, b string) float64 { return text.Similarity(a, b) }
+// The sentenceSimilarity wrapper that sat here is gone. Its only caller was the
+// prompt-gravity term in the old scorer, which is internal/markov's now and calls
+// text.Similarity directly. The linter reporting it unused is how that was confirmed
+// rather than assumed, which is the same way M6b established that filter.go's last two
+// wrappers existed only for the cleanup pass.
 
 // sessionEmoji resolves a :shortcode: against the guilds the session can see.
 //
@@ -1704,299 +1728,6 @@ func findJumpWord(r *storage.Reader, promptWords, currentWords, recognizedNames 
 	return ""
 }
 
-// pickPromptAwareNextWithSimilarity picks the next word considering prompt similarity and context.
-func pickPromptAwareNextWithSimilarity(
-	r *storage.Reader,
-	prefix string,
-	fullPrompt string,
-	recentWords []string,
-	used map[string]int,
-	generatedNgrams map[string]struct{},
-	aggregatedAssoc map[string]corpus.TopicAssoc,
-	isRoast bool,
-	sentenceLength int, // current sentence length
-	maxWords int, // max words for this sentence
-	currentTopic string,
-	coreTopics map[int]float64, // For Topic Gravity
-	in *text.Interner, // per-call token interner; see internal/text.Interner
-	currentSentence []string, // for the immediate repetition check
-) string {
-	// The Reader replaces four *bbolt.Bucket parameters and the getNextMap call that
-	// opened its own transaction. The buckets were passed down because the helper
-	// could not be trusted to look them up without nesting; that whole hazard is gone.
-	successors, err := r.Successors(prefix)
-	if err != nil || len(successors) == 0 {
-		return ""
-	}
-
-	type cand struct {
-		word   string
-		weight float64
-	}
-	cands := make([]cand, 0, len(successors))
-
-	promptWords := tokenize(fullPrompt)
-	promptSet := make(map[string]struct{}, len(promptWords))
-	for _, w := range promptWords {
-		promptSet[w] = struct{}{}
-	}
-
-	recentSet := make(map[string]struct{}, len(recentWords))
-	for _, w := range recentWords {
-		recentSet[toLowerCaseExceptURLs(w)] = struct{}{} // Use helper
-	}
-
-	curPos := float64(sentenceLength) / float64(maxWords) // Use actual sentence progress
-	// NEW: momentum factor, grows as we move forward to encourage linguistic continuity
-	momentum := math.Min(1.0, curPos*1.2+0.1)
-
-	// Pre-load all topic-word associations needed for this generation round to avoid
-	// repeated DB access.
-	topicWordAssocCache := make(map[string]map[string]corpus.TopicAssoc)
-	loadAssoc := func(topic string) {
-		if _, exists := topicWordAssocCache[topic]; exists {
-			return
-		}
-		if assoc, err := r.TopicWordsFor(topic); err == nil {
-			topicWordAssocCache[topic] = assoc
-		}
-	}
-	// Aggregated name topics, then core prompt topics for Topic Gravity.
-	for topic := range aggregatedAssoc {
-		loadAssoc(topic)
-	}
-	for topicIdx := range coreTopics {
-		loadAssoc(in.Word(topicIdx))
-	}
-
-	for _, succ := range successors {
-		lw := toLowerCaseExceptURLs(succ.Token)
-		score := float64(succ.Count)
-
-		// --- Topic Gravity (New Sophisticated Version) ---
-		topicGravity := 1.0
-		for topicIdx, significance := range coreTopics {
-			topic := in.Word(topicIdx)
-			if wordAssoc, ok := topicWordAssocCache[topic]; ok {
-				if data, ok := wordAssoc[lw]; ok {
-					// 1. Strength Score: How strong is the link between the topic and this candidate word?
-					strengthScore := math.Sqrt(float64(data.Count))
-
-					// 2. Positional Score: Does this word tend to appear in the right place relative to the topic?
-					distance := math.Abs(curPos - data.MeanPosition())
-					posScore := math.Exp(-distance * 5.0) // Exponential decay based on distance
-
-					// Combine scores: strength * position * topic significance
-					topicGravity += strengthScore * posScore * significance
-				}
-			}
-		}
-		score *= topicGravity
-		// --- End Topic Gravity ---
-
-		// Roasty flavor boost
-		if isRoast {
-			roastyWords := map[string]float64{
-				toLowerCaseExceptURLs("dumbass"):  5.0,
-				toLowerCaseExceptURLs("idiot"):    5.0,
-				toLowerCaseExceptURLs("loser"):    4.0,
-				toLowerCaseExceptURLs("clown"):    4.0,
-				toLowerCaseExceptURLs("cringe"):   3.0,
-				toLowerCaseExceptURLs("pathetic"): 3.0,
-				toLowerCaseExceptURLs("weak"):     2.0,
-				toLowerCaseExceptURLs("sad"):      2.0,
-				toLowerCaseExceptURLs("cope"):     2.0,
-				toLowerCaseExceptURLs("seethe"):   2.0,
-				toLowerCaseExceptURLs("mald"):     2.0,
-				toLowerCaseExceptURLs("ratio"):    1.5,
-				toLowerCaseExceptURLs("lmao"):     1.0,
-				toLowerCaseExceptURLs("lol"):      1.0,
-			}
-			if boost, ok := roastyWords[lw]; ok {
-				score *= (1.0 + boost)
-			}
-		}
-
-		// recognized name boost (moderated). IsName rather than Name, because this runs
-		// once per candidate per step and only needs the yes or no: decoding the record
-		// would put a JSON unmarshal in the innermost loop of generation.
-		if r.IsName(lw) {
-			score *= 1.2
-		}
-
-		// global topic boost (moderated)
-		//
-		// This now sees short words. incTopicInTx silently dropped anything under
-		// three characters, so the count for "ok", "no" and "wtf" was permanently
-		// zero and this term contributed nothing for much of the vocabulary of a
-		// server that talks in short interjections (SPEC.md section 8, G10).
-		score += math.Sqrt(float64(r.TopicCount(lw))) * 0.3
-
-		// aggregated name-topic weighting (now hierarchical and cached)
-		if len(aggregatedAssoc) > 0 {
-			for topic, topicData := range aggregatedAssoc {
-				distanceToTopic := math.Abs(curPos - topicData.MeanPosition())
-				topicPosScore := math.Exp(-distanceToTopic * 3)
-
-				if topicPosScore > 0.1 {
-					if wordAssoc, ok := topicWordAssocCache[topic]; ok {
-						if wordPos, ok := wordAssoc[lw]; ok {
-							distanceToWordInTopic := math.Abs(curPos - wordPos.MeanPosition())
-							wordPosScore := math.Exp(-distanceToWordInTopic * 4)
-							score += math.Sqrt(float64(wordPos.Count)) * 0.8 * topicPosScore * wordPosScore
-						}
-					}
-				}
-			}
-		}
-
-		// Smooth topic transition: bias towards words in the current topic cluster
-		if currentTopic != "" {
-			if wordAssoc, ok := topicWordAssocCache[currentTopic]; ok {
-				if _, ok := wordAssoc[lw]; ok {
-					score *= 1.5 // Boost words within the current topic
-				}
-			}
-		}
-
-		// prompt relevance boost (unchanged)
-		if _, ok := promptSet[lw]; ok {
-			score += cfg.PromptRelevanceBoost
-		}
-
-		// recent context nudge (stronger)
-		if _, ok := recentSet[lw]; ok {
-			score *= 1.25 // Increased multiplier from 1.05 to 1.25
-		}
-
-		// repetition penalty (stronger)
-		if used[lw] > 0 {
-			score /= math.Pow(2.2, float64(used[lw])) // Increased penalty from 1.6 to 2.2
-		}
-
-		// Immediate sentence repetition check (NEW)
-		for i := len(currentSentence) - 1; i >= 0 && i >= len(currentSentence)-5; i-- { // Check last 5 words
-			if toLowerCaseExceptURLs(currentSentence[i]) == lw {
-				score *= 0.01 // Heavily penalize immediate repetition within the sentence
-				break
-			}
-		}
-
-		// N-gram repetition penalty
-		// Check for 1-gram (word) repetition
-		if _, found := generatedNgrams[lw]; found {
-			score *= 0.5 // Penalty for repeating a word
-		}
-		// Check for 2-gram repetition
-		if len(prefix) > 0 {
-			twoGram := toLowerCaseExceptURLs(prefix + " " + lw)
-			if _, found := generatedNgrams[twoGram]; found {
-				score *= 0.1 // Heavy penalty for repeating a 2-gram
-			}
-		}
-		// Check for 3-gram repetition
-		if len(prefix) > 0 {
-			words := strings.Fields(prefix)
-			if len(words) >= 2 {
-				threeGram := toLowerCaseExceptURLs(strings.Join(words[len(words)-2:], " ") + " " + lw)
-				if _, found := generatedNgrams[threeGram]; found {
-					score *= 0.01 // Very heavy penalty for repeating a 3-gram
-				}
-			}
-		}
-
-		// Semantic grounding: encourage words that maintain semantic flow
-		// Positional grounding: encourage words that fit typical sentence structure at current position
-		// These are implicitly handled by the markov chain probabilities and topic/name associations
-		// as well as the prompt gravity and momentum factors. Further explicit implementation
-		// would require more advanced NLP techniques (e.g., word embeddings, part-of-speech tagging)
-		// which are beyond the scope of a simple Markov bot without additional libraries.
-
-		// slight punctuation penalty
-		// Removed as punctuation is no longer desired in output.
-
-		// Prompt Gravity: Dynamically pull the sentence back towards the prompt's topic.
-		currentSentenceFragment := prefix + " " + lw
-		gravity := sentenceSimilarity(currentSentenceFragment, fullPrompt)
-		if gravity > 0.05 { // Only apply if there's a meaningful similarity
-			score *= (1.0 + gravity*2.5) // Apply a strong, compounding bonus for staying on topic.
-		}
-
-		// stochastic jitter to reduce deterministic loops
-		score *= 0.9 + 0.2*rand.Float64() // ±10% variation
-
-		// Penalize the <end> token heavily if the sentence is short.
-		if lw == "<end>" && curPos < 0.4 { // curPos is an approximation of sentence progress (0.0 to 1.0)
-			score *= 0.1 // Drastically reduce the chance of ending early
-		}
-
-		// early <END> penalty
-		// Removed as punctuation is no longer desired in output.
-
-		// === NEW NATURAL FLOW HEURISTICS ===
-		// discourage early punctuation / closure
-		// Removed as punctuation is no longer desired in output.
-		// discourage mid-sequence stop words if too repetitive
-		if curPos > 0.3 && curPos < 0.7 && (lw == "and" || lw == "but" || lw == "so") && used[lw] > 0 {
-			score *= 0.8
-		}
-		// gentle encouragement for connective continuity in mid-sentence
-		if curPos > 0.2 && curPos < 0.8 && (lw == "and" || lw == "but" || lw == "then" || lw == "because") {
-			score *= 1.1 * momentum
-		}
-		// encourage conclusive / emotional tokens near the end
-		// Removed as punctuation is longer desired in output.
-		// lightly dampen excessive connectors at very end
-		if curPos > 0.85 && (lw == "and" || lw == "but" || lw == "because") {
-			score *= 0.7
-		}
-
-		if score > 0 {
-			cands = append(cands, cand{succ.Token, score})
-		}
-	}
-
-	if len(cands) == 0 {
-		return ""
-	}
-
-	// stochastic selection.
-	//
-	// The 1.0 to 1.05 bonus that used to be applied to cands[0] is deleted here rather
-	// than in M7 with the rest of the scoring, because M6b would have made it worse.
-	// It was a bonus attached to an arbitrary index: candidates arrived in Go's
-	// randomized map iteration order, so the bonus landed on a random candidate, which
-	// is meaningless but at least unbiased (SPEC.md section 8, G4).
-	//
-	// Reader.Successors returns a cursor scan, which is sorted key order, so the same
-	// line would now hand a permanent 5% advantage to whichever continuation sorts
-	// first alphabetically, every time, at every step of every sentence. A known-bad
-	// heuristic becoming systematic instead of random is a change worth not shipping.
-	total := 0.0
-	weights := make([]float64, len(cands))
-	for i := range cands {
-		weights[i] = math.Pow(cands[i].weight, 1.0/(Creativity+0.01))
-		total += weights[i]
-	}
-
-	if total <= 0 {
-		return cands[len(cands)-1].word
-	}
-
-	r_val := rand.Float64() * total
-	for i := range cands {
-		r_val -= weights[i]
-		if r_val <= 0 {
-			if cands[i].word == "<END>" && len(prefix) < 10 && len(cands) > 1 {
-				return cands[1].word
-			}
-			return cands[i].word
-		}
-	}
-
-	return cands[len(cands)-1].word
-}
-
 // generateSentenceWithContext builds a sentence using the markov DB, prompt, and recent context.
 func generateSentenceWithContext(s *discordgo.Session, prompt string, isRoast bool, convMemory *ConversationMemory) (string, error) {
 	promptWords := tokenize(prompt)
@@ -2064,49 +1795,47 @@ func generateSentenceWithContext(s *discordgo.Session, prompt string, isRoast bo
 	return final, nil
 }
 
-// generateSentenceAttempt is a helper that contains the core sentence generation logic.
+// generateSentenceAttempt drives one sentence out of the engine.
+//
+// What used to be here was 470 lines: a prefix-shrink loop that took the first
+// non-empty result from the longest prefix, and a 290-line scorer that multiplied a
+// raw n-gram count by an unbounded topic term and a dozen more ad-hoc factors before
+// raising it to a power. All of that is internal/markov now, and what is left is the
+// part that is genuinely legacy's job: turning a Discord prompt into a markov.Step and
+// walking the loop.
+//
+// Three things that were tangled together here are now separate, and it is worth
+// saying which because the diff is large. The probability model is Kneser-Ney inside
+// the engine. The heuristics are additive logits inside the engine. The length bounds
+// and the stuck-jump are still here, because they are M7b's row.
 func generateSentenceAttempt(r *storage.Reader, promptWords, recentWords []string, originalPrompt string, isRoast bool) ([]string, []string, map[string]corpus.TopicAssoc) {
-	// One interner per attempt, created here and discarded with the attempt.
-	//
-	// This replaces a package-level map and slice that every per-message goroutine
-	// wrote to with no synchronization, which is a concurrent map write: in Go that
-	// is a runtime fatal error, not a panic, so no recover and no deferred database
-	// close (SPEC.md section 8, finding 2). It was also never pruned, so it held
-	// every distinct token the process had ever seen.
-	//
-	// Per-attempt is correct rather than merely safe: the ids only have to be
-	// consistent within the one attempt that uses them, because nothing persists
-	// them. Nothing may start persisting them either, for the reason recorded on
-	// text.Interner.
-	in := text.NewInterner()
+	g := markov.New(r, genParams(), nil)
 
-	sentence := []string{}
-	usedWords := make(map[string]int)
-	generatedNgrams := make(map[string]struct{}) // Track generated n-grams
 	var recognizedNames []string
-	var aggregatedAssoc map[string]corpus.TopicAssoc
-	var currentTopic string // Track the current topic cluster
-
-	// populate recognizedNames. isRecognizedName takes the Reader now, so this no
-	// longer opens a transaction per prompt word inside the one already open.
 	for _, word := range promptWords {
 		if name, exists := isRecognizedName(r, word); exists {
 			recognizedNames = append(recognizedNames, name)
 		}
 	}
 
-	// --- Topic Gravity ---
-	// Extract core non-stop-words from the prompt and weigh them by significance (global count).
-	coreTopics := make(map[int]float64)
+	// Core topics: the prompt's non-stop words, weighted by the log of their global
+	// count so significance does not grow too quickly.
+	//
+	// Keyed by the word itself rather than by a text.Interner id. The interner is gone
+	// from this function, and that is a simplification the engine bought rather than a
+	// change in behavior: the ids only ever existed to key these two maps within one
+	// attempt, they were never persisted, and the engine's Corpus interface speaks in
+	// strings. Nothing may start persisting an interner id, for the reason recorded on
+	// text.Interner, and having no id here is the strongest form of that.
+	coreTopics := make(map[string]float64, len(promptWords))
 	for _, word := range promptWords {
-		if _, isStop := stopWords[word]; !isStop {
-			// Use the log of the count to get a significance score that doesn't grow too quickly.
-			coreTopics[in.Intern(word)] = math.Log(float64(r.TopicCount(word)) + 1)
+		if _, isStop := stopWords[word]; isStop {
+			continue
 		}
+		coreTopics[word] = math.Log(float64(r.TopicCount(word)) + 1)
 	}
 
-	// Aggregate all recognized names' associations.
-	aggregatedAssoc = make(map[string]corpus.TopicAssoc)
+	aggregatedAssoc := make(map[string]corpus.TopicAssoc)
 	for _, nm := range recognizedNames {
 		nmKey := toLowerCaseExceptURLs(nm)
 		assoc, err := r.NameTopicsFor(nmKey)
@@ -2122,119 +1851,113 @@ func generateSentenceAttempt(r *storage.Reader, promptWords, recentWords []strin
 		}
 	}
 
-	// Determine seed using the new intelligent algorithm
-	seed := findBestSeed(r, in, promptWords, recentWords, recognizedNames)
+	// The interner is constructed inline because findBestSeed is now its only user: it
+	// keys its candidate map by id. The scorer used to share this one, which is why it
+	// was a variable. M7b moves seed selection into the engine and the interner goes
+	// with it. Per-call is still the requirement, not merely the convention, for the
+	// reason recorded on text.Interner: ids depend on insertion order, so one that
+	// outlived a call would mean different words to different callers.
+	seed := findBestSeed(r, text.NewInterner(), promptWords, recentWords, recognizedNames)
 	if seed == "" || seed == "<START>" {
 		if len(promptWords) > 0 {
 			seed = promptWords[0]
 		} else {
-			seed = "<START>" // Should be rare
+			seed = "<START>"
 		}
 	}
-	currentTopic = seed // Initialize current topic with the seed
 
-	// Initialize sentence with seed
 	words := tokenize(seed)
-	sentence = append(sentence, words...)
-	for _, w := range words {
-		usedWords[w]++
-	}
-	lastWords := append([]string{}, words...)
+	sentence := append([]string{}, words...)
 
-	// Set generation boundaries
-	minWords := 5 + rand.IntN(4) // Set a dynamic minimum length (5-8 words)
+	// Length bounds, unchanged from M6b and deliberately so: M7b replaces all three
+	// competing length mechanisms with one model, and changing them here would mean
+	// tuning the engine against bounds that are about to move.
+	minWords := 5 + rand.IntN(4)
 	maxWords := 30 + rand.IntN(15)
 
-	// Generate words iteratively
-	for i := 0; i < maxWords; i++ {
-		if len(lastWords) == 0 {
+	step := &markov.Step{
+		Prefix:       append([]string{}, words...),
+		Sentence:     sentence,
+		Prompt:       originalPrompt,
+		PromptSet:    wordSet(promptWords),
+		RecentSet:    wordSet(recentWords),
+		Used:         make(map[string]int, maxWords),
+		Ngrams:       make(map[string]struct{}, maxWords*3),
+		MinWords:     minWords,
+		CoreTopics:   coreTopics,
+		CurrentTopic: seed,
+		NameAssoc:    aggregatedAssoc,
+	}
+	if isRoast {
+		step.Persona = markov.PersonaRoast
+	}
+	for _, w := range words {
+		step.Used[w]++
+	}
+
+	for range maxWords {
+		if len(step.Prefix) == 0 {
+			break
+		}
+		step.Position = float64(len(step.Sentence)) / float64(maxWords)
+
+		next, err := g.Next(step)
+		if err != nil {
+			log.Printf("[WARN] generation step failed: %v", err)
 			break
 		}
 
-		n := len(lastWords)
-		if n > cfg.MaxNGram-1 {
-			n = cfg.MaxNGram - 1
-		}
-
-		var next string
-		// Shrink prefix if no match
-		for shrink := n; shrink >= 1; shrink-- {
-			// Lowercased, because that is how learning stores the prefix, and it was
-			// not lowercased here.
-			//
-			// This is defence rather than a fixed bug, and the distinction is worth
-			// being honest about: as it stands every producer of lastWords is already
-			// lowercase, so the old code matched. The seed comes from findBestSeed,
-			// whose candidates are all interned from lowercased sources, and every
-			// subsequent word is a stored successor token. The one branch that could
-			// have introduced a raw prompt word, the `seed == "<START>"` fallback
-			// below, is unreachable with a non-empty corpus because
-			// generateSentenceWithContext returns early on CorpusEmpty.
-			//
-			// It is lowercased anyway because the alternative is an invariant held by
-			// five separate producers agreeing, none of which states it, against a
-			// lookup that fails silently by returning no candidates. M7 normalizes
-			// once at the storage boundary and this goes away.
-			prefix := toLowerCaseExceptURLs(strings.Join(lastWords[len(lastWords)-shrink:], " "))
-			next = pickPromptAwareNextWithSimilarity(
-				r,
-				prefix,
-				originalPrompt,
-				recentWords,
-				usedWords,
-				generatedNgrams,
-				aggregatedAssoc,
-				isRoast,
-				len(sentence),
-				maxWords,
-				currentTopic,
-				coreTopics, // for Topic Gravity
-				in,
-				sentence, // for the immediate repetition check
-			)
-			if next != "" {
+		if next == markov.EndToken {
+			// The floor is still enforced here rather than in the engine, which only
+			// penalizes the sentinel. M7b makes this one length model.
+			if len(step.Sentence) >= minWords {
 				break
 			}
-		} // If we generate an end token but the sentence is too short, discard it and try to find another word.
-		if next == "<end>" && len(sentence) < minWords {
-			next = "" // Discard the <end> token
-		}
-
-		if next == "<end>" {
-			break // Stop generating if we hit the end token and sentence is long enough
+			next = ""
 		}
 
 		if next == "" {
-			// Creative Jump: If we hit a dead end, try to find a related word to jump to.
-			jumpWord := findJumpWord(r, promptWords, sentence, recognizedNames)
-			if jumpWord != "" {
-				next = jumpWord
-			} else {
-				// If we still can't find a jump, then it's a true dead end.
+			// A dead end. Either the prefix has no continuation, or the
+			// author-diversity gate refused everything that did, which on a young
+			// corpus is the common case and is the gate working.
+			jump := findJumpWord(r, promptWords, step.Sentence, recognizedNames)
+			if jump == "" {
 				break
 			}
+			next = jump
 		}
 
-		sentence = append(sentence, next)
-		lastWords = append(lastWords, next)
-		if len(lastWords) > cfg.MaxNGram-1 {
-			lastWords = lastWords[1:]
+		step.Sentence = append(step.Sentence, next)
+		lower := toLowerCaseExceptURLs(next)
+		step.Used[lower]++
+		step.Ngrams[lower] = struct{}{}
+		if len(step.Sentence) >= 2 {
+			step.Ngrams[toLowerCaseExceptURLs(strings.Join(step.Sentence[len(step.Sentence)-2:], " "))] = struct{}{}
 		}
-		usedWords[toLowerCaseExceptURLs(next)]++
+		if len(step.Sentence) >= 3 {
+			step.Ngrams[toLowerCaseExceptURLs(strings.Join(step.Sentence[len(step.Sentence)-3:], " "))] = struct{}{}
+		}
 
-		// Track generated n-grams (1, 2, and 3-grams)
-		generatedNgrams[toLowerCaseExceptURLs(next)] = struct{}{}
-		if len(sentence) >= 2 {
-			twoGram := toLowerCaseExceptURLs(strings.Join(sentence[len(sentence)-2:], " "))
-			generatedNgrams[twoGram] = struct{}{}
-		}
-		if len(sentence) >= 3 {
-			threeGram := toLowerCaseExceptURLs(strings.Join(sentence[len(sentence)-3:], " "))
-			generatedNgrams[threeGram] = struct{}{}
+		step.Prefix = append(step.Prefix, next)
+		if len(step.Prefix) > cfg.MaxNGram-1 {
+			step.Prefix = step.Prefix[1:]
 		}
 	}
 
-	return sentence, recognizedNames, aggregatedAssoc
+	return step.Sentence, recognizedNames, aggregatedAssoc
+}
+
+// wordSet builds a normalized presence set.
+//
+// Once per sentence, where the old scorer rebuilt the prompt set inside the
+// per-candidate loop: it tokenized the whole prompt and allocated a map once per
+// candidate per step per generated word.
+func wordSet(words []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(words))
+	for _, w := range words {
+		out[toLowerCaseExceptURLs(w)] = struct{}{}
+	}
+	return out
 }
 
 // -----------------------------------------------------------------------------

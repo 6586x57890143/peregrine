@@ -1007,3 +1007,215 @@ func TestIsNameDoesNotDecode(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// ---------------------------------------------------------------- M7a additions
+
+// TestPrefixTotalSumsOnlyItsOwnRange is the correctness test for the one method in this
+// layer that deliberately walks instead of reading a counter.
+//
+// PrefixTotal is the normalizer of interpolated Kneser-Ney's discounted term, so if it
+// ever summed across the NUL separator into longer prefixes, every lambda in the model
+// would be wrong. Nothing in the output would look broken: the balance between n-gram
+// orders would just quietly shift, which is the same class of invisible defect as the
+// unweighted backoff it exists to replace.
+func TestPrefixTotalSumsOnlyItsOwnRange(t *testing.T) {
+	s := dbtest.Store(t)
+	dbtest.Seed(t, s,
+		dbtest.Learn{Prefix: "the", Next: "bird", Author: "a"},
+		dbtest.Learn{Prefix: "the", Next: "bird", Author: "b"},
+		dbtest.Learn{Prefix: "the", Next: "cat", Author: "a"},
+		dbtest.Learn{Prefix: "the bird", Next: "flew", Author: "a"},
+		dbtest.Learn{Prefix: "the bird", Next: "sang", Author: "b"},
+		dbtest.Learn{Prefix: "theatre", Next: "trip", Author: "a"},
+	)
+
+	if err := s.View(func(r *storage.Reader) error {
+		// "the" has bird twice and cat once. It must NOT pick up the two "the bird"
+		// continuations, and it must not pick up "theatre" either: NUL sorts below every
+		// printable byte, so the range ends before any longer prefix begins.
+		if got := r.PrefixTotal("the"); got != 3 {
+			t.Errorf("PrefixTotal(\"the\") = %d, want 3. Anything larger means the scan "+
+				"crossed the separator into \"the bird\" or \"theatre\" keys", got)
+		}
+		if got := r.PrefixTotal("the bird"); got != 2 {
+			t.Errorf("PrefixTotal(\"the bird\") = %d, want 2", got)
+		}
+		if got := r.PrefixTotal("theatre"); got != 1 {
+			t.Errorf("PrefixTotal(\"theatre\") = %d, want 1", got)
+		}
+		if got := r.PrefixTotal("nonexistent"); got != 0 {
+			t.Errorf("PrefixTotal on an unknown prefix = %d, want 0", got)
+		}
+		// Refused explicitly rather than left to work by accident, because it reads as
+		// "sum the whole corpus" to anyone scanning the call site.
+		if got := r.PrefixTotal(""); got != 0 {
+			t.Errorf("PrefixTotal(\"\") = %d, want 0", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("View: %v", err)
+	}
+}
+
+// TestPrefixTotalAgreesWithSuccessors keeps the walk and the enumeration honest about
+// each other. They are two different cursor scans over the same range, and the engine
+// uses one for the normalizer and the other for the candidates.
+func TestPrefixTotalAgreesWithSuccessors(t *testing.T) {
+	s := dbtest.Store(t)
+
+	var entries []dbtest.Learn
+	for i := range 40 {
+		entries = append(entries, dbtest.Learn{
+			Prefix: "shared prefix",
+			Next:   "tok" + strconv.Itoa(i%7),
+			Author: "a" + strconv.Itoa(i%3),
+		})
+	}
+	dbtest.Seed(t, s, entries...)
+
+	if err := s.View(func(r *storage.Reader) error {
+		succ, err := r.Successors("shared prefix")
+		if err != nil {
+			return err
+		}
+		var want uint64
+		for _, sc := range succ {
+			want += sc.Count
+		}
+		if got := r.PrefixTotal("shared prefix"); got != want {
+			t.Errorf("PrefixTotal = %d, sum over Successors = %d", got, want)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("View: %v", err)
+	}
+}
+
+// TestTopicTotalIsMaintainedIncrementally covers the counter the Kneser-Ney base case
+// divides by for its raw-frequency half.
+func TestTopicTotalIsMaintainedIncrementally(t *testing.T) {
+	s := dbtest.Store(t)
+
+	if err := s.Update(func(w *storage.Writer) error {
+		for _, word := range []string{"bird", "bird", "loose", "ok"} {
+			if err := w.IncTopic(word); err != nil {
+				return err
+			}
+		}
+		// An empty word is a no-op and must not move the total, or the denominator
+		// drifts above the sum of the counts it normalizes.
+		return w.IncTopic("")
+	}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	if err := s.View(func(r *storage.Reader) error {
+		if got := r.TotalTopicCount(); got != 4 {
+			t.Errorf("TotalTopicCount = %d, want 4", got)
+		}
+		// And it must equal the sum of the per-word counts it is the denominator for.
+		var sum uint64
+		for _, word := range []string{"bird", "loose", "ok"} {
+			sum += r.TopicCount(word)
+		}
+		if sum != 4 {
+			t.Errorf("per-word counts sum to %d, want 4", sum)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("View: %v", err)
+	}
+}
+
+// TestOpenBackfillsTheTopicTotalForAnOlderCorpus is the upgrade path for a schema-1
+// corpus written before the counter existed, which is every corpus created between M6a
+// and M7a.
+//
+// A zero here is not a crash. It silently turns PEREGRINE_KN_RAW_MIX off, so the bot
+// generates with pure Kneser-Ney and therefore systematically suppresses the memetic
+// register it exists to speak in, with nothing in the log to say why. That is exactly
+// the kind of silent degradation this repo keeps designing against, which is why the
+// counter is derived at startup rather than defaulted.
+func TestOpenBackfillsTheTopicTotalForAnOlderCorpus(t *testing.T) {
+	path := dbtest.Path(t)
+
+	// Build a normal current corpus, then remove the counter to reproduce what a
+	// pre-M7a file looks like on disk.
+	s, err := storage.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := s.Update(func(w *storage.Writer) error {
+		for _, word := range []string{"bird", "bird", "bird", "loose", "ok"} {
+			if err := w.IncTopic(word); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed topics: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	db, err := bbolt.Open(path, 0600, nil)
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	if err := db.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket([]byte("meta")).Delete([]byte("count:topic_total"))
+	}); err != nil {
+		t.Fatalf("remove counter: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+
+	reopened, err := storage.Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+
+	if err := reopened.View(func(r *storage.Reader) error {
+		if got := r.TotalTopicCount(); got != 5 {
+			t.Errorf("TotalTopicCount after backfill = %d, want 5. Open must derive the "+
+				"counter for a corpus written before it existed, because a zero silently "+
+				"disables the raw-count half of the Kneser-Ney base case", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("View: %v", err)
+	}
+}
+
+// TestOpenDoesNotStampATopicTotalOnAnEmptyCorpus is the other half of the backfill
+// condition. A new file must not have the key written for it, or every startup pays a
+// walk over a bucket that is about to be filled by the first message anyway.
+func TestOpenDoesNotStampATopicTotalOnAnEmptyCorpus(t *testing.T) {
+	s := dbtest.Store(t)
+
+	if err := s.View(func(r *storage.Reader) error {
+		if got := r.TotalTopicCount(); got != 0 {
+			t.Errorf("TotalTopicCount on a fresh corpus = %d, want 0", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("View: %v", err)
+	}
+
+	// And the first write must establish it correctly rather than starting from a
+	// stamped zero that the backfill would then decline to fix.
+	if err := s.Update(func(w *storage.Writer) error { return w.IncTopic("first") }); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if err := s.View(func(r *storage.Reader) error {
+		if got := r.TotalTopicCount(); got != 1 {
+			t.Errorf("TotalTopicCount after one word = %d, want 1", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("View: %v", err)
+	}
+}

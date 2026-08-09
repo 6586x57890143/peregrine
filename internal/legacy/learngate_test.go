@@ -50,7 +50,28 @@ func gateFixture(t *testing.T) *storage.Store {
 	t.Cleanup(func() { store, cfg, gate = oldStore, oldCfg, oldGate })
 
 	store = s
-	cfg = &config.Config{MaxNGram: 3, MaxHistory: 1000}
+	// The generation dials carry the shipped defaults rather than zero values, so these
+	// tests exercise the configuration production actually runs. A zero Temperature
+	// makes the sampler argmax and a zero TopP keeps only the single best candidate,
+	// which would quietly turn every test here into a deterministic-path test and hide
+	// anything to do with sampling.
+	//
+	// MinDistinctAuthors is the one deliberate exception, at 0. These fixtures are
+	// single-author by nature, so the shipped default of 2 would make generation
+	// correctly produce nothing and every assertion below would be testing the gate
+	// instead of what it says it tests. The gate has its own coverage in
+	// internal/markov and in TestGenerationHonoursTheConfiguredAuthorGate.
+	cfg = &config.Config{
+		MaxNGram:             3,
+		MaxHistory:           1000,
+		Temperature:          1.0,
+		TopK:                 40,
+		TopP:                 0.95,
+		KNDiscount:           0.75,
+		KNRawMix:             0.25,
+		MinDistinctAuthors:   0,
+		PromptRelevanceBoost: 0.6,
+	}
 	gate = safety.NewGate(bl, slog.New(slog.NewTextHandler(io.Discard, nil)), false)
 
 	return s
