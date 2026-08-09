@@ -14,8 +14,11 @@ import (
 	"github.com/6586x57890143/peregrine/internal/config"
 	"github.com/6586x57890143/peregrine/internal/corpus"
 	"github.com/6586x57890143/peregrine/internal/dbtest"
+	"github.com/6586x57890143/peregrine/internal/discordguard"
 	"github.com/6586x57890143/peregrine/internal/safety"
 	"github.com/6586x57890143/peregrine/internal/storage"
+	"github.com/6586x57890143/peregrine/wordgames"
+	"github.com/bwmarrin/discordgo"
 )
 
 // This file is the regression pin for SPEC.md section 4, A1: the highest-value
@@ -46,8 +49,15 @@ func gateFixture(t *testing.T) *storage.Store {
 	}
 
 	// Save and restore the globals, so these tests do not leak into each other.
-	oldStore, oldCfg, oldGate := store, cfg, gate
-	t.Cleanup(func() { store, cfg, gate = oldStore, oldCfg, oldGate })
+	oldStore, oldCfg, oldGate, oldGuard, oldBoard := store, cfg, gate, guard, leaderboard
+	t.Cleanup(func() {
+		store, cfg, gate, guard, leaderboard = oldStore, oldCfg, oldGate, oldGuard, oldBoard
+	})
+
+	// The word-game leaderboard, which Init loads in production. Nil here made
+	// cmdLeaderboard panic on leaderboard.Format() rather than fail an assertion, which
+	// is how the first version of the finding-9 pin reported a revert.
+	leaderboard = wordgames.NewLeaderboard()
 
 	store = s
 	// The generation dials carry the shipped defaults rather than zero values, so these
@@ -81,7 +91,56 @@ func gateFixture(t *testing.T) *storage.Store {
 	}
 	gate = safety.NewGate(bl, slog.New(slog.NewTextHandler(io.Discard, nil)), false)
 
+	// A guard over a recording fake, so the command and reply steps can run without a
+	// Discord connection and a test can assert on what would have been sent. Without
+	// this, anything reaching sendMessage dereferences a nil guard.
+	sent = &recordingSession{}
+	guard = discordguard.New(sent, emitGate{g: gate}, nil, nil)
+
 	return s
+}
+
+// sent records what the fixture's guard would have sent. Reset per fixture, so a test
+// reads only its own traffic.
+var sent *recordingSession
+
+// recordingSession satisfies discordguard.Session and keeps what it was given.
+//
+// Deliberately in this package rather than reusing the one in internal/discordguard's
+// tests: a test fake is not API, and importing another package's test types would make
+// that fake something both suites have to agree on.
+type recordingSession struct {
+	sends   []string
+	edits   []string
+	deletes int
+	reacts  int
+}
+
+func (r *recordingSession) ChannelMessageSendComplex(_ string, data *discordgo.MessageSend, _ ...discordgo.RequestOption) (*discordgo.Message, error) {
+	r.sends = append(r.sends, data.Content)
+	return &discordgo.Message{ID: snowflake(770000 + len(r.sends))}, nil
+}
+
+func (r *recordingSession) ChannelMessageEditComplex(m *discordgo.MessageEdit, _ ...discordgo.RequestOption) (*discordgo.Message, error) {
+	if m.Content != nil {
+		r.edits = append(r.edits, *m.Content)
+	}
+	return &discordgo.Message{ID: m.ID}, nil
+}
+
+func (r *recordingSession) ChannelMessageDelete(_, _ string, _ ...discordgo.RequestOption) error {
+	r.deletes++
+	return nil
+}
+
+func (r *recordingSession) MessageReactionAdd(_, _, _ string, _ ...discordgo.RequestOption) error {
+	r.reacts++
+	return nil
+}
+
+func (r *recordingSession) MessageReactionRemove(_, _, _, _ string, _ ...discordgo.RequestOption) error {
+	r.reacts--
+	return nil
 }
 
 func writeBlocklist(t *testing.T) string {
@@ -310,17 +369,24 @@ func TestLearnMessageCallerCountIsKnown(t *testing.T) {
 	// Counted from the AST rather than by grepping the source. A regexp attempt at
 	// this counted five, because the function's own declaration looks exactly like a
 	// call to a pattern that is not parsing Go.
+	//
+	// Counted across EVERY file in the package, not just legacy.go. M10b moved two of the
+	// four callers into reactor.go and this test reported two, which is the same weakness
+	// TestThisPackageCannotReachBbolt was rewritten to avoid: a structural check scoped to
+	// one file stops being a check on the package the moment the package grows a file.
 	calls := 0
-	ast.Inspect(parseLegacy(t), func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
+	for _, file := range parsePackage(t) {
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "learnMessage" {
+				calls++
+			}
 			return true
-		}
-		if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "learnMessage" {
-			calls++
-		}
-		return true
-	})
+		})
+	}
 
 	const known = 4 // backfill, self-learning, live handler, voice transcript
 	if calls != known {
@@ -387,6 +453,37 @@ func parseLegacy(t *testing.T) *ast.File {
 		t.Fatalf("parse legacy.go: %v", err)
 	}
 	return file
+}
+
+// parsePackage parses every non-test file in the package.
+//
+// Structural checks that count or forbid something should use this rather than
+// parseLegacy, because a check scoped to one file silently stops covering the package as
+// soon as the package grows another one. M10b added reactor.go and the caller count
+// dropped from four to two without anything actually changing.
+func parsePackage(t *testing.T) []*ast.File {
+	t.Helper()
+	names, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+
+	fset := token.NewFileSet()
+	var out []*ast.File
+	for _, name := range names {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		out = append(out, file)
+	}
+	if len(out) == 0 {
+		t.Fatal("no source files found, so any structural check over them proves nothing")
+	}
+	return out
 }
 
 func findFunc(t *testing.T, name string) *ast.FuncDecl {
@@ -459,6 +556,11 @@ func TestNothingBypassesTheGuard(t *testing.T) {
 		"ChannelMessageEditComplex",
 		"ChannelMessageDelete",
 		"MessageReactionAdd",
+		// Added after the M10b split dropped a MessageReactionRemove call and this test
+		// did NOT notice, because the method was missing from this list. The lesson is
+		// that a forbidden-call list is only as good as its enumeration, so when the guard
+		// grows a method, this grows with it.
+		"MessageReactionRemove",
 	}
 
 	// The adapters in legacy.go that are allowed to name the raw session, by the

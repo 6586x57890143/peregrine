@@ -68,6 +68,7 @@ type Session interface {
 	ChannelMessageEditComplex(m *discordgo.MessageEdit, options ...discordgo.RequestOption) (*discordgo.Message, error)
 	ChannelMessageDelete(channelID, messageID string, options ...discordgo.RequestOption) error
 	MessageReactionAdd(channelID, messageID, emojiID string, options ...discordgo.RequestOption) error
+	MessageReactionRemove(channelID, messageID, emojiID, userID string, options ...discordgo.RequestOption) error
 }
 
 // EmitGate is the outbound half of internal/safety. *safety.Gate satisfies it.
@@ -250,6 +251,29 @@ func (g *Guard) React(channelID, messageID, emoji string) bool {
 	}
 	if err := g.session.MessageReactionAdd(channelID, messageID, emoji); err != nil {
 		g.log.Info("discord reaction failed", "channel", channelID, "message", messageID, "err", err)
+		return false
+	}
+	return true
+}
+
+// Unreact removes one of the bot's own reactions.
+//
+// NOT gated on the pause switch, and that asymmetry with React is deliberate. Removing a
+// reaction is the bot withdrawing rather than participating, so an operator who has hit
+// the emergency stop wants it to succeed: refusing it would leave the bot's mark on
+// somebody's message with no way to take it back until the pause is lifted.
+//
+// It is still routed through here so the ignore list and the logging apply, and so the
+// structural test covering the reaction methods has something to point at. Discovered by
+// dropping the call during the M10b reactor split and noticing the test did NOT catch it,
+// because MessageReactionRemove was missing from the forbidden list; both halves of that
+// gap are fixed.
+func (g *Guard) Unreact(channelID, messageID, emoji, userID string) bool {
+	if g.ignored(channelID, "unreact") {
+		return false
+	}
+	if err := g.session.MessageReactionRemove(channelID, messageID, emoji, userID); err != nil {
+		g.log.Info("discord reaction removal failed", "channel", channelID, "message", messageID, "err", err)
 		return false
 	}
 	return true
