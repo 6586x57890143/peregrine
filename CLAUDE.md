@@ -435,9 +435,17 @@ The prod image tag is pinned to the commit SHA in `deployed-tag.env` on the host
 
 `markov.db`, the whisper model and the ffmpeg binary are all gitignored. `voicenotes/models/ggml-small.bin` is 465 MiB, over GitHub's hard 100 MiB per-file limit, so a commit containing it cannot be pushed at all and the only remedy is rewriting history. `.dockerignore` exists for the same weight: the working tree is around 692 MB and `COPY . .` would ship all of it into the builder on every build.
 
-## Transcription is Windows-local only
+## Transcription is a seam with no engine behind it
 
-Voice-note transcription shells out to `ffmpeg` and `whisper-cli` and needs a 465 MiB model. None of that exists in a distroless image, which has no shell at all, so `PEREGRINE_ENABLE_TRANSCRIPTION` defaults to **false** and that default deliberately differs from the old in-code constant. The binaries and model are gitignored and fetched by hand. Only `voicenotes/bin/windows/` exists; on Linux the path lookup fails and every voice note produces a failure reply, which is another reason the flag defaults off.
+`internal/plugins/voicenote` is a complete plugin over an `Engine` interface, and **the only implementation that ships reports itself unavailable**. That is the state as of M12, deliberately: the implementation it replaced shelled out to `ffmpeg` and `whisper-cli` and needed a 465 MiB model, none of which exists in a distroless image that has no shell at all, and all three assets are gitignored because the model alone is over GitHub's hard 100 MiB per-file limit. The feature had never run anywhere but one Windows machine.
+
+`PEREGRINE_ENABLE_TRANSCRIPTION` still defaults to **false**, and the flag being on with no engine is a startup **warning** naming the seam rather than silence: a feature that is enabled and does nothing is the exact shape of findings 30 and G3.
+
+**The plugin's own half is real and tested**, because that is the part this repository owns: a bounded queue that drops and says so, a context-bound worker the shutdown path waits for, a placeholder posted before a job is queued (and no job at all when the guard refuses the placeholder, because a transcription with nowhere to report is a Whisper run spent on nothing), and every message through the guard.
+
+**Transcripts are not learned, and that is a decision rather than an omission.** The old path fed them into the corpus, which was one of A1's four unfiltered callers and the worst of them: a Whisper transcript of arbitrary audio is the least controlled text the bot handles, and somebody could have taught it anything by saying it out loud. If a future engine wants transcripts learned it goes through `learn.Learner.Message` like every other path, and that decision belongs in a milestone rather than in a side effect.
+
+**What a real engine must not reproduce** is listed in the package comment: a bare `http.Get` with no timeout, status check or size cap; `exec.Command` with no context; paths resolved against the working directory; and a scratch filename built from the URL by hand. Read it before writing one.
 
 ## Conventions
 

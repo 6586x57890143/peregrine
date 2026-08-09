@@ -189,6 +189,12 @@ type Config struct {
 	// and every voice note produces a failure reply, so shipping it on by default
 	// meant the container's only visible transcription behavior was an error.
 	EnableTranscription bool // PEREGRINE_ENABLE_TRANSCRIPTION
+
+	// TranscriptionQueue bounds work in flight. Transcription is slow and voice notes
+	// arrive in bursts, so this is what stops a burst becoming unbounded memory. A full
+	// queue drops the note and says so in the channel, which is the same honest semantics
+	// the message dispatcher uses.
+	TranscriptionQueue int // PEREGRINE_TRANSCRIPTION_QUEUE
 }
 
 // Word game pacing modes.
@@ -218,12 +224,17 @@ var deferredVars = map[string]string{
 	// never exist is worse than a deferred one: the deferred warning at least promises
 	// a milestone. An operator who still has either set gets no warning now, which is
 	// correct, because there is nothing left for them to be waiting for.
-	"PEREGRINE_BACKUP_DIR":            "M13",
-	"PEREGRINE_BACKUP_TICK":           "M13",
-	"PEREGRINE_BACKUP_KEEP":           "M13",
-	"PEREGRINE_WHISPER_MODEL":         "M12",
-	"PEREGRINE_VOICENOTES_DIR":        "M12",
-	"PEREGRINE_TRANSCRIPTION_TIMEOUT": "M12",
+	"PEREGRINE_BACKUP_DIR":  "M13",
+	"PEREGRINE_BACKUP_TICK": "M13",
+	"PEREGRINE_BACKUP_KEEP": "M13",
+	// These three configure a transcription ENGINE, and M12 shipped the seam rather than an
+	// engine: no implementation ships in this repository, because the one peregrine had needed
+	// a 465 MiB model and platform binaries that exist in no deployed environment. They stay
+	// deferred rather than being deleted, because unlike the clustering variables above there
+	// is a milestone that will read them.
+	"PEREGRINE_WHISPER_MODEL":         "M12b",
+	"PEREGRINE_VOICENOTES_DIR":        "M12b",
+	"PEREGRINE_TRANSCRIPTION_TIMEOUT": "M12b",
 }
 
 // Load reads and validates the environment. The returned error, if any, names
@@ -404,6 +415,7 @@ func Load() (*Config, error) {
 		WordGameSweepTick: l.dur("PEREGRINE_WORDGAME_SWEEP_TICK", 5*time.Second, time.Second, time.Minute),
 
 		EnableTranscription: l.boolVal("PEREGRINE_ENABLE_TRANSCRIPTION", false),
+		TranscriptionQueue:  l.intVal("PEREGRINE_TRANSCRIPTION_QUEUE", 32, 1, 10_000),
 	}
 
 	// Cross-field checks. Each of these was previously a way to get silence.

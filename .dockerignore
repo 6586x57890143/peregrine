@@ -1,9 +1,14 @@
-# Merlin has no .dockerignore and does not need one. Peregrine does: the repo
-# working tree is around 692 MB, almost all of it the whisper model and the
-# bundled ffmpeg binary, and `COPY . .` would push every byte of that into the
-# builder layer on every build. CI builds the image twice (docker-build and
-# push-image) for two architectures, so without this file that is roughly
-# 2.7 GB of pointless context per run.
+# Merlin has no .dockerignore and does not need one. Peregrine does, and the
+# reason was the transcription assets: the working tree was around 692 MB, almost
+# all of it the whisper model and the bundled ffmpeg binary, and `COPY . .` would
+# push every byte of that into the builder layer on every build. CI builds the
+# image twice (docker-build and push-image) for two architectures, so without this
+# file that was roughly 2.7 GB of pointless context per run.
+#
+# M12 removed the tree, so the working copy is small again. The file stays because
+# the reasoning holds for whatever an engine implementation brings back, and
+# because excluding the corpus and .env from the build context is worth doing on
+# its own.
 #
 # The build only needs Go sources, go.mod and go.sum. Everything else here is
 # excluded on purpose.
@@ -22,10 +27,8 @@ markov.db.lock
 *.db.tmp
 backups/
 
-# The transcription assets, which is the 692 MB.
-voicenotes/models/
-voicenotes/bin/
-voicenotes/audio/
+# The transcription assets, if an engine implementation brings them back.
+voicenotes/
 
 # Build output from a host build, which would otherwise shadow the one the
 # builder stage produces.
