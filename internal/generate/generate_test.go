@@ -123,7 +123,7 @@ func TestGenerateFromALearnedCorpus(t *testing.T) {
 		"the server is doomed honestly",
 	)
 
-	got, err := g.Sentence("the bird is", false, nil, nil)
+	got, _, err := g.Sentence("the bird is", false, nil, nil)
 	if err != nil {
 		t.Fatalf("Sentence: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestGenerationHonoursTheConfiguredAuthorGate(t *testing.T) {
 	teach(t, s, l, "poisoner", 500, lines...)
 
 	for range 30 {
-		got, err := g.Sentence("the bird should", false, nil, nil)
+		got, _, err := g.Sentence("the bird should", false, nil, nil)
 		if err != nil {
 			t.Fatalf("Sentence: %v", err)
 		}
@@ -186,7 +186,7 @@ func TestGenerationAllowsWhatTwoAuthorsSaid(t *testing.T) {
 
 	found := false
 	for range 30 {
-		got, err := g.Sentence("the bird is", false, nil, nil)
+		got, _, err := g.Sentence("the bird is", false, nil, nil)
 		if err != nil {
 			t.Fatalf("Sentence: %v", err)
 		}
@@ -215,7 +215,7 @@ func TestAMixedCasePromptFindsTheCorpus(t *testing.T) {
 		"the bird is loose and it is bad",
 	)
 
-	got, err := g.Sentence("The BIRD Is", false, nil, nil)
+	got, _, err := g.Sentence("The BIRD Is", false, nil, nil)
 	if err != nil {
 		t.Fatalf("Sentence: %v", err)
 	}
@@ -229,12 +229,18 @@ func TestAMixedCasePromptFindsTheCorpus(t *testing.T) {
 func TestAnEmptyCorpusIsQuietAndDoesNotHang(t *testing.T) {
 	_, _, g := fixture(t, defaults())
 
-	got, err := g.Sentence("anything at all", false, nil, nil)
+	got, outcome, err := g.Sentence("anything at all", false, nil, nil)
 	if err != nil {
 		t.Fatalf("Sentence on an empty corpus: %v", err)
 	}
 	if got != "" {
 		t.Errorf("generated %q from an empty corpus, want silence", got)
+	}
+	// The REASON, not just the silence. An empty corpus and a dead-ended walk both produce
+	// "" and need different advice from the operator, and conflating them is finding 32.
+	if outcome != CorpusEmpty {
+		t.Errorf("outcome = %s, want corpus-empty: the caller logs this, and a wrong reason "+
+			"sends an operator looking in the wrong place", outcome)
 	}
 }
 
@@ -250,12 +256,18 @@ func TestBelowTwoWordsIsSilence(t *testing.T) {
 	teach(t, s, l, "u1", 300, "roof")
 
 	for range 20 {
-		got, err := g.Sentence("nothing", false, nil, nil)
+		got, outcome, err := g.Sentence("nothing", false, nil, nil)
 		if err != nil {
 			t.Fatalf("Sentence: %v", err)
 		}
 		if got != "" && len(strings.Fields(got)) < 2 {
 			t.Fatalf("generated the one-word reply %q; below two words the bot must stay silent", got)
+		}
+		// And when it does stay silent, it says the walk came up short rather than claiming the
+		// corpus is empty: this corpus has something in it, and an operator told "corpus empty"
+		// here would go looking at ingestion instead of at the author gate (finding 32).
+		if got == "" && outcome != TooShort {
+			t.Fatalf("outcome = %s on a populated corpus, want too-short", outcome)
 		}
 	}
 }

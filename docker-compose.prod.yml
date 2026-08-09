@@ -2,9 +2,17 @@ services:
   bot:
     # Pinned to the exact commit CI built, not :latest. Rolling back is then
     # editing one line in deployed-tag.env and re-running compose, instead of
-    # hoping a mutable tag still points where you think it does. The default
-    # keeps a hand-run `docker compose up` working on a host that has never
-    # been deployed to. See README's Runbook.
+    # hoping a mutable tag still points where you think it does.
+    #
+    # THE :latest FALLBACK IS A LAST RESORT, NOT A CONVENIENCE. CI does push that
+    # tag, but the deploy script ends with `docker logout ghcr.io`, so pulling it
+    # by hand on the host fails with a bare `unauthorized` against a private
+    # package. Always source deployed-tag.env before a hand-run compose: the
+    # pinned SHA is already in the local image cache from the last deploy, so it
+    # needs no registry access at all. The fallback only helps on a host with
+    # GHCR credentials and no deployed-tag.env, which in practice means a
+    # developer's machine. See README's Runbook, where omitting this step broke
+    # the first production deploy.
     image: ghcr.io/6586x57890143/peregrine:${PEREGRINE_IMAGE_TAG:-latest}
     read_only: true
     cap_drop:
@@ -21,23 +29,49 @@ services:
       # Backups deliberately land on a host bind, OUTSIDE the corpus volume, so
       # that losing or accidentally removing that volume does not take the
       # backups with it.
+      #
+      # The container WRITES here, so this needs the same uid treatment the blocklist
+      # needs for reading, and for the same reason: a BIND keeps its host ownership, so
+      # a directory owned by deploy is not writable by uid 65532 and every snapshot
+      # fails. It fails a tick after startup rather than at startup, because the backup
+      # loop is deliberately not Immediate, so nobody watching the boot logs sees it.
+      #
+      #   sudo chgrp 65532 backups && chmod 775 backups
       - ./backups:/backups
       # The blocklist, read-only, as data rather than baked into the image so the
       # operator can edit it mid-incident and restart, with no rebuild and no
       # public diff. Set PEREGRINE_BLOCKLIST_PATH=/blocklist.txt in .env to use it.
       #
-      # UNCOMMENT THIS BEFORE RUNNING IN A LIVE CHANNEL. The bot starts without it
-      # and warns, falling back to the built-in baseline in internal/filter, but
-      # the operator list is where the threat and illegal-content patterns live and
-      # it is the only part of the ruleset that is editable without a deploy.
+      # ENABLED as of the first production deploy. The operator list is where the
+      # threat and illegal-content patterns live, and it is the only part of the
+      # ruleset editable without a deploy.
       #
-      # Left commented rather than enabled because a bind mount whose SOURCE does
-      # not exist makes Docker silently create a DIRECTORY at that path. The loader
-      # then fails to read a directory as a file, which looks like a parser bug
-      # rather than a missing file. Create /home/deploy/peregrine/blocklist.txt on
-      # the host first, mode 0600.
+      # /home/deploy/peregrine/blocklist.txt MUST EXIST AS A FILE before this container
+      # starts, and MUST BE READABLE BY UID 65532. A bind mount whose source does not
+      # exist makes Docker silently create a DIRECTORY at that path, and the loader then
+      # fails to read a directory as a file, which looks like a parser bug rather than a
+      # missing file.
       #
-      # - ./blocklist.txt:/blocklist.txt:ro
+      # MODE 0600 DOES NOT WORK, which is the second way this one setting failed in
+      # production. The image runs USER nonroot, uid 65532, and a BIND keeps its host
+      # ownership, so a file owned by deploy in 0600 is unreadable to 65532 and the bot
+      # refuses to start with "permission denied" in a restart loop. The corpus volume
+      # never has this problem because a NAMED volume inherits the image directory's
+      # ownership when it is created empty, and the Dockerfile chowns /data to 65532.
+      #
+      #   sudo chgrp 65532 blocklist.txt && chmod 640 blocklist.txt
+      #
+      # Group-readable rather than world-readable, and still owned by deploy so it stays
+      # editable mid-incident without sudo, which is the entire reason this is a bind
+      # rather than baked into the image.
+      #
+      # It was commented out until now for that reason, and leaving it commented had
+      # its own failure mode which is what actually happened: PEREGRINE_BLOCKLIST_PATH
+      # was set in .env, nothing mounted anything at that path, and the bot refused to
+      # start with "no such file or directory" in a restart loop. Failing closed is
+      # correct, but the two halves of this setting live in two files and only one of
+      # them is version controlled.
+      - ./blocklist.txt:/blocklist.txt:ro
     restart: unless-stopped
     # bbolt mmaps the whole corpus. Mapped clean pages are reclaimable, so a
     # 1 GB corpus does not need 1 GB of resident memory, but a write
