@@ -321,10 +321,18 @@ func TestShutdownTakesNoFinalSnapshot(t *testing.T) {
 }
 
 // TestDescribeSaysWhatIsConfigured, for the status line.
+//
+// The directory is t.TempDir() rather than a literal like "/data/backups", and that is not
+// cosmetic: Init calls MkdirAll, which SUCCEEDS on Windows (where /data becomes C:\data and the
+// user can create it) and FAILS on Linux CI as a non-root user, so the same test passed locally,
+// failed on CI, and created a stray directory on the developer's filesystem on the way. A test
+// that writes outside its own temp directory is wrong even when it passes.
 func TestDescribeSaysWhatIsConfigured(t *testing.T) {
-	s, _ := fixture(t, Options{Dir: "/data/backups", Every: 6 * time.Hour, Keep: 4})
+	dir := t.TempDir()
+	s, _ := fixture(t, Options{Dir: dir, Every: 6 * time.Hour, Keep: 4})
+
 	got := s.Describe()
-	for _, want := range []string{"/data/backups", "6h", "4"} {
+	for _, want := range []string{dir, "6h", "4"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("Describe = %q, want it to mention %q", got, want)
 		}
