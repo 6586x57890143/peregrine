@@ -6,7 +6,7 @@ Sibling project to [merlin](../merlin), whose deployment conventions this repo f
 
 ## Status
 
-Mid-restructure. The bot works and runs, but it is being taken from a single 3,200-line `main.go` to a proper package layout one subsystem at a time, with a catalogue of known defects being closed along the way. See `SPEC.md` §8 for the defect list and §9 for the milestone order.
+Deployed and running. The restructure from a single 3,200-line `main.go` to a proper package layout is finished, and the catalogue of defects closed along the way is in `SPEC.md` §8, with the milestone order in §9.
 
 **The restructure is complete.** Milestones 0 through 13 are done, except M8 which was dropped for the reasons in `SPEC.md` finding 29, and M12b (a transcription engine) which is the one row left open. The layout is the one `SPEC.md` §2 describes: `cmd/bot` wires, `internal/core` owns the lifecycle, `internal/storage` is the only package that knows a bucket exists, `internal/markov` is the generation engine, and the features are nine packages under `internal/plugins`. **`internal/legacy` is deleted**, which was the point of the whole sequence: it went 3,200 lines, then one file, then 250 lines, then nothing.
 
@@ -185,21 +185,42 @@ This works because the image is pinned to an exact commit SHA rather than a muta
 
 Set `PEREGRINE_PAUSE_ALL_WRITES=1` in `.env` and restart the container. That refuses every outbound message process-wide while leaving reads and learning alone. It requires SSH and a restart, which is a known weakness during exactly the incident it exists for; a Discord-reachable equivalent is an open decision in `SPEC.md` §10.
 
+**Host bind mounts need uid 65532**
+
+The image runs `USER nonroot`, uid 65532. A **named volume** inherits the image directory's ownership when it is created empty, which is why the corpus needs no intervention: the Dockerfile chowns `/data` to 65532. A **bind mount keeps its host ownership**, so anything bound in from the host needs permissions that let 65532 at it, or the container fails on first access.
+
+```sh
+cd /home/deploy/peregrine
+sudo chgrp 65532 blocklist.txt && chmod 640 blocklist.txt   # the container reads this
+sudo chgrp 65532 backups       && chmod 775 backups         # the container writes here
+```
+
+Group rather than world, and still owned by `deploy`, so the blocklist stays editable mid-incident without sudo. That is the whole reason it is a bind rather than baked into the image.
+
+Both halves bit on the first production deploy. The blocklist at mode 0600 gave `permission denied` in a restart loop, which at least failed loudly. `./backups` owned by `deploy` fails **quietly**, a tick after startup rather than during it, because the backup loop is deliberately not `Immediate`, so nobody watching the boot logs sees it.
+
 **Back up and restore the corpus**
 
-Backups are taken in-process into `./backups` once the M13 ticker lands. Do **not** back up the corpus by copying `markov.db` from the host while the bot is running: bbolt is a single mmap updated by copy-on-write pages plus a meta-page flip, so an external byte copy can capture a torn state, and it will usually appear to work. See the long comment in `docker-compose.prod.yml`.
+Snapshots are taken in-process into whatever `PEREGRINE_BACKUP_DIR` points at, which the prod compose binds to `./backups`. Empty disables them and is the default. Do **not** back up the corpus by copying `markov.db` from the host while the bot is running: bbolt is a single mmap updated by copy-on-write pages plus a meta-page flip, so an external byte copy can capture a torn state, and it will usually appear to work. See the long comment in `docker-compose.prod.yml`.
 
 To restore, stop the bot, replace the file inside the `corpus` volume, and start it again.
 
 **Start the corpus over**
 
 ```sh
-docker compose -f docker-compose.prod.yml down
+docker compose -f docker-compose.prod.yml down     # stops AND REMOVES the container
 docker volume rm peregrine_corpus
+set -a && . ./deployed-tag.env && set +a           # pin the tag, or you fall through to :latest
 docker compose -f docker-compose.prod.yml up -d
 ```
 
-Required once when deploying M6b, since the key layout changed and old data is not migrated. Skipping it does not corrupt anything: `storage.Open` refuses the old file and the container fails to start with an error saying to do this.
+Three things here are each a step somebody skips.
+
+`down` rather than `stop`, because **a stopped container still holds its volumes** and `volume rm` is refused while it exists. `down` does not remove named volumes itself, which is why the explicit `volume rm` sits between the two.
+
+Sourcing `deployed-tag.env` is not optional even though the rollback recipe above is the only other place it appears. Without it the compose file falls through to its `:-latest` default, and although CI does push `:latest`, the deploy script ends with `docker logout ghcr.io`, so a hand-run pull of a private package fails with a bare `unauthorized`. The pinned SHA is already in the local image cache from the last deploy, so pinning it means no registry access at all. This omission was a real papercut: the recipe was followed on the first production deploy and failed at exactly this step.
+
+Skipping the whole thing does not corrupt anything. `storage.Open` refuses a corpus it does not recognise and the container fails to start with an error naming this command, which is what happened on the first deploy to a host that had run a pre-M6 build by hand.
 
 ## Development
 

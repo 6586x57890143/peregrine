@@ -99,14 +99,55 @@ func New(store *storage.Store, opts Options) *Generator {
 	return &Generator{store: store, opts: opts}
 }
 
-// Sentence generates a reply to prompt, steered by mem, and returns "" when there is
-// nothing worth saying.
+// Outcome says WHY Sentence produced nothing, which the caller needs in order to log
+// something an operator can act on.
+//
+// An empty string with a nil error used to cover three different situations, and the
+// difference between them is the difference between "wait" and "your configuration is
+// wrong". A bot that had learned 27 messages and stayed quiet reported nothing at all, and
+// working out which of the three it was took reading the source (SPEC.md section 8, finding
+// 32).
+type Outcome int
+
+const (
+	// Produced means there is a sentence.
+	Produced Outcome = iota
+
+	// CorpusEmpty means nothing has been learned yet, so there was nothing to say. On a
+	// fresh deploy this is the expected answer until ingestion has run.
+	CorpusEmpty
+
+	// TooShort means every re-seed dead-ended below the two-word floor.
+	//
+	// On a YOUNG corpus this usually means the author-diversity gate is doing its job:
+	// PEREGRINE_MIN_DISTINCT_AUTHORS defaults to 2, so until several people have said
+	// similar things almost no continuation is eligible and the walk dies immediately. It is
+	// the single most likely reason a freshly deployed bot is mute, and it is not a fault.
+	TooShort
+)
+
+// String names the outcome for a log field.
+func (o Outcome) String() string {
+	switch o {
+	case Produced:
+		return "produced"
+	case CorpusEmpty:
+		return "corpus-empty"
+	case TooShort:
+		return "too-short"
+	}
+	return "unknown"
+}
+
+// Sentence generates a reply to prompt, steered by mem, and returns "" with a reason when
+// there is nothing worth saying.
 //
 // Returning empty is a normal outcome rather than a failure: an empty corpus, a young one
 // where the author-diversity gate refuses everything, or a dead-ended seed all produce it.
 // The caller stays silent, which is what this bot does anyway whenever it decides not to
-// answer.
-func (g *Generator) Sentence(prompt string, roast bool, mem *Memory, emoji EmojiResolver) (string, error) {
+// answer. What the caller must NOT do is stay silent in the log as well: the bot's silence
+// is a feature and the operator's is a bug.
+func (g *Generator) Sentence(prompt string, roast bool, mem *Memory, emoji EmojiResolver) (string, Outcome, error) {
 	promptWords := text.Tokenize(prompt)
 	if len(promptWords) == 0 {
 		promptWords = []string{"<START>"}
@@ -120,6 +161,7 @@ func (g *Generator) Sentence(prompt string, roast bool, mem *Memory, emoji Emoji
 	var (
 		sentence        []string
 		recognizedNames []string
+		empty           bool
 	)
 
 	// ONE read transaction for the whole attempt, and genuinely one: everything inside
@@ -128,6 +170,10 @@ func (g *Generator) Sentence(prompt string, roast bool, mem *Memory, emoji Emoji
 	// answer "is there anything in here" (finding 11).
 	err := g.store.View(func(r *storage.Reader) error {
 		if r.CorpusEmpty() {
+			// Recorded rather than inferred from the empty sentence below, because a
+			// dead-ended walk on a populated corpus produces the same empty slice and the
+			// two need different advice.
+			empty = true
 			return nil
 		}
 
@@ -163,14 +209,17 @@ func (g *Generator) Sentence(prompt string, roast bool, mem *Memory, emoji Emoji
 		return nil
 	})
 	if err != nil {
-		return "", err
+		return "", Produced, err
+	}
+	if empty {
+		return "", CorpusEmpty, nil
 	}
 
 	// Below two words there is nothing worth posting. One word is not a punchy reply, it is
 	// a reply that looks broken, and silence is indistinguishable from the bot choosing not
 	// to answer, which it does all the time anyway.
 	if len(sentence) < 2 {
-		return "", nil
+		return "", TooShort, nil
 	}
 
 	final := strings.Join(sentence, " ")
@@ -185,7 +234,7 @@ func (g *Generator) Sentence(prompt string, roast bool, mem *Memory, emoji Emoji
 	if roast {
 		persona = markov.PersonaRoast
 	}
-	return markov.Style(nil, markov.DefaultWeights(), final, persona, len(recognizedNames) > 0), nil
+	return markov.Style(nil, markov.DefaultWeights(), final, persona, len(recognizedNames) > 0), Produced, nil
 }
 
 // attempt drives one sentence out of the engine and returns it with the names it

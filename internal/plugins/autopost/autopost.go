@@ -48,9 +48,10 @@ type Guard interface {
 	Send(channelID, content string) (*discordgo.Message, bool)
 }
 
-// Speaker produces a sentence. internal/generate's Generator satisfies it.
+// Speaker produces a sentence, and says why when it does not. internal/generate's Generator
+// satisfies it.
 type Speaker interface {
-	Sentence(prompt string, roast bool, mem *generate.Memory, emoji generate.EmojiResolver) (string, error)
+	Sentence(prompt string, roast bool, mem *generate.Memory, emoji generate.EmojiResolver) (string, generate.Outcome, error)
 }
 
 // Options are the dials.
@@ -157,13 +158,14 @@ func (s *Service) post() {
 	// Seeded with the CHANNEL'S OWN recent context. The old code passed the channel's
 	// LastMessageID: a snowflake, tokenized into a meaningless integer and fed to the
 	// generator as if somebody had said it.
-	msg, err := s.speaker.Sentence("autonomous thought", false, s.memories.For(channelID), s.emoji)
+	msg, outcome, err := s.speaker.Sentence("autonomous thought", false, s.memories.For(channelID), s.emoji)
 	if err != nil {
 		log.Println("[AUTONOMOUS] Error generating message:", err)
 		return
 	}
 	if msg == "" {
-		log.Println("[AUTONOMOUS] Generated message is empty, skipping.")
+		// This path already said something; the reason is what it was missing.
+		log.Printf("[AUTONOMOUS] Nothing to post, skipping: %s", outcome)
 		return
 	}
 
