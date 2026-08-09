@@ -18,6 +18,7 @@ import (
 	"github.com/6586x57890143/peregrine/internal/plugins/chat"
 	"github.com/6586x57890143/peregrine/internal/plugins/games"
 	"github.com/6586x57890143/peregrine/internal/plugins/images"
+	"github.com/6586x57890143/peregrine/internal/plugins/voicenote"
 	"github.com/6586x57890143/peregrine/internal/safety"
 	"github.com/6586x57890143/peregrine/internal/storage"
 	"github.com/6586x57890143/peregrine/internal/wordgame"
@@ -136,15 +137,13 @@ func registerServices(
 		ActiveChannelWindow: cfg.ActiveChannelWindow,
 	})
 
-	// Voice transcription has no engine wired in yet, so the reactor's voice step declines.
-	// Said out loud rather than left silent, because a feature that is enabled and does
-	// nothing is the exact shape of findings 30 and G3: the operator sets the flag, watches
-	// nothing happen, and concludes the bot ignores its configuration. M12 supplies the
-	// plugin.
-	if cfg.EnableTranscription {
-		log.Warn("PEREGRINE_ENABLE_TRANSCRIPTION is true but no transcription engine is compiled in, " +
-			"so voice notes will be ignored (SPEC.md section 9, M12)")
-	}
+	// Transcription, over an Engine seam whose only implementation in this repository is a
+	// stub. StubEngine is named rather than passed as nil, so what is being wired is visible
+	// here: swapping in a real engine is this one argument.
+	voiceSvc := voicenote.New(voicenote.StubEngine(), guard, voicenote.Options{
+		Enabled:   cfg.EnableTranscription,
+		QueueSize: cfg.TranscriptionQueue,
+	})
 
 	reactor := chat.New(chat.Deps{
 		Session:  session,
@@ -159,7 +158,7 @@ func registerServices(
 		Aggro:    aggroSvc,
 		Images:   imagesSvc,
 		Games:    gamesSvc,
-		Voice:    nil,
+		Voice:    voiceSvc,
 		Options: chat.Options{
 			SelfMention:  cfg.SelfMention,
 			RoastChance:  cfg.RoastChance,
@@ -179,6 +178,7 @@ func registerServices(
 	registry.Register(imagesSvc)
 	registry.Register(gamesSvc)
 	registry.Register(autopostSvc)
+	registry.Register(voiceSvc)
 	registry.Register(reactor)
 	registry.Register(legacy.New(learner))
 	return nil
