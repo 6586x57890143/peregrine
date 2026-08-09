@@ -90,8 +90,19 @@ func TestLoadDefaults(t *testing.T) {
 		{"ImageCacheSize", cfg.ImageCacheSize, 100},
 		{"AutonomousPostTick", cfg.AutonomousPostTick, 10 * time.Minute},
 		{"AutonomousSkipChance", cfg.AutonomousSkipChance, 0.90},
-		{"WordGameMode", cfg.WordGameMode, WordGameModeInterval},
-		{"WordGameInterval", cfg.WordGameInterval, 2 * time.Minute},
+		// Activity mode as of M11: a puzzle when a channel is busy reads as the bot
+		// joining in, whereas one on a timer reads as it interrupting.
+		{"WordGameMode", cfg.WordGameMode, WordGameModeActivity},
+		// 30 minutes, not the 2 that stood here. Two was plainly a leftover from testing.
+		{"WordGameInterval", cfg.WordGameInterval, 30 * time.Minute},
+		{"WordGameTimeout", cfg.WordGameTimeout, time.Minute},
+		{"WordGameAnnounceTTL", cfg.WordGameAnnounceTTL, 30 * time.Second},
+		{"WordGameActivityWindow", cfg.WordGameActivityWindow, 5 * time.Minute},
+		{"WordGameActivityThreshold", cfg.WordGameActivityThreshold, 5},
+		{"WordGameTriggerChance", cfg.WordGameTriggerChance, 0.025},
+		{"WordGameMinLength", cfg.WordGameMinLength, 5},
+		{"WordGameMaxLength", cfg.WordGameMaxLength, 12},
+		{"WordGameSweepTick", cfg.WordGameSweepTick, 5 * time.Second},
 		// Both safety defaults are permissive-looking and are checked here so that
 		// changing either is a visible decision. An unset blocklist path is allowed
 		// (cmd/bot warns loudly), and writes are not paused by default because the
@@ -100,7 +111,11 @@ func TestLoadDefaults(t *testing.T) {
 		{"PauseAllWrites", cfg.PauseAllWrites, false},
 		{"EnableImageRepost", cfg.EnableImageRepost, true},
 		{"EnableAutonomousPost", cfg.EnableAutonomousPost, false},
-		{"EnableWordGames", cfg.EnableWordGames, false},
+		// ON as of M11, and that is the point of the milestone rather than a slip. Word
+		// games were switched off by a compile-time constant, then by a flag defaulting
+		// false, and a game nobody can play is not a conservative default: it is a
+		// feature that does not exist.
+		{"EnableWordGames", cfg.EnableWordGames, true},
 		// Deliberately differs from the old in-code constant, which was true.
 		// See the field comment: none of the transcription toolchain exists in a
 		// distroless image, so on by default meant the only visible behavior in

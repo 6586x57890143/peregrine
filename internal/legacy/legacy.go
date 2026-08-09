@@ -45,9 +45,8 @@ import (
 	"github.com/6586x57890143/peregrine/internal/safety"
 	"github.com/6586x57890143/peregrine/internal/storage"
 	"github.com/6586x57890143/peregrine/internal/text"
+	"github.com/6586x57890143/peregrine/internal/wordgame"
 	"github.com/6586x57890143/peregrine/voicenotes"
-	"github.com/6586x57890143/peregrine/wordgames"
-	"github.com/beevik/ntp"
 	"github.com/bwmarrin/discordgo"
 	"golang.org/x/sync/errgroup"
 )
@@ -217,16 +216,24 @@ var botID string
 
 var transcriptionQueue chan TranscriptionJob // A queue for voice transcription jobs
 
-var activeWordGames = make(map[string]*wordgames.ScrambleGame)
-var wordGameMutex = &sync.Mutex{}
+// games owns every live word-game puzzle and the activity tracking that starts one.
+//
+// This replaces four package-level variables and two mutexes: activeWordGames,
+// channelActivity, wordGameMutex and activityMutex, plus a wordGamesAvailable flag. Those
+// two locks were taken in a fixed order at one call site and separately at another, which
+// is a deadlock waiting for a third caller, and the state they guarded had no owner: the
+// lifecycle lived in three hand-copied goroutines that slept and then acted.
+//
+// The Manager takes no session and performs no I/O. It returns what should be said, and
+// the caller sends it through the guard, so a word-game announcement cannot skip mention
+// suppression or the emit gate.
+var games *wordgame.Manager
 
-// wordGamesAvailable records whether the dictionary actually loaded. Checked
-// alongside cfg.EnableWordGames so that a failed load degrades to "word games off"
-// rather than to a panic on an empty word list.
-var wordGamesAvailable bool
-var channelActivity = make(map[string][]time.Time)
-var activityMutex = &sync.Mutex{}
-var leaderboard *wordgames.Leaderboard
+// leaderboard is the weekly win tally. Its mutex is inside it now, and its marshalling
+// happens under that mutex, which is the fix for a real data race rather than a tidy-up:
+// the old struct exported its mutex and was JSON-marshalled outside it while AddWin held
+// it, and a concurrent map read and write is a FATAL runtime error in Go.
+var leaderboard *wordgame.Leaderboard
 
 // ----- BIRD AGGRO -----
 var birdAggroTargetID string
@@ -309,8 +316,9 @@ var stopWords = map[string]struct{}{
 // Auto-seeding also removes the time.Now().UnixNano() seed, which was the
 // conventional but wrong way to get randomness that differs per process.
 
-// lastWordGameTime tracks the last time a word game was posted in interval mode.
-var lastWordGameTime time.Time
+// lastWordGameTime is gone. Interval mode is a core.Loop now, so the interval is the
+// ticker's rather than a timestamp compared by hand inside an unrelated function: it used
+// to pace the autonomous poster, which does not post word games (finding 30).
 
 // Service is everything peregrine does, as one core.Service.
 //
@@ -364,21 +372,32 @@ func (s *Service) Init(deps core.Deps) error {
 	// would be nil for every message that arrived in that window.
 	guard = discordguard.New(dg, emitGate{g: gate}, deps.Logger, cfg.IgnoreChannels)
 
-	lastWordGameTime = time.Now() // Initialize with current time on startup
-
 	// Load the word game dictionary. Deliberately not fatal: word games are one
 	// optional feature, and taking the whole bot down because a 64 KB word list
 	// would not load meant an unrelated asset problem killed learning,
 	// generation, and every other behavior with it. A failure here disables word
 	// games and says so. PEREGRINE_WORDGAME_DICTIONARY overrides the embedded
 	// list; empty means use the embedded one.
-	if err := wordgames.LoadDictionary(cfg.WordGameDictionary); err != nil {
+	dict, err := wordgame.LoadDictionary(cfg.WordGameDictionary, wordgame.DictionaryOptions{
+		MinLength: cfg.WordGameMinLength,
+		MaxLength: cfg.WordGameMaxLength,
+	})
+	if err != nil {
+		// A nil dictionary is fine: Manager.Available reports false and every entry point
+		// declines. That is the general rule here, and it is why this is a warning rather
+		// than a fatal: peregrine is a bag of loosely related engagement behaviours and
+		// exactly one of them failing should disable that one, never the process.
 		log.Printf("[WARN] Word game dictionary failed to load, word games disabled: %v", err)
-		wordGamesAvailable = false
 	} else {
-		log.Println("[INFO] Word game dictionary loaded.")
-		wordGamesAvailable = true
+		log.Printf("[INFO] Word game dictionary loaded, %d usable words.", dict.Len())
 	}
+	games = wordgame.NewManager(dict, nil, wordgame.Options{
+		Timeout:           cfg.WordGameTimeout,
+		AnnounceTTL:       cfg.WordGameAnnounceTTL,
+		ActivityWindow:    cfg.WordGameActivityWindow,
+		ActivityThreshold: cfg.WordGameActivityThreshold,
+		TriggerChance:     cfg.WordGameTriggerChance,
+	})
 
 	// Load persistent states from DB
 	_ = store.View(func(r *storage.Reader) error {
@@ -391,7 +410,7 @@ func (s *Service) Init(deps core.Deps) error {
 		leaderboard, err = loadLeaderboard(r)
 		if err != nil {
 			log.Printf("[WARN] Failed to load leaderboard, starting fresh: %v", err)
-			leaderboard = wordgames.NewLeaderboard()
+			leaderboard = wordgame.NewLeaderboard(time.Now())
 		} else {
 			log.Println("[INFO] Leaderboard loaded.")
 		}
@@ -484,8 +503,37 @@ func (s *Service) Start(ctx context.Context) error {
 		{
 			Name:  "leaderboard-reset",
 			Every: cfg.LeaderboardTick,
-			Fn:    func(context.Context) { maybeResetLeaderboard() },
+			// Immediate, which the NTP version could not usefully be: it only returned
+			// true inside one hour on Monday, so a startup check almost always answered
+			// no. Comparing week boundaries makes a check at startup the useful one,
+			// because that is when a bot returning from downtime notices the week turned
+			// while it was off.
+			Immediate: true,
+			Fn:        func(context.Context) { maybeResetLeaderboard() },
 		},
+	}
+	if cfg.EnableWordGames {
+		// One sweep replaces up to three goroutines per game. Each of those slept and then
+		// acted with no context, so after shutdown they woke against a closed session; the
+		// count was bounded only by how often people played.
+		loops = append(loops, core.Loop{
+			Name:  "wordgame-sweep",
+			Every: cfg.WordGameSweepTick,
+			Fn:    func(context.Context) { sweepWordGames(dg) },
+		})
+
+		// Interval mode gets its own loop, which is what makes the setting mean what its
+		// name says. It used to pace the AUTONOMOUS POSTER, which posts Markov text, so
+		// PEREGRINE_WORDGAME_INTERVAL controlled how often the bot said something that was
+		// not a word game (finding 30). Activity mode has no loop because its trigger is
+		// per message, in the reactor.
+		if cfg.WordGameMode == config.WordGameModeInterval {
+			loops = append(loops, core.Loop{
+				Name:  "wordgame-interval",
+				Every: cfg.WordGameInterval,
+				Fn:    func(ctx context.Context) { startIntervalWordGame(ctx, dg) },
+			})
+		}
 	}
 	if cfg.EnableAutonomousPost {
 		loops = append(loops, core.Loop{
@@ -602,28 +650,32 @@ func maybeTriggerAggro(ctx context.Context, dg *discordgo.Session) {
 	}
 }
 
-// maybeResetLeaderboard is likewise the body of a former inline ticker.
+// maybeResetLeaderboard clears the weekly tally when the week has turned over.
+//
+// THE NTP QUERY IS GONE (SPEC.md section 8, finding 17). The old version asked
+// pool.ntp.org what day it was, hourly, and reset only when the answer was Monday between
+// 00:00 and 00:59 UTC. Three things were wrong with that:
+//
+//   - It went to the network for something time.Now() answers. A bot whose clock is an
+//     hour out has a much larger problem than a stale leaderboard.
+//   - A failed query inside that one-hour window skipped the reset for a WHOLE WEEK, and
+//     logged an error nobody would connect to a stale board six days later.
+//   - The reset had to be observed within a specific hour, so it depended on the tick
+//     landing there. A restart moved the tick's phase, and downtime across Monday morning
+//     meant it never happened at all.
+//
+// Comparing week boundaries has none of those properties, and the important one is that it
+// CATCHES UP: a bot that was off all Monday resets on its first tick back, because the
+// week it holds is still the old one. The decision itself lives in the leaderboard, next
+// to the field it reads, so the display and the reset cannot disagree about when the week
+// turns.
 func maybeResetLeaderboard() {
-	reset, err := isTimeToResetLeaderboard()
-	if err != nil {
-		log.Printf("[LEADERBOARD] Error checking reset time: %v", err)
+	if !leaderboard.MaybeReset(time.Now()) {
 		return
 	}
-	if !reset {
-		return
-	}
-	leaderboard.Mutex.Lock()
-	defer leaderboard.Mutex.Unlock()
+	log.Printf("[LEADERBOARD] New week starting %s, leaderboard reset.",
+		leaderboard.WeekStart().Format(time.DateOnly))
 
-	now := time.Now().UTC()
-	// Final check to ensure we only reset once per week
-	if now.Sub(leaderboard.LastReset) <= 24*time.Hour {
-		return
-	}
-	log.Println("[LEADERBOARD] It's a new week! Resetting the leaderboard.")
-	leaderboard.WeekStartDate = now
-	leaderboard.LastReset = now
-	leaderboard.Scores = make(map[string]wordgames.LeaderboardEntry)
 	if err := store.Update(func(w *storage.Writer) error {
 		return saveLeaderboard(w, leaderboard)
 	}); err != nil {
@@ -839,8 +891,14 @@ func loadImageURLsFromDB() ([]string, error) {
 	return urls, err
 }
 
-// saveLeaderboard saves the current leaderboard state.
-func saveLeaderboard(w *storage.Writer, l *wordgames.Leaderboard) error {
+// saveLeaderboard persists the leaderboard.
+//
+// json.Marshal is safe to call concurrently with AddWin now, because Leaderboard
+// implements MarshalJSON and takes its own lock. It was NOT safe before: the mutex was an
+// exported field of the marshalled struct and the marshalling ran outside it, so a win
+// landing during a save was a concurrent map read and write, which in Go is a fatal
+// runtime error rather than a recoverable panic.
+func saveLeaderboard(w *storage.Writer, l *wordgame.Leaderboard) error {
 	encoded, err := json.Marshal(l)
 	if err != nil {
 		return err
@@ -848,22 +906,23 @@ func saveLeaderboard(w *storage.Writer, l *wordgames.Leaderboard) error {
 	return w.PutBlob(storage.BlobLeaderboard, "current", encoded)
 }
 
-// loadLeaderboard loads the leaderboard state.
-func loadLeaderboard(r *storage.Reader) (*wordgames.Leaderboard, error) {
+// loadLeaderboard restores the leaderboard, or starts a fresh one.
+//
+// The pre-M11 field names are still read, and that asymmetry with the corpus is
+// deliberate: storage.Open refuses a corpus written by an older layout outright, because a
+// corpus is re-derivable from Discord history. A week of wins is not re-derivable from
+// anything, so discarding it would lose data nobody can rebuild.
+func loadLeaderboard(r *storage.Reader) (*wordgame.Leaderboard, error) {
 	v, err := r.GetBlob(storage.BlobLeaderboard, "current")
 	if err != nil {
 		return nil, err
 	}
 	if v == nil {
-		return wordgames.NewLeaderboard(), nil // No state saved, create a new one
+		return wordgame.NewLeaderboard(time.Now()), nil
 	}
-	var l wordgames.Leaderboard
+	var l wordgame.Leaderboard
 	if err := json.Unmarshal(v, &l); err != nil {
 		return nil, err
-	}
-	// Ensure the map is initialized
-	if l.Scores == nil {
-		l.Scores = make(map[string]wordgames.LeaderboardEntry)
 	}
 	return &l, nil
 }
@@ -902,21 +961,6 @@ func loadAllUserStats(r *storage.Reader) (map[string]int, error) {
 		}
 	}
 	return scores, nil
-}
-
-// isTimeToResetLeaderboard checks an NTP server to see if it's Monday morning UTC.
-func isTimeToResetLeaderboard() (bool, error) {
-	ntpTime, err := ntp.Time("pool.ntp.org")
-	if err != nil {
-		return false, fmt.Errorf("failed to query NTP server: %w", err)
-	}
-
-	utcTime := ntpTime.UTC()
-	// Reset between 00:00 and 01:00 on Monday UTC
-	if utcTime.Weekday() == time.Monday && utcTime.Hour() == 0 {
-		return true, nil
-	}
-	return false, nil
 }
 
 // getNextMap is gone, and it was the other half of finding 1.
@@ -2014,45 +2058,68 @@ func findRandomActiveUser(ctx context.Context, s *discordgo.Session) string {
 //  Autonomous posting
 // -----------------------------------------------------------------------------
 
+// busiestChannel returns the ID of the most active channel the bot can see, or "".
+//
+// Extracted in M11 because two callers want it: autonomous posting and interval-mode word
+// games. It had been inline in the first, so the second would have had to copy it, and a
+// copy is how the two would eventually disagree about what "busiest" means.
+//
+// allow, when non-empty, restricts the choice. Filtering while CHOOSING rather than after
+// is the fix for a real bug: the old code scored every channel, picked the winner, and then
+// rejected it if it was not on the allowlist, so a bot whose busiest channel was not listed
+// posted nothing and logged a rejection every single cycle. Now the busiest ALLOWED channel
+// wins, which is what an allowlist means.
+//
+// The "general" bonus is preserved and is a judgement about where a bot is welcome to speak
+// unprompted rather than a measurement.
+func busiestChannel(ctx context.Context, s *discordgo.Session, allow []string) string {
+	guilds, err := s.UserGuilds(100, "", "", false)
+	if err != nil || len(guilds) == 0 {
+		log.Println("[ACTIVE] No guilds available or error:", err)
+		return ""
+	}
+
+	allowed := make(map[string]struct{}, len(allow))
+	for _, id := range allow {
+		if id != "" {
+			allowed[id] = struct{}{}
+		}
+	}
+
+	best := ""
+	bestScore := 0.0
+	for _, g := range guilds {
+		if g == nil {
+			continue
+		}
+		for _, info := range getActiveChannels(ctx, s, g.ID, time.Now().Add(-cfg.IngestLookback)) {
+			if len(allowed) > 0 {
+				if _, ok := allowed[info.Channel.ID]; !ok {
+					continue
+				}
+			}
+			score := float64(info.MessageCount)
+			if strings.Contains(strings.ToLower(info.Channel.Name), "general") {
+				score *= 1.5
+			}
+			// Ties break on channel ID, so the choice does not depend on which REST call
+			// returned first. getActiveChannels sorts its result for the same reason.
+			if score > bestScore || (score == bestScore && info.Channel.ID < best) {
+				bestScore = score
+				best = info.Channel.ID
+			}
+		}
+	}
+	return best
+}
+
 // autonomousPost picks an active channel and posts a generated message occasionally.
 func autonomousPost(ctx context.Context, dg *discordgo.Session) {
 	start := time.Now()
 	log.Println("[AUTONOMOUS] Starting autonomous post cycle...")
 
-	// Fetch guilds
-	guilds, err := dg.UserGuilds(100, "", "", false)
-	if err != nil || len(guilds) == 0 {
-		log.Println("[AUTONOMOUS] No guilds available or error:", err)
-		return
-	}
-
-	var bestChannel *discordgo.Channel
-	maxScore := 0.0
-
-	for _, gptr := range guilds {
-		if gptr == nil {
-			continue
-		}
-		channels := getActiveChannels(ctx, dg, gptr.ID, time.Now().Add(-cfg.IngestLookback))
-		if len(channels) == 0 {
-			log.Printf("[AUTONOMOUS] Guild %s has no active channels", gptr.Name)
-			continue
-		}
-		for _, chInfo := range channels {
-			score := float64(chInfo.MessageCount)
-			if strings.Contains(strings.ToLower(chInfo.Channel.Name), "general") {
-				score *= 1.5 // Apply a bonus to general channels
-			}
-
-			log.Printf("[AUTONOMOUS] Channel #%s has %d recent messages, score: %.2f", chInfo.Channel.Name, chInfo.MessageCount, score)
-			if score > maxScore {
-				maxScore = score
-				bestChannel = chInfo.Channel
-			}
-		}
-	}
-
-	if bestChannel == nil {
+	channelID := busiestChannel(ctx, dg, cfg.AutonomousPostChannels)
+	if channelID == "" {
 		log.Println("[AUTONOMOUS] No active channel found, skipping post")
 		return
 	}
@@ -2064,35 +2131,37 @@ func autonomousPost(ctx context.Context, dg *discordgo.Session) {
 		return
 	}
 
-	// Only post word games as autonomous posts for now
-	if !cfg.EnableWordGames || !wordGamesAvailable {
-		return
-	}
+	// THE WORD-GAME GATE THAT USED TO BE HERE IS GONE, and it was a wiring error rather
+	// than a policy (SPEC.md section 8, finding 30).
+	//
+	// This function posts a MARKOV SENTENCE. It always has: the call below is
+	// generateSentenceWithContext. But it returned early unless word games were enabled
+	// AND their dictionary had loaded, and then paced itself with
+	// PEREGRINE_WORDGAME_MODE and PEREGRINE_WORDGAME_INTERVAL, while two comments
+	// claimed it posted word games.
+	//
+	// The consequence is the one that matters: setting
+	// PEREGRINE_ENABLE_AUTONOMOUS_POST=true produced NOTHING unless word games happened
+	// to be on too, which they were not by default. That is the third distinct way this
+	// feature has been dead, after the compile-time constant and the empty allowlist.
+	//
+	// Pacing is the skip chance above plus the tick, both of which are autonomous
+	// posting's own configuration. Word games have their own trigger in the reactor, and
+	// PEREGRINE_WORDGAME_MODE and PEREGRINE_WORDGAME_INTERVAL are what M11 rewires to
+	// mean what they say.
 
-	// Word game pacing. The outer `if EnableWordGames` that used to wrap this was
-	// unreachable-false: the guard above already returned when word games are
-	// off. Activity mode intentionally has no branch here, because for an
-	// autonomous post the global skip chance above already provides the pacing;
-	// only interval mode needs its own clock.
-	if cfg.WordGameMode == config.WordGameModeInterval {
-		if time.Since(lastWordGameTime) < cfg.WordGameInterval {
-			log.Printf("[AUTONOMOUS] Not time for a word game yet (next in %v)", cfg.WordGameInterval-time.Since(lastWordGameTime))
-			return
-		}
-		lastWordGameTime = time.Now()
-	}
+	// The allowlist check that used to be here is gone, because busiestChannel applies it
+	// while CHOOSING rather than after. Checking afterwards meant the busiest channel in
+	// the server won the scoring and was then rejected, so a bot whose allowlist did not
+	// happen to contain its busiest channel posted nothing and logged a rejection every
+	// cycle. Filtering first picks the busiest ALLOWED channel, which is what the
+	// allowlist means.
 
-	// Only post word games in allowed channels
-	if !stringContains(cfg.AutonomousPostChannels, bestChannel.ID) {
-		log.Printf("[AUTONOMOUS] Channel %s not in allowed list for autonomous posting, skipping word game", bestChannel.Name)
-		return
-	}
-
-	// Generate message (will be a word game in this current implementation)
-	// For autonomous posts, we'll create a temporary memory instance based on the most active channel
-	tempMemory := &ConversationMemory{}
-	tempMemory.AddMessage(bestChannel.LastMessageID) // Seed with the last message ID
-	msg, err := generateSentenceWithContext(dg, "autonomous thought", false, tempMemory)
+	// The conversation memory is seeded with the channel's own recent context rather than
+	// with its last message ID, which is what the old code passed: a snowflake, tokenized
+	// into a meaningless number and fed to the generator as if it were something somebody
+	// said.
+	msg, err := generateSentenceWithContext(dg, "autonomous thought", false, memoryFor(channelID))
 	if err != nil {
 		log.Println("[AUTONOMOUS] Error generating message:", err)
 		return
@@ -2107,8 +2176,8 @@ func autonomousPost(ctx context.Context, dg *discordgo.Session) {
 	// because the gate sat at the generation exit and the autonomous poster called a
 	// different one. An unprompted post is the output with the least human context
 	// around it, so it is the worst one to have been ungated.
-	if sentMsg, ok := guard.Send(bestChannel.ID, msg); ok {
-		log.Printf("[AUTONOMOUS] Sent message in #%s: %s (ID: %s)", bestChannel.Name, msg, sentMsg.ID)
+	if sentMsg, ok := guard.Send(channelID, msg); ok {
+		log.Printf("[AUTONOMOUS] Sent message in %s: %s (ID: %s)", channelID, msg, sentMsg.ID)
 	}
 
 	log.Printf("[AUTONOMOUS] Cycle finished in %s", time.Since(start))
@@ -2233,12 +2302,8 @@ func monitorPerformance(ctx context.Context, dg *discordgo.Session) {
 	}
 }
 
-// stringContains is a helper function to check if a string is in a slice of strings.
-func stringContains(slice []string, item string) bool {
-	for _, s := range slice {
-		if s == item {
-			return true
-		}
-	}
-	return false
-}
+// stringContains is gone. It reimplemented slices.Contains, and its last caller was the
+// autonomous poster's allowlist check, which busiestChannel now applies while choosing
+// rather than after (SPEC.md section 8, the folded-in list). The linter reporting it unused
+// is how that was confirmed rather than assumed, which is the same way M6b established that
+// filter.go's last two wrappers existed only for the cleanup pass.
