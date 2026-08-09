@@ -34,6 +34,13 @@ type Options struct {
 
 	// ActivityWindow and ActivityThreshold decide when a channel is busy enough to
 	// deserve a game: at least Threshold messages within Window.
+	//
+	// The Manager no longer counts those messages itself. It asks a Counter, which in
+	// production is internal/activity's tracker, because the Manager's own per-channel
+	// activity map was a second copy of a mechanism the aggro and autonomous-post
+	// features needed as well: three consumers, all fed from the same call site, and one
+	// of them counting for itself. ActivityWindow is still owned here, since how busy is
+	// busy enough for a WORD GAME is this feature's judgement rather than the tracker's.
 	ActivityWindow    time.Duration
 	ActivityThreshold int
 
@@ -41,12 +48,7 @@ type Options struct {
 	// busy enough.
 	TriggerChance float64
 
-	// MaxChannels bounds the activity map.
-	//
-	// The old one was keyed by channel ID and never pruned except when a game started in
-	// that channel, so a bot in many guilds accumulated an entry per channel forever.
-	// It is the same slow leak the conversation memory had before M7b, and the same kind
-	// a test using one channel would never reveal.
+	// MaxChannels bounds the cooldown map, which is the only per-channel map left here.
 	MaxChannels int
 }
 
@@ -83,16 +85,32 @@ func (o Options) withDefaults() Options {
 // or delete, so the caller can route it through the send chokepoint and the tests need no
 // Discord at all.
 type Manager struct {
-	mu       sync.Mutex
-	games    map[string]*Game // channel ID -> live game
-	activity map[string][]time.Time
-	pending  []PendingDelete
+	mu      sync.Mutex
+	games   map[string]*Game     // channel ID -> live game
+	started map[string]time.Time // channel ID -> when a game last started there
+	pending []PendingDelete
 
-	dict *Dictionary
-	src  Source
-	opts Options
-	now  func() time.Time
+	dict    *Dictionary
+	src     Source
+	counter Counter
+	opts    Options
+	now     func() time.Time
 }
+
+// Counter is how the Manager finds out whether a channel is busy.
+//
+// Declared here rather than imported, so this package still depends on nothing and its
+// tests still need no tracker: internal/activity's Tracker satisfies it structurally.
+type Counter interface {
+	Count(channelID string, window time.Duration) int
+}
+
+// noCounter reports every channel as silent, which disables the activity trigger. It is
+// what a nil Counter means, and it fails in the quiet direction: no counter is a reason
+// to start no games, never a reason to start one on every message.
+type noCounter struct{}
+
+func (noCounter) Count(string, time.Duration) int { return 0 }
 
 // PendingDelete is a message to remove once its time is up.
 //
@@ -106,18 +124,23 @@ type PendingDelete struct {
 	Due       time.Time
 }
 
-// NewManager builds a Manager. A nil Source means DefaultSource.
-func NewManager(dict *Dictionary, src Source, opts Options) *Manager {
+// NewManager builds a Manager. A nil Source means DefaultSource, and a nil Counter
+// disables the activity trigger.
+func NewManager(dict *Dictionary, src Source, counter Counter, opts Options) *Manager {
 	if src == nil {
 		src = DefaultSource{}
 	}
+	if counter == nil {
+		counter = noCounter{}
+	}
 	return &Manager{
-		games:    map[string]*Game{},
-		activity: map[string][]time.Time{},
-		dict:     dict,
-		src:      src,
-		opts:     opts.withDefaults(),
-		now:      time.Now,
+		games:   map[string]*Game{},
+		started: map[string]time.Time{},
+		dict:    dict,
+		src:     src,
+		counter: counter,
+		opts:    opts.withDefaults(),
+		now:     time.Now,
 	}
 }
 
@@ -157,9 +180,16 @@ func (m *Manager) Start(channelID string) (*Game, error) {
 	}
 	m.games[channelID] = g
 
-	// Starting a game clears the channel's activity, so the trigger has to build up
-	// again rather than firing on the next message.
-	delete(m.activity, channelID)
+	// Recorded so the activity trigger cannot fire again here immediately. This replaces
+	// clearing the channel's activity counter, which is no longer the Manager's to
+	// clear: the tracker is a shared observer and zeroing it would lie to the aggro and
+	// autonomous-post features about how busy the channel is. A cooldown of one
+	// ActivityWindow reproduces the old behaviour exactly, because clearing meant a full
+	// window of fresh traffic had to accumulate before the threshold could be met again.
+	m.started[channelID] = now
+	if len(m.started) > m.opts.MaxChannels {
+		m.evictOldestCooldown(channelID)
+	}
 
 	return g, nil
 }
@@ -210,60 +240,64 @@ func (m *Manager) Guess(channelID, guess string) (*Game, bool) {
 	return g, true
 }
 
-// Note records channel activity and reports whether a game should start.
+// MaybeStart reports whether a channel has earned a game.
 //
 // It returns a decision rather than starting one, so the caller can check its own
-// preconditions (the feature flag, the guard's ignore list) before committing.
-func (m *Manager) Note(channelID string) bool {
+// preconditions (the feature flag, the guard's ignore list) before committing. It was
+// called Note when it also did the counting; the counting is internal/activity's now,
+// and the name says what is left.
+//
+// Three gates, cheapest first: no game already running here, no game started here
+// within the last ActivityWindow, and at least ActivityThreshold messages inside that
+// window. Then the dice.
+func (m *Manager) MaybeStart(channelID string) bool {
 	if !m.Available() {
 		return false
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	now := m.now()
 
+	m.mu.Lock()
 	if _, playing := m.games[channelID]; playing {
+		m.mu.Unlock()
 		return false
 	}
-
-	now := m.now()
-	cutoff := now.Add(-m.opts.ActivityWindow)
-
-	kept := m.activity[channelID][:0]
-	for _, ts := range m.activity[channelID] {
-		if ts.After(cutoff) {
-			kept = append(kept, ts)
-		}
+	if last, ok := m.started[channelID]; ok && now.Sub(last) < m.opts.ActivityWindow {
+		m.mu.Unlock()
+		return false
 	}
-	kept = append(kept, now)
-	m.activity[channelID] = kept
+	m.mu.Unlock()
 
-	if len(m.activity) > m.opts.MaxChannels {
-		m.evictQuietestChannel(channelID)
-	}
-
-	if len(kept) < m.opts.ActivityThreshold {
+	// Asked outside the lock. The Counter is another package's mutex, and holding this
+	// one across a call into it is how a lock-ordering deadlock gets built. Nothing here
+	// depends on the count and the game map being consistent with each other: the worst
+	// case is starting a game on a count that was true a microsecond ago.
+	if m.counter.Count(channelID, m.opts.ActivityWindow) < m.opts.ActivityThreshold {
 		return false
 	}
 	return m.src.IntN(1_000_000) < int(m.opts.TriggerChance*1_000_000)
 }
 
-// evictQuietestChannel drops the activity entry with the oldest last message, never the
-// one being written. Caller holds the lock.
-func (m *Manager) evictQuietestChannel(protect string) {
+// evictOldestCooldown drops the oldest cooldown entry, never the one being written.
+// Caller holds the lock.
+//
+// The map is keyed by channel and so grows with every guild the bot joins, which is the
+// same slow leak the conversation memory had before M7b and the kind a test using one
+// channel would never reveal. Losing a cooldown early is harmless: the worst outcome is
+// a second game in a channel that has not had one for a while.
+func (m *Manager) evictOldestCooldown(protect string) {
 	var oldestID string
 	var oldest time.Time
-	for id, stamps := range m.activity {
-		if id == protect || len(stamps) == 0 {
+	for id, at := range m.started {
+		if id == protect {
 			continue
 		}
-		last := stamps[len(stamps)-1]
-		if oldestID == "" || last.Before(oldest) {
-			oldestID, oldest = id, last
+		if oldestID == "" || at.Before(oldest) {
+			oldestID, oldest = id, at
 		}
 	}
 	if oldestID != "" {
-		delete(m.activity, oldestID)
+		delete(m.started, oldestID)
 	}
 }
 

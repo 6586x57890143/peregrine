@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/6586x57890143/peregrine/internal/activity"
 )
 
 // clearEnv unsets every variable this package reads, so a test never inherits
@@ -23,8 +25,10 @@ func clearEnv(t *testing.T) {
 		"PEREGRINE_STATUS_TICK", "PEREGRINE_ENABLE_CLUSTERING", "PEREGRINE_CLUSTERING_TICK",
 		"PEREGRINE_LEADERBOARD_CHECK_TICK",
 		"PEREGRINE_AGGRO_TICK", "PEREGRINE_AGGRO_CHANCE", "PEREGRINE_AGGRO_DURATION", "PEREGRINE_AGGRO_EMOJI",
+		"PEREGRINE_AGGRO_ACTIVITY_WINDOW", "PEREGRINE_ACTIVE_CHANNEL_WINDOW",
 		"PEREGRINE_ENABLE_IMAGE_REPOST", "PEREGRINE_IMAGE_REPOST_CHANCE",
 		"PEREGRINE_IMAGE_REPOST_CHANCE_DIRECT", "PEREGRINE_IMAGE_CACHE_SIZE",
+		"PEREGRINE_IMAGE_MAX_PER_AUTHOR",
 		"PEREGRINE_ENABLE_AUTONOMOUS_POST", "PEREGRINE_AUTONOMOUS_POST_CHANNELS",
 		"PEREGRINE_AUTONOMOUS_POST_TICK", "PEREGRINE_AUTONOMOUS_SKIP_CHANCE",
 		"PEREGRINE_ENABLE_WORD_GAMES", "PEREGRINE_WORDGAME_FREQUENCY_MODE",
@@ -321,6 +325,62 @@ func TestAutonomousPostWithChannelsSucceeds(t *testing.T) {
 // TestMaxNGramFloorIsTwo pins the floor. Order 1 makes the n-gram prefix empty,
 // and an empty prefix is a single bbolt key holding a map of the entire
 // vocabulary, rewritten once per word per message, that nothing ever reads.
+// TestTheActivityCeilingFitsTheTracker pins a relationship between two packages that
+// would otherwise be held together by a comment.
+//
+// internal/activity keeps a fixed ring of timestamps per channel, so a count saturates.
+// A word-game threshold above that saturation point could never be met: the variable
+// would be accepted, the trigger would never fire, and nothing in the log would explain
+// it. That is the "knob wired to nothing" failure this package exists to prevent, and it
+// would arrive by someone raising one constant without looking at the other.
+func TestTheActivityCeilingFitsTheTracker(t *testing.T) {
+	if maxActivityThreshold > activity.PerChannelHistory {
+		t.Errorf("maxActivityThreshold is %d but the tracker can only count to %d; "+
+			"a threshold in between would be silently unreachable",
+			maxActivityThreshold, activity.PerChannelHistory)
+	}
+}
+
+// TestAPerAuthorCapAtTheCacheSizeIsRefused. A cap that equals or exceeds the cache is
+// not a cap: one author can still own every entry, so the operator believes A7's
+// protection is on while it does nothing. Both variables are named because the mistake
+// is in their relationship rather than in either value.
+func TestAPerAuthorCapAtTheCacheSizeIsRefused(t *testing.T) {
+	for _, tc := range []struct{ name, cache, perAuthor string }{
+		{"equal", "10", "10"},
+		{"above", "10", "50"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("PEREGRINE_IMAGE_CACHE_SIZE", tc.cache)
+			t.Setenv("PEREGRINE_IMAGE_MAX_PER_AUTHOR", tc.perAuthor)
+
+			_, err := Load()
+			if err == nil {
+				t.Fatal("a per-author cap at or above the cache size must be a startup error")
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "PEREGRINE_IMAGE_MAX_PER_AUTHOR") || !strings.Contains(msg, "PEREGRINE_IMAGE_CACHE_SIZE") {
+				t.Errorf("error must name both variables; got:\n%s", msg)
+			}
+		})
+	}
+}
+
+// TestThePerAuthorCapIsNotCheckedWhenRepostingIsOff, because a cap on a feature that is
+// not running is not a misconfiguration, and refusing to start over it would be the
+// bot's opinion rather than the operator's problem.
+func TestThePerAuthorCapIsNotCheckedWhenRepostingIsOff(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("PEREGRINE_ENABLE_IMAGE_REPOST", "false")
+	t.Setenv("PEREGRINE_IMAGE_CACHE_SIZE", "10")
+	t.Setenv("PEREGRINE_IMAGE_MAX_PER_AUTHOR", "10")
+
+	if _, err := Load(); err != nil {
+		t.Errorf("unexpected error with image reposting off: %v", err)
+	}
+}
+
 func TestMaxNGramFloorIsTwo(t *testing.T) {
 	for _, v := range []string{"1", "0", "-3"} {
 		t.Run(v, func(t *testing.T) {

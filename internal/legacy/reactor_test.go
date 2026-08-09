@@ -123,8 +123,16 @@ func TestCommandsConsumeTheMessage(t *testing.T) {
 
 	for content, wantConsumed := range cases {
 		t.Run(content, func(t *testing.T) {
+			// The Author is not decoration. cmdWordGame reads it for the authorization
+			// check, and leaving it nil made this test panic rather than fail once that
+			// check became a function call: the old inline form was
+			// `cfg.AdminUserID == "" || r.m.Author.ID != ...`, which short-circuited on
+			// the empty admin ID and never touched the nil.
 			r := &reaction{
-				m:     &discordgo.MessageCreate{Message: &discordgo.Message{Content: content}},
+				m: &discordgo.MessageCreate{Message: &discordgo.Message{
+					Content: content,
+					Author:  &discordgo.User{ID: snowflake(4242), Username: "someone"},
+				}},
 				flags: map[string]bool{},
 			}
 			if got := stepCommands(r); got != wantConsumed {

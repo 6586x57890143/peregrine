@@ -8,10 +8,12 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/6586x57890143/peregrine/internal/activity"
 	"github.com/6586x57890143/peregrine/internal/config"
 	"github.com/6586x57890143/peregrine/internal/corpus"
 	"github.com/6586x57890143/peregrine/internal/dbtest"
@@ -51,9 +53,16 @@ func gateFixture(t *testing.T) *storage.Store {
 
 	// Save and restore the globals, so these tests do not leak into each other.
 	oldStore, oldCfg, oldGate, oldGuard, oldBoard := store, cfg, gate, guard, leaderboard
+	oldActivity := channelActivity
 	t.Cleanup(func() {
 		store, cfg, gate, guard, leaderboard = oldStore, oldCfg, oldGate, oldGuard, oldBoard
+		channelActivity = oldActivity
 	})
+
+	// A fresh activity tracker per fixture. Nil would make stepActivity panic on the
+	// first message rather than fail an assertion, which is the failure mode the
+	// leaderboard field above was added for.
+	channelActivity = activity.New(activity.Options{})
 
 	// The word-game leaderboard, which Init loads in production. Nil here made
 	// cmdLeaderboard panic on leaderboard.Format() rather than fail an assertion, which
@@ -95,6 +104,12 @@ func gateFixture(t *testing.T) *storage.Store {
 		MaxWords:           18,
 		CooccurrenceWindow: 5,
 		RoastChance:        0.10,
+
+		// SelfMention is compiled in production by config.Load. A nil here makes
+		// stepClassify panic on MatchString rather than fail an assertion, which any test
+		// that runs the whole step table hits immediately. Same class of fixture gap as
+		// the nil leaderboard above.
+		SelfMention: regexp.MustCompile(`(?i)\bperegrine\b`),
 	}
 	gate = safety.NewGate(bl, slog.New(slog.NewTextHandler(io.Discard, nil)), false)
 
@@ -120,7 +135,7 @@ func gateFixture(t *testing.T) *storage.Store {
 func testManager(t *testing.T, words ...string) *wordgame.Manager {
 	t.Helper()
 	if len(words) == 0 {
-		return wordgame.NewManager(nil, nil, wordgame.Options{})
+		return wordgame.NewManager(nil, nil, nil, wordgame.Options{})
 	}
 
 	path := filepath.Join(t.TempDir(), "words.txt")
@@ -131,7 +146,7 @@ func testManager(t *testing.T, words ...string) *wordgame.Manager {
 	if err != nil {
 		t.Fatalf("LoadDictionary: %v", err)
 	}
-	return wordgame.NewManager(dict, nil, wordgame.Options{TriggerChance: 0})
+	return wordgame.NewManager(dict, nil, nil, wordgame.Options{TriggerChance: 0})
 }
 
 // sent records what the fixture's guard would have sent. Reset per fixture, so a test

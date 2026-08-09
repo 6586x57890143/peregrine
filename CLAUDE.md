@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `peregrine` is a Markov-chain Discord engagement bot (Go 1.25, `discordgo` v0.29, `bbolt` v1.5). It learns from channel messages and replies in the server's own voice. Full design doc: [`SPEC.md`](./SPEC.md). Read it before any non-trivial change, especially §4 (safety and threat model) and §5 (the generation pipeline). The bot lives in a meme-heavy server and exists to cause engagement, fun and chaos, so **output that lands matters more than output that is grammatical**, and several things that look like bugs are deliberate register. The things that are actually bugs are catalogued in §8.
 
-**The repository is mid-restructure.** It is being taken from a single 3,200-line `package main` to merlin's `cmd/` plus `internal/` layout, one subsystem per milestone (`SPEC.md` §9). The entrypoint is `cmd/bot`, and most of what it calls still lives in `internal/legacy/legacy.go`, which started as the old `main.go` moved verbatim. A comment saying "M7b replaces this" means exactly that. Do not treat the current shape as the intended shape, and in particular do not add anything new to `internal/legacy`: it is a holding pen that only shrinks. Storage, config, safety, the lifecycle, the tokenizer, the filters and now the generation engine have all left it; ingestion, the sends and the engagement features have not.
+**The repository is mid-restructure.** It is being taken from a single 3,200-line `package main` to merlin's `cmd/` plus `internal/` layout, one subsystem per milestone (`SPEC.md` §9). The entrypoint is `cmd/bot`, and most of what it calls still lives in `internal/legacy/legacy.go`, which started as the old `main.go` moved verbatim. A comment saying "M7b replaces this" means exactly that. Do not treat the current shape as the intended shape, and in particular do not add anything new to `internal/legacy`: it is a holding pen that only shrinks. Storage, config, safety, the lifecycle, the tokenizer, the filters, the generation engine, the sends, ingestion, the word games and now activity tracking have all left it; the reactor steps and the state they close over have not, and M11c is the milestone that moves them.
 
 ## Commands
 
@@ -218,6 +218,52 @@ The dictionary load used to be `log.Fatalf`, so a missing 64 KB word list killed
 **The weekly reset compares week boundaries and catches up.** It asked `pool.ntp.org` what day it was, hourly, and reset only during one hour on Monday, so a failed query or downtime across Monday morning skipped a whole week (finding 17). A bot that was off all Monday now resets on its first tick back. The display derives the next reset from the same boundary, where it used to compute it from the host clock while the reset consulted NTP.
 
 **The pre-M11 leaderboard format is still read**, and that asymmetry with the corpus is deliberate: `storage.Open` refuses an old corpus outright because a corpus is re-derivable from Discord history, whereas a week of wins is not re-derivable from anything.
+
+**The Manager does not count messages any more; it asks a `Counter` it declares itself.** M11a gave it a per-channel activity map, and M11b took it away, because two other features needed the same number and one of them keeping a private copy is the finding-28 shape. `Note` became `MaybeStart`. `Start` no longer clears the channel's count, since the count belongs to a shared observer now and zeroing it would lie to aggro and autonomous posting about how busy the channel is; a per-channel cooldown of one `ActivityWindow` reproduces the old behaviour exactly, because clearing meant a full window of fresh traffic before the threshold could be met again. A nil `Counter` disables the trigger, which is the quiet direction: no way to tell whether a channel is busy is a reason to start no games.
+
+**`MaybeStart` asks the counter outside its own lock**, because the counter is another package's mutex and holding one lock while taking another is how a lock-ordering deadlock gets built. Nothing needs the count and the game map to be consistent with each other; the worst case is a game started on a count that was true a microsecond ago.
+
+### `internal/activity` is the one place that knows where people are talking
+
+Three features need to know how busy a channel is or who is around: word games deciding a channel has earned a puzzle, autonomous posting and interval-mode word games choosing somewhere to speak, and aggro choosing a target. Before M11b, two of them **paged Discord's REST API** for it and the third kept its own copy.
+
+**The two that asked Discord were the expensive mistake.** `getActiveChannels` paged every text channel in every guild fifty messages at a time with a 50ms sleep between pages; `findRandomActiveUser` then called it per guild and fetched another hundred messages per active channel. Hundreds of REST calls per aggro tick, on an hourly ticker, for information the gateway had already delivered and the bot had thrown away. Both functions are deleted, not refactored.
+
+**It is the state cache plus a tally, not the state cache alone**, because they answer different halves. `s.State` knows a channel exists, its name, its type and its NSFW flag, and `LastMessageID` gives recency. It does not know volume. So `busiestChannel` reads the tracker for how busy and `State` for what and where, and neither costs a request.
+
+**The tracker keeps timestamps, not a counter, so each consumer brings its own window.** Word games want "is it busy right now" (5 minutes); aggro wants "who is around" (6 hours). One counter with one window would have forced them to agree, and that is what made the word-game manager keep a second copy in the first place.
+
+**Both maps are bounded and this is not optional.** They are keyed by channel and by user, so they grow with every guild the bot joins and every person it meets. That leak has already happened twice here: the conversation memory before M7b and the word-game activity map in M11a.
+
+**The per-channel history is a fixed ring, so a count saturates**, and that has a config consequence worth knowing: `PEREGRINE_WORDGAME_ACTIVITY_THRESHOLD` is capped below the ring size, because a threshold above it could never be met and the knob would silently do nothing. `activity.PerChannelHistory` is exported so a test asserts the relationship instead of two files agreeing by comment.
+
+**`Note` is called after the learn gate, deliberately.** A spam flood would otherwise advertise a channel as busy and pull the bot toward exactly the place it should be ignoring. Counting only what the corpus was willing to see is the same decision, made once.
+
+Two behaviour changes to know before debugging them as outages: **aggro has no target for the first minutes after a restart**, because the candidates are people the bot has seen, and **`busiestChannel` returns nothing on a cold start** rather than falling back to `LastMessageID` recency, because recency without volume would let a channel whose last message was 59 minutes ago decide where the bot speaks unprompted.
+
+### Image reposting is the bot republishing under its own name
+
+`SPEC.md` §4 A7 is the finding. Cached user-posted image and Tenor URLs get reposted later, by the bot, in a channel of its choosing, so a hostile user seeding the cache is the attack and the operator wears the result.
+
+**The mitigations were specified in M5 and unbuildable until M11b, because the problem was the key layout rather than a missing check.** The cache was keyed by the URL alone, so nothing recorded where an entry came from: there was nothing to attribute, nothing to cap per person, and no way to ask which entries a deleted message had contributed. `Writer.DeleteImageURL` sat in `internal/storage` for a milestone with a comment about deleted messages and no caller, which is what an unimplementable design looks like from the inside. The key is `<message snowflake> NUL <url>` with the author snowflake as the value now, and three of the four mitigations fell out of that.
+
+**The caps are enforced inside `AddImageURL`, not at the caller**, for exactly the reason `CheckLearn` lives inside `learnMessage`. At the per-author cap the author's **own oldest** entry is evicted rather than the new URL dropped, so a prolific poster stays current without exceeding their share. A cap at or above `PEREGRINE_IMAGE_CACHE_SIZE` is a startup error naming both variables: a cap one person can saturate is not a cap, and an operator who believes the protection is on is worse off than one who knows it is off.
+
+**Deletion is a signal about republishing, not about the corpus.** The `MESSAGE_DELETE` handlers revoke cached URLs; they do not unlearn n-grams. Removing learned text on delete is a different and much harder question and is deliberately out of scope.
+
+**Putting the snowflake first also made eviction correct and cheap by construction**, which is finding 10's lesson one bucket over. Byte order is numeric order is chronological order, so a cursor's `First()` is the oldest. The previous trim searched the whole bucket for the minimum timestamp *inside* the eviction loop, so trimming k entries cost O(n*k), which is finding 11's shape.
+
+**Do not hold `imageURLMutex` across a `store.Update`.** It used to wrap the whole capture, so one goroutine's write transaction (already serialized against every write in the process) also blocked every other capture from reading the slice. The lock guards the slice; the store guards itself.
+
+**`schema_version` is 2, and it has a migration where version 1 has a refusal.** That asymmetry is the rule: `upgradeToV2` empties the image cache, because a hundred URLs refill themselves from live traffic within minutes, whereas converting the corpus would mean rewriting every key and the corpus is re-derivable from Discord history anyway. Migrate what is cheap to lose, refuse what is not.
+
+### Authorization is one function and only one
+
+`authorized()` in `internal/legacy/reactor.go` is the only authorization check in the codebase and the only place permitted to name `cfg.AdminUserID`. `TestAuthorizationIsAChokepoint` parses the package and fails if anything else does.
+
+It took two milestones because the value and the shape are different problems. M2 replaced a hardcoded Discord ID with a fail-closed environment variable, which fixed the value; it stayed an inline comparison in one command body, which left the shape. The second command to need authorization would reimplement it, and the way an inline reimplementation goes wrong is the empty case, which fails **open**: a missing variable becomes a public operator command. A behavioural test cannot cover that, because it would have to know about the command nobody has written yet.
+
+Note the trap this exposed. The old inline form was `cfg.AdminUserID == "" || m.Author.ID != cfg.AdminUserID`, which short-circuited and therefore never evaluated `m.Author` when no admin was configured. Turning it into a function call made the argument always evaluate, which found a nil `Author` in a test fixture. Production always has one; the fixture did not.
 
 ### Ingestion asks "what is new", not "what have I forgotten"
 

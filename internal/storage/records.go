@@ -295,56 +295,117 @@ func (r *Reader) ForEachName(fn func(key string, n corpus.Name) error) error {
 
 // ---------------------------------------------------------------- images
 
-// AddImageURL caches a URL for later reposting and trims the cache to max.
+// AddImageURL caches a URL for later reposting, attributed to the message and the
+// author it came from, and enforces both caps.
 //
-// Keyed by URL with a timestamp value, so a duplicate does not grow the cache and
-// eviction is by insertion order via the counter.
-func (w *Writer) AddImageURL(url string, at time.Time, max int) error {
-	b := w.bucket(bucketImage)
-	if b.Get([]byte(url)) != nil {
-		return nil
-	}
-	if err := b.Put([]byte(url), encodeTime(at.UnixNano())); err != nil {
+// The caps are enforced HERE rather than at the caller, and that placement is the
+// same argument as CheckLearn living inside learnMessage: image reposting is the
+// bot republishing user-supplied media under its own name (SPEC.md section 4, A7),
+// so "one author may not own more than their share of the cache" has to be a
+// property of the store rather than a rule the current caller happens to follow. A
+// second caller cannot skip it.
+//
+// At the per-author cap the author's OWN OLDEST entry is evicted rather than the new
+// URL dropped. Dropping would freeze a prolific poster's contribution at whatever
+// they happened to post first; evicting keeps their share current without letting it
+// grow. Either way the cap holds, which is the part that matters.
+//
+// One bounded pass answers both questions the caps need (is this URL already cached,
+// and how many entries does this author hold) plus finds the eviction candidate. The
+// bucket is bounded by maxTotal, which is PEREGRINE_IMAGE_CACHE_SIZE and defaults to
+// 100, with 8-byte values: this is the same trade as Reader.PrefixTotal, a bounded
+// sequential scan in preference to a counter that would need maintaining per author
+// on every insert.
+func (w *Writer) AddImageURL(url, msgID, authorID string, maxTotal, maxPerAuthor int) error {
+	key, err := imageKey(msgID, url)
+	if err != nil {
 		return err
 	}
-	if err := w.addCounter(metaImageCount, 1); err != nil {
+	author, err := encodeSnowflake(authorID)
+	if err != nil {
+		return fmt.Errorf("image author: %w", err)
+	}
+
+	b := w.bucket(bucketImage)
+
+	var (
+		authorCount   int
+		authorsOldest []byte
+	)
+	c := b.Cursor()
+	for k, v := c.First(); k != nil; k, v = c.Next() {
+		cached, ok := splitImageKey(k)
+		if !ok {
+			continue
+		}
+		if cached == url {
+			// Already cached, from this message or another. Keep the existing
+			// attribution: re-attributing would let a second poster of the same URL
+			// spend someone else's quota, and it would reset the entry's age, which
+			// is what decides when it leaves.
+			return nil
+		}
+		if bytes.Equal(v, author) {
+			authorCount++
+			if authorsOldest == nil {
+				// Keys are ordered by snowflake, so the first match in cursor order
+				// is this author's oldest entry. No timestamp comparison needed.
+				authorsOldest = bytes.Clone(k)
+			}
+		}
+	}
+
+	evicted := int64(0)
+	if maxPerAuthor > 0 && authorCount >= maxPerAuthor && authorsOldest != nil {
+		if err := b.Delete(authorsOldest); err != nil {
+			return err
+		}
+		evicted++
+	}
+
+	if err := b.Put(key, author); err != nil {
+		return err
+	}
+	if err := w.addCounter(metaImageCount, 1-evicted); err != nil {
 		return err
 	}
 
-	count := w.counter(metaImageCount)
-	removed := int64(0)
-	for count > uint64(max) && max > 0 {
-		// Evict the oldest by timestamp rather than the lexicographically first URL.
-		// Cursor order here is URL order, which has nothing to do with age, so this
-		// finds the minimum explicitly.
-		var oldestKey []byte
-		var oldest int64
-		if err := b.ForEach(func(k, v []byte) error {
-			ts := decodeTime(v)
-			if oldestKey == nil || ts < oldest {
-				oldestKey = bytes.Clone(k)
-				oldest = ts
-			}
-			return nil
-		}); err != nil {
-			return err
-		}
-		if oldestKey == nil {
-			break
-		}
-		if err := b.Delete(oldestKey); err != nil {
-			return err
-		}
-		count--
-		removed++
-	}
-	if removed > 0 {
-		return w.addCounter(metaImageCount, -removed)
-	}
-	return nil
+	return w.trimImageCache(maxTotal)
 }
 
-// ImageURLs returns every cached URL.
+// trimImageCache evicts oldest-first down to max.
+//
+// Oldest-first is free here because the key leads with the source message's
+// snowflake, so cursor order is chronological order. The old layout keyed by URL and
+// searched the whole bucket for the minimum timestamp on every single eviction.
+func (w *Writer) trimImageCache(max int) error {
+	if max <= 0 {
+		return nil
+	}
+	count := w.counter(metaImageCount)
+	if count <= uint64(max) {
+		return nil
+	}
+
+	drop := int(count - uint64(max))
+	victims := make([][]byte, 0, drop)
+	c := w.bucket(bucketImage).Cursor()
+	for k, _ := c.First(); k != nil && len(victims) < drop; k, _ = c.Next() {
+		victims = append(victims, bytes.Clone(k))
+	}
+
+	// Collected before deleting rather than deleted during the walk, because bbolt
+	// does not define cursor behaviour across a mutation of the bucket being walked.
+	b := w.bucket(bucketImage)
+	for _, k := range victims {
+		if err := b.Delete(k); err != nil {
+			return err
+		}
+	}
+	return w.addCounter(metaImageCount, -int64(len(victims)))
+}
+
+// ImageURLs returns every cached URL, oldest first.
 func (r *Reader) ImageURLs() ([]string, error) {
 	b := r.bucket(bucketImage)
 	if b == nil {
@@ -352,7 +413,9 @@ func (r *Reader) ImageURLs() ([]string, error) {
 	}
 	var out []string
 	if err := b.ForEach(func(k, _ []byte) error {
-		out = append(out, string(k))
+		if url, ok := splitImageKey(k); ok {
+			out = append(out, url)
+		}
 		return nil
 	}); err != nil {
 		return nil, err
@@ -360,16 +423,63 @@ func (r *Reader) ImageURLs() ([]string, error) {
 	return out, nil
 }
 
-// DeleteImageURL removes one cached URL, for when the source message was deleted.
-func (w *Writer) DeleteImageURL(url string) error {
+// DeleteImagesByMessage removes every URL cached from one message and reports how
+// many went.
+//
+// This is SPEC.md section 4.2's deleted-message rule: a deletion is a strong signal
+// that the content should not be republished, and the bot reposting something a
+// moderator or its author has just removed is the exact failure A7 describes. The
+// rule was specified a milestone ago and could not be implemented, because with the
+// URL as the key there was no way to ask which entries a message had contributed.
+//
+// A message ID that is not a snowflake is an error rather than a silent no-op: the
+// only way to get one here is a caller that invented it.
+func (w *Writer) DeleteImagesByMessage(msgID string) (int, error) {
+	seek, limit, err := imageMessageRange(msgID)
+	if err != nil {
+		return 0, err
+	}
+
 	b := w.bucket(bucketImage)
-	if b.Get([]byte(url)) == nil {
-		return nil
+	var victims [][]byte
+	c := b.Cursor()
+	for k, _ := c.Seek(seek); k != nil && bytes.Compare(k, limit) < 0; k, _ = c.Next() {
+		victims = append(victims, bytes.Clone(k))
 	}
-	if err := b.Delete([]byte(url)); err != nil {
-		return err
+	if len(victims) == 0 {
+		return 0, nil
 	}
-	return w.addCounter(metaImageCount, -1)
+	for _, k := range victims {
+		if err := b.Delete(k); err != nil {
+			return 0, err
+		}
+	}
+	if err := w.addCounter(metaImageCount, -int64(len(victims))); err != nil {
+		return 0, err
+	}
+	return len(victims), nil
+}
+
+// ImageAuthorCount reports how many cached entries an author holds. Exported for the
+// cap's test, which otherwise could only observe the cap through its effect on the
+// URL list and could not tell a working cap from a full cache.
+func (r *Reader) ImageAuthorCount(authorID string) int {
+	author, err := encodeSnowflake(authorID)
+	if err != nil {
+		return 0
+	}
+	b := r.bucket(bucketImage)
+	if b == nil {
+		return 0
+	}
+	n := 0
+	c := b.Cursor()
+	for k, v := c.First(); k != nil; k, v = c.Next() {
+		if bytes.Equal(v, author) {
+			n++
+		}
+	}
+	return n
 }
 
 // ---------------------------------------------------------------- stats

@@ -187,8 +187,26 @@ func writeWords(t *testing.T, words ...string) string {
 
 // ---------------------------------------------------------------- the manager
 
+// counter is a settable message count standing in for internal/activity's tracker,
+// which satisfies wordgame.Counter structurally. It also records the window it was
+// asked about, because which window the Manager passes is part of the contract: how
+// busy is busy enough for a word game is this feature's judgement, not the tracker's.
+type counter struct {
+	n      int
+	asked  time.Duration
+	called int
+}
+
+func (c *counter) Count(_ string, window time.Duration) int {
+	c.asked = window
+	c.called++
+	return c.n
+}
+
+func counting(n int) *counter { return &counter{n: n} }
+
 func TestStartAndSolveAGame(t *testing.T) {
-	m := NewManager(dictOf("peregrine"), seeded(1, 2), testOpts())
+	m := NewManager(dictOf("peregrine"), seeded(1, 2), counting(0), testOpts())
 
 	g, err := m.Start("chan")
 	if err != nil {
@@ -223,7 +241,7 @@ func TestStartAndSolveAGame(t *testing.T) {
 // lock released in between, so two people guessing at the same instant could both be told
 // they had won and the leaderboard would record two wins for one puzzle.
 func TestOnlyOneWinnerPerGame(t *testing.T) {
-	m := NewManager(dictOf("peregrine"), seeded(1, 2), testOpts())
+	m := NewManager(dictOf("peregrine"), seeded(1, 2), counting(0), testOpts())
 	if _, err := m.Start("chan"); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -250,7 +268,7 @@ func TestOnlyOneWinnerPerGame(t *testing.T) {
 }
 
 func TestStartRefusesASecondGameInTheSameChannel(t *testing.T) {
-	m := NewManager(dictOf("peregrine"), seeded(1, 2), testOpts())
+	m := NewManager(dictOf("peregrine"), seeded(1, 2), counting(0), testOpts())
 	if _, err := m.Start("chan"); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -264,14 +282,14 @@ func TestStartRefusesASecondGameInTheSameChannel(t *testing.T) {
 }
 
 func TestAnUnavailableManagerRefusesToStart(t *testing.T) {
-	m := NewManager(dictOf(), seeded(1, 2), testOpts())
+	m := NewManager(dictOf(), seeded(1, 2), counting(0), testOpts())
 	if m.Available() {
 		t.Fatal("a manager with no words reports itself available")
 	}
 	if _, err := m.Start("chan"); !errors.Is(err, ErrNoDictionary) {
 		t.Errorf("Start returned %v, want ErrNoDictionary", err)
 	}
-	if m.Note("chan") {
+	if m.MaybeStart("chan") {
 		t.Error("an unavailable manager asked for a game to be started")
 	}
 }
@@ -283,7 +301,7 @@ func TestAnUnavailableManagerRefusesToStart(t *testing.T) {
 // woke against a closed session, and the count was bounded only by how often people played.
 // One sweep replaces all of them.
 func TestExpiredSweepsInsteadOfSpawningTimers(t *testing.T) {
-	m := NewManager(dictOf("peregrine"), seeded(1, 2), testOpts())
+	m := NewManager(dictOf("peregrine"), seeded(1, 2), counting(0), testOpts())
 
 	now := time.Now()
 	m.now = func() time.Time { return now }
@@ -317,7 +335,7 @@ func TestExpiredSweepsInsteadOfSpawningTimers(t *testing.T) {
 }
 
 func TestDueDeletionsAreSweptOnce(t *testing.T) {
-	m := NewManager(dictOf("peregrine"), seeded(1, 2), testOpts())
+	m := NewManager(dictOf("peregrine"), seeded(1, 2), counting(0), testOpts())
 	now := time.Now()
 	m.now = func() time.Time { return now }
 
@@ -343,7 +361,7 @@ func TestDueDeletionsAreSweptOnce(t *testing.T) {
 func TestAnnounceTTLZeroKeepsAnnouncements(t *testing.T) {
 	o := testOpts()
 	o.AnnounceTTL = 0
-	m := NewManager(dictOf("peregrine"), seeded(1, 2), o)
+	m := NewManager(dictOf("peregrine"), seeded(1, 2), counting(0), o)
 
 	m.DeleteLater("chan", "msg1")
 	if got := m.DueDeletions(); len(got) != 0 {
@@ -353,74 +371,74 @@ func TestAnnounceTTLZeroKeepsAnnouncements(t *testing.T) {
 
 // TestNoteRequiresTheActivityThreshold. A quiet channel should not get a puzzle nobody is
 // around to solve.
-func TestNoteRequiresTheActivityThreshold(t *testing.T) {
+func TestMaybeStartRequiresTheActivityThreshold(t *testing.T) {
 	o := testOpts()
 	o.ActivityThreshold = 3
-	m := NewManager(dictOf("peregrine"), seeded(1, 2), o)
+	c := counting(2) // one short
+	m := NewManager(dictOf("peregrine"), seeded(1, 2), c, o)
 
-	// Two messages, one short of the threshold of three. Written as a loop rather than
-	// `Note() || Note()`, which short-circuits and therefore only calls the second when
-	// the first returned false: correct here by luck, and confusing enough that
-	// staticcheck flags it.
-	for i := range 2 {
-		if m.Note("chan") {
-			t.Fatalf("a game was requested after %d messages, below the threshold of 3", i+1)
-		}
+	if m.MaybeStart("chan") {
+		t.Error("a game was requested in a channel below the activity threshold")
 	}
-	if !m.Note("chan") {
+	c.n = 3
+	if !m.MaybeStart("chan") {
 		t.Error("the threshold was reached and no game was requested (TriggerChance is 1)")
 	}
 }
 
-// TestNoteForgetsOldActivity, so a channel with one message an hour never accumulates its
-// way to a puzzle.
-func TestNoteForgetsOldActivity(t *testing.T) {
+// TestMaybeStartAsksAboutItsOwnWindow. The counting moved to internal/activity, which
+// keeps timestamps precisely so each consumer can bring its own window: word games want
+// "is it busy right now", aggro wants "who is around". If the Manager stopped passing
+// ActivityWindow, PEREGRINE_WORDGAME_ACTIVITY_WINDOW would quietly stop meaning anything.
+func TestMaybeStartAsksAboutItsOwnWindow(t *testing.T) {
 	o := testOpts()
-	o.ActivityThreshold = 3
-	o.ActivityWindow = time.Minute
-	m := NewManager(dictOf("peregrine"), seeded(1, 2), o)
+	o.ActivityWindow = 90 * time.Second
+	o.ActivityThreshold = 1
+	c := counting(5)
+	m := NewManager(dictOf("peregrine"), seeded(1, 2), c, o)
+
+	m.MaybeStart("chan")
+	if c.asked != 90*time.Second {
+		t.Errorf("the Manager asked about a window of %s, want its own ActivityWindow of 90s", c.asked)
+	}
+}
+
+// TestALiveGameSkipsTheCounterEntirely. Cheapest gate first: a channel already playing
+// cannot start another game, so there is no reason to ask how busy it is.
+func TestALiveGameSkipsTheCounterEntirely(t *testing.T) {
+	o := testOpts()
+	o.ActivityThreshold = 1
+	c := counting(100)
+	m := NewManager(dictOf("peregrine"), seeded(1, 2), c, o)
+
+	if _, err := m.Start("chan"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	c.called = 0
+	if m.MaybeStart("chan") {
+		t.Error("a second game was requested in a channel already playing one")
+	}
+	if c.called != 0 {
+		t.Errorf("the counter was consulted %d times for a channel already playing", c.called)
+	}
+}
+
+// TestACooldownFollowsAGame. Starting a game used to clear the channel's activity count so
+// the trigger had to build up again. The count is a shared observer now and zeroing it
+// would lie to the aggro and autonomous-post features about how busy the channel is, so
+// the Manager keeps its own cooldown of one ActivityWindow, which reproduces the same
+// behaviour without touching anyone else's data.
+func TestACooldownFollowsAGame(t *testing.T) {
+	o := testOpts()
+	o.ActivityThreshold = 1
+	o.ActivityWindow = 5 * time.Minute
+	m := NewManager(dictOf("peregrine"), seeded(1, 2), counting(50), o)
 
 	now := time.Now()
 	m.now = func() time.Time { return now }
 
-	for range 5 {
-		m.Note("chan")
-		now = now.Add(2 * time.Minute) // each message falls outside the window of the next
-	}
-	if m.Note("chan") {
-		t.Error("stale activity counted toward the threshold")
-	}
-}
-
-// TestNoteDoesNotAccumulateChannelsForever. The old activity map was keyed by channel and
-// pruned only when a game started there, so a bot in many guilds grew an entry per channel
-// and never released one. Same slow leak the conversation memory had before M7b.
-func TestNoteDoesNotAccumulateChannelsForever(t *testing.T) {
-	o := testOpts()
-	o.MaxChannels = 5
-	o.ActivityThreshold = 1000 // never trigger, so entries just accumulate
-	m := NewManager(dictOf("peregrine"), seeded(1, 2), o)
-
-	for i := range 50 {
-		m.Note("chan" + string(rune('a'+i%26)) + string(rune('a'+i/26)))
-	}
-
-	m.mu.Lock()
-	n := len(m.activity)
-	m.mu.Unlock()
-	if n > o.MaxChannels {
-		t.Errorf("tracking %d channels against a cap of %d", n, o.MaxChannels)
-	}
-}
-
-func TestStartingAGameResetsTheChannelsActivity(t *testing.T) {
-	o := testOpts()
-	o.ActivityThreshold = 2
-	m := NewManager(dictOf("peregrine"), seeded(1, 2), o)
-
-	m.Note("chan")
-	if !m.Note("chan") {
-		t.Fatal("threshold not reached")
+	if !m.MaybeStart("chan") {
+		t.Fatal("a busy channel with no game was refused one")
 	}
 	if _, err := m.Start("chan"); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -428,9 +446,51 @@ func TestStartingAGameResetsTheChannelsActivity(t *testing.T) {
 	if _, ok := m.Guess("chan", "peregrine"); !ok {
 		t.Fatal("could not solve")
 	}
-	// The trigger has to build up again rather than firing on the next message.
-	if m.Note("chan") {
+
+	// Solved, so no game is live, but the cooldown still holds.
+	if m.MaybeStart("chan") {
 		t.Error("a game was requested immediately after the previous one ended")
+	}
+	now = now.Add(5*time.Minute + time.Second)
+	if !m.MaybeStart("chan") {
+		t.Error("the cooldown never expired")
+	}
+}
+
+// TestTheCooldownMapDoesNotAccumulateChannelsForever. It is keyed by channel, so it grows
+// with every guild the bot joins. Same slow leak the conversation memory had before M7b,
+// and the same kind a test using one channel would never reveal.
+func TestTheCooldownMapDoesNotAccumulateChannelsForever(t *testing.T) {
+	o := testOpts()
+	o.MaxChannels = 5
+	m := NewManager(dictOf("peregrine"), seeded(1, 2), counting(0), o)
+
+	for i := range 50 {
+		if _, err := m.Start("chan" + string(rune('a'+i%26)) + string(rune('a'+i/26))); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+	}
+
+	m.mu.Lock()
+	n := len(m.started)
+	m.mu.Unlock()
+	if n > o.MaxChannels {
+		t.Errorf("tracking %d cooldowns against a cap of %d", n, o.MaxChannels)
+	}
+}
+
+// TestNoCounterMeansNoGames. A nil Counter is a wiring mistake, and it fails in the quiet
+// direction: no way to tell whether a channel is busy is a reason to start no games, never
+// a reason to start one on every message.
+func TestNoCounterMeansNoGames(t *testing.T) {
+	o := testOpts()
+	o.ActivityThreshold = 1
+	m := NewManager(dictOf("peregrine"), seeded(1, 2), nil, o)
+
+	for range 20 {
+		if m.MaybeStart("chan") {
+			t.Fatal("a game was requested with no counter wired up")
+		}
 	}
 }
 
