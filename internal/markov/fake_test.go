@@ -156,6 +156,31 @@ func (f *fakeCorpus) authorCount(prefix, next string) uint32 {
 	return uint32(len(f.authors[prefix][next]))
 }
 
+// HasSuccessors mirrors the real reader's contract, which is NOT a byte-prefix match:
+// keys are <prefix> NUL <next>, so a query for "the" must not be satisfied by keys
+// under "the cat". Here that falls out of the map being keyed by exact prefix, which
+// makes this the one method where the fake is trivially right and storage's version
+// needed a bounded cursor range to be.
+func (f *fakeCorpus) HasSuccessors(prefix string) bool {
+	if prefix == "" {
+		return false
+	}
+	return len(f.counts[prefix]) > 0
+}
+
+// FirstPrefix returns the lowest prefix in sorted order, matching a cursor's First().
+func (f *fakeCorpus) FirstPrefix() (string, bool) {
+	if len(f.counts) == 0 {
+		return "", false
+	}
+	keys := make([]string, 0, len(f.counts))
+	for k := range f.counts {
+		keys = append(keys, k)
+	}
+	sortStrings(keys)
+	return keys[0], true
+}
+
 func (f *fakeCorpus) PrefixTotal(prefix string) uint64 {
 	var total uint64
 	for _, c := range f.counts[prefix] {
@@ -205,6 +230,9 @@ func testParams() Params {
 		KNDiscount:         0.75,
 		KNRawMix:           0.25,
 		MinDistinctAuthors: 0,
+		MinWords:           4,
+		MaxWords:           18,
+		CooccurrenceWindow: 5,
 		PromptRelevance:    0.6,
 	}
 }
@@ -221,6 +249,6 @@ func newStep(prefix []string) *Step {
 		Ngrams:     map[string]struct{}{},
 		CoreTopics: map[string]float64{},
 		NameAssoc:  map[string]corpus.TopicAssoc{},
-		MinWords:   4,
+		Length:     Length{Min: 4, Max: 18, Target: 8},
 	}
 }

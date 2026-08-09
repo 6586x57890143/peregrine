@@ -17,41 +17,9 @@ import (
 // the spelling again.
 const EndToken = "<end>"
 
-// Persona selects which vocabulary bias applies to a sentence.
-type Persona int
-
-const (
-	PersonaNeutral Persona = iota
-	PersonaRoast
-)
-
-// roastLexicon is the roast vocabulary and its relative strength, hoisted to a
-// package variable.
-//
-// This used to be a fourteen-entry map literal allocated INSIDE the per-candidate
-// loop, with fourteen calls to a lowercase helper on constants that were already
-// lower case, which is to say once per candidate per step per generated word
-// (SPEC.md finding G6). The keys are written pre-normalized here so no conversion
-// happens at all.
-//
-// Values are relative weights in 0..1, multiplied by Weights.Persona, so the
-// vocabulary can be reordered without retuning the logit scale.
-var roastLexicon = map[string]float64{
-	"dumbass":  1.00,
-	"idiot":    1.00,
-	"loser":    0.80,
-	"clown":    0.80,
-	"cringe":   0.60,
-	"pathetic": 0.60,
-	"weak":     0.40,
-	"sad":      0.40,
-	"cope":     0.40,
-	"seethe":   0.40,
-	"mald":     0.40,
-	"ratio":    0.30,
-	"lmao":     0.20,
-	"lol":      0.20,
-}
+// Persona, the roast lexicon and the filler sets live in persona.go, because the
+// in-sampler bias and the post-pass are one mechanism and splitting them across files
+// is how they became two mechanisms in the first place.
 
 // connectives get a mid-sentence nudge and a late-sentence dampening.
 var connectives = map[string]struct{}{
@@ -90,10 +58,12 @@ type Step struct {
 	// Position is progress through the sentence, 0 at the start and 1 at the cap.
 	Position float64
 
-	// MinWords is the length floor below which the end sentinel is penalized.
-	MinWords int
+	// Length is the one length model: floor, cap and the target sampled once for this
+	// sentence. It replaces the three competing mechanisms described in length.go, so
+	// there is no MinWords field here any more and no discard-and-retry in the caller.
+	Length Length
 
-	// Persona selects the vocabulary bias.
+	// Persona selects the vocabulary bias and, at the end, the filler set.
 	Persona Persona
 
 	// CoreTopics are the prompt's non-stop words weighted by global significance,
@@ -286,12 +256,9 @@ func (g *Generator) heuristics(s *Step, c candidate, assoc assocCache) float64 {
 		logit += w.IsName
 	}
 
-	// Persona vocabulary.
-	if s.Persona == PersonaRoast {
-		if strength, ok := roastLexicon[tok]; ok {
-			logit += w.Persona * strength
-		}
-	}
+	// Persona vocabulary. One call, shared with the post-pass in persona.go, rather
+	// than a lexicon rebuilt here per candidate.
+	logit += g.lexiconBias(s.Persona, tok)
 
 	// Prompt echo and recent conversation.
 	if _, ok := s.PromptSet[tok]; ok {
@@ -335,11 +302,12 @@ func (g *Generator) heuristics(s *Step, c candidate, assoc assocCache) float64 {
 		}
 	}
 
-	// The end sentinel, penalized until the sentence has reached its floor. The one
-	// competing length mechanism kept in M7a; M7b replaces all of them with a single
-	// length model.
-	if tok == EndToken && len(s.Sentence) < s.MinWords {
-		logit += w.EndEarly
+	// The end sentinel, shifted by the length model. This is now the ONLY place length
+	// influences generation: the discard-and-retry and the second progress-based
+	// multiplier are gone, so there is one answer to "how long should this be" instead
+	// of three that could disagree.
+	if tok == EndToken {
+		logit += s.Length.endLogit(w, len(s.Sentence))
 	}
 
 	// Connectives: a nudge mid-sentence, a dampening right at the end. Both small,

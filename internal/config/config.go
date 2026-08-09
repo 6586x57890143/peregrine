@@ -71,6 +71,10 @@ type Config struct {
 	KNDiscount           float64 // PEREGRINE_KN_DISCOUNT
 	KNRawMix             float64 // PEREGRINE_KN_RAW_MIX
 	MinDistinctAuthors   int     // PEREGRINE_MIN_DISTINCT_AUTHORS
+	MinWords             int     // PEREGRINE_MIN_WORDS
+	MaxWords             int     // PEREGRINE_MAX_WORDS
+	CooccurrenceWindow   int     // PEREGRINE_COOCCURRENCE_WINDOW
+	RoastChance          float64 // PEREGRINE_ROAST_CHANCE
 	SelfMention          *regexp.Regexp
 
 	// Ingestion.
@@ -92,12 +96,10 @@ type Config struct {
 
 	// Housekeeping loops.
 	//
-	// EnableClustering and ClusteringTick were here until M6b and are now deferred
-	// variables instead, because the rule is that every field in this struct is read
-	// by code that exists. The clustering loop is gone: it needed a *bbolt.DB, which
-	// nothing outside internal/storage can hold, and it had never produced readable
-	// data anyway (SPEC.md section 8, finding 27). They come back as live fields in
-	// M8, with the pass rebuilt.
+	// EnableClustering and ClusteringTick were here until M6b, became deferred
+	// variables, and are gone entirely as of M7b: clustering is deleted rather than
+	// rebuilt, so there is no milestone left to defer them to (SPEC.md section 8,
+	// findings 27 and 29).
 	StatusTick      time.Duration // PEREGRINE_STATUS_TICK
 	LeaderboardTick time.Duration // PEREGRINE_LEADERBOARD_CHECK_TICK
 
@@ -146,22 +148,15 @@ const (
 // documentation. Load warns instead. Delete an entry when its milestone lands and
 // the field appears in Config above.
 var deferredVars = map[string]string{
-	// Deferred as of M6b rather than from the start, which is the one direction this
-	// map is not supposed to move. It is honest here: the loop these two drove is
-	// gone, so leaving them as live fields would mean an operator could set them and
-	// watch nothing happen, which is precisely what this map exists to prevent.
-	"PEREGRINE_ENABLE_CLUSTERING": "M8",
-	"PEREGRINE_CLUSTERING_TICK":   "M8",
-	"PEREGRINE_BACKUP_DIR":        "M13",
-	"PEREGRINE_BACKUP_TICK":       "M13",
-	"PEREGRINE_BACKUP_KEEP":       "M13",
-	// The six dials M7a made live are gone from here, which is the direction this map
-	// is supposed to move. What is left belongs to M7b: the length model, the
-	// co-occurrence window and the persona layer.
-	"PEREGRINE_MIN_WORDS":                  "M7b",
-	"PEREGRINE_MAX_WORDS":                  "M7b",
-	"PEREGRINE_COOCCURRENCE_WINDOW":        "M7b",
-	"PEREGRINE_ROAST_CHANCE":               "M7b",
+	// PEREGRINE_ENABLE_CLUSTERING and PEREGRINE_CLUSTERING_TICK were here until M7b
+	// and are now GONE rather than promoted, because clustering is deleted rather than
+	// rebuilt (SPEC.md section 8, finding 29). A variable naming a feature that will
+	// never exist is worse than a deferred one: the deferred warning at least promises
+	// a milestone. An operator who still has either set gets no warning now, which is
+	// correct, because there is nothing left for them to be waiting for.
+	"PEREGRINE_BACKUP_DIR":                 "M13",
+	"PEREGRINE_BACKUP_TICK":                "M13",
+	"PEREGRINE_BACKUP_KEEP":                "M13",
 	"PEREGRINE_IMAGE_MAX_PER_AUTHOR":       "M11",
 	"PEREGRINE_IGNORE_CHANNELS":            "M10",
 	"PEREGRINE_INGEST_GUILD_CONCURRENCY":   "M9",
@@ -242,6 +237,20 @@ func Load() (*Config, error) {
 		// on a live server: the default is 2 so that the safe direction is what an
 		// operator gets by doing nothing.
 		MinDistinctAuthors: l.intVal("PEREGRINE_MIN_DISTINCT_AUTHORS", 2, 0, 100),
+
+		// Length, live as of M7b. The old bound was 30 + rand(15) words, which is a
+		// paragraph. The cap's upper limit of 100 is deliberately well above anything
+		// sensible: it is a guard against a typo, not a recommendation.
+		MinWords: l.intVal("PEREGRINE_MIN_WORDS", 4, 1, 100),
+		MaxWords: l.intVal("PEREGRINE_MAX_WORDS", 18, 1, 100),
+
+		// The co-occurrence window, live as of M7b. 0 means unbounded, which restores
+		// the all-pairs behaviour and warns, because quadratic work inside bbolt's
+		// single write transaction blocks all ingestion.
+		CooccurrenceWindow: l.intVal("PEREGRINE_COOCCURRENCE_WINDOW", 5, 0, 1000),
+
+		// Roast persona probability, live as of M7b.
+		RoastChance: l.float("PEREGRINE_ROAST_CHANCE", 0.10, 0, 1),
 
 		SelfMention: l.regex("PEREGRINE_SELF_MENTION_PATTERN", `(?i)\b(peregrine|bird)\b`),
 
