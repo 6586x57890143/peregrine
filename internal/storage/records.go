@@ -597,64 +597,31 @@ func (w *Writer) PutBlob(kind, key string, value []byte) error {
 	return w.bucket(bucket).Put([]byte(key), value)
 }
 
-// ForEachBlob visits every value of a kind.
-func (r *Reader) ForEachBlob(kind string, fn func(key string, value []byte) error) error {
-	bucket, err := blobBucket(kind)
-	if err != nil {
-		return err
-	}
-	b := r.bucket(bucket)
-	if b == nil {
-		return nil
-	}
-	return b.ForEach(func(k, v []byte) error { return fn(string(k), v) })
-}
-
-// ReplaceBlobs atomically swaps every value of a kind for a new set.
+// ForEachBlob and ReplaceBlobs are gone as of M13, along with the BlobCluster kind and the
+// bucket behind it.
 //
-// Exists for the clustering pass, which produces a whole new set of clusters each
-// run. It does a delete-and-recreate of the bucket, which is a full destructive
-// rebuild, and that is recorded as a defect rather than endorsed: M8 makes clustering
-// diff-based so this becomes unnecessary for its main caller (SPEC.md section 8,
-// finding 15).
-func (w *Writer) ReplaceBlobs(kind string, values map[string][]byte) error {
-	bucket, err := blobBucket(kind)
-	if err != nil {
-		return err
-	}
-	if w.tx.Bucket([]byte(bucket)) != nil {
-		if err := w.tx.DeleteBucket([]byte(bucket)); err != nil {
-			return err
-		}
-	}
-	b, err := w.tx.CreateBucket([]byte(bucket))
-	if err != nil {
-		return err
-	}
-	for k, v := range values {
-		if err := b.Put([]byte(k), v); err != nil {
-			return err
-		}
-	}
-	return nil
-}
+// Both existed for one caller: the clustering pass, which rebuilt its whole bucket every 24 hours
+// with a DeleteBucket plus CreateBucket, and which M7b deleted for the reasons in finding 29.
+// ReplaceBlobs was the atomic version of that destructive rebuild, so it had no other possible
+// user. The linter reporting them unreachable is how that was confirmed rather than assumed, which
+// is the same way M5's and M6b's leftover wrappers were retired.
 
 // Blob kinds. Named constants rather than free strings so a typo is a compile error
 // at the call site instead of a silent read from a bucket that does not exist.
 const (
 	BlobConfig      = "config"
 	BlobLeaderboard = "leaderboard"
-	BlobCluster     = "cluster"
 )
 
+// BlobCluster is gone as of M13, along with the bucket behind it. Clustering was deleted in M7b
+// (finding 29) and this kind outlived it by six milestones, which is the same shape as the bucket
+// itself: a deletion is not finished while the layout still has a name for the thing.
 func blobBucket(kind string) (string, error) {
 	switch kind {
 	case BlobConfig:
 		return bucketMeta, nil
 	case BlobLeaderboard:
 		return bucketLeaderfoo, nil
-	case BlobCluster:
-		return bucketCluster, nil
 	default:
 		return "", fmt.Errorf("unknown blob kind %q", kind)
 	}
@@ -670,7 +637,6 @@ type Status struct {
 	TopicWords    int
 	NameTopics    int
 	Names         int
-	Clusters      int
 	HistoryWindow uint64
 	ImageCache    uint64
 	Learned       uint64
@@ -696,7 +662,6 @@ func (r *Reader) Status() Status {
 		TopicWords:    keyN(bucketTopicWord),
 		NameTopics:    keyN(bucketNameTopic),
 		Names:         keyN(bucketName),
-		Clusters:      keyN(bucketCluster),
 		HistoryWindow: r.counter(metaHistoryCount),
 		ImageCache:    r.counter(metaImageCount),
 		Learned:       r.counter(metaMessagesLearned),

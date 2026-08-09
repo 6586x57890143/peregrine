@@ -64,7 +64,9 @@ services:
 # proper snapshot either, because bbolt holds an exclusive flock on the file.
 #
 # The correct mechanism is in-process and lives in the bot: a read transaction
-# calling tx.CopyFile, which is consistent by construction and does not block
-# writers. See PEREGRINE_BACKUP_* in .env.example.
+# calling tx.WriteTo, which is consistent by construction and does not block
+# writers. internal/plugins/backup puts that on a ticker as of M13, so set
+# PEREGRINE_BACKUP_DIR=/backups in .env to turn it on. Empty is the default and
+# means no snapshots at all.
 volumes:
   corpus:

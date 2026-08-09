@@ -6,7 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `peregrine` is a Markov-chain Discord engagement bot (Go 1.25, `discordgo` v0.29, `bbolt` v1.5). It learns from channel messages and replies in the server's own voice. Full design doc: [`SPEC.md`](./SPEC.md). Read it before any non-trivial change, especially §4 (safety and threat model) and §5 (the generation pipeline). The bot lives in a meme-heavy server and exists to cause engagement, fun and chaos, so **output that lands matters more than output that is grammatical**, and several things that look like bugs are deliberate register. The things that are actually bugs are catalogued in §8.
 
-**The repository is mid-restructure.** It is being taken from a single 3,200-line `package main` to merlin's `cmd/` plus `internal/` layout, one subsystem per milestone (`SPEC.md` §9). The entrypoint is `cmd/bot`, and `internal/legacy` is what remains of the old `main.go`. Do not add anything to it: it is a holding pen that only shrinks. As of M11c it is **250 lines**: the ingestion pass, the corpus status line and the Discord latency probe. Everything else has left. M13 takes those three and deletes the package.
+**The restructure is complete as of M13.** The repository went from a single 3,200-line `package main` to merlin's `cmd/` plus `internal/` layout, one subsystem per milestone (`SPEC.md` §9), and `internal/legacy` is **deleted**. If you find a reference to it in a comment, that comment is stale and worth fixing.
+
+`cmd/bot` is the entrypoint: `main.go` decides which mode to run and translates a signal into a cancelled context, and `services.go` is the only place the features are named together. `internal/core` owns the lifecycle mechanisms and imports no feature package, which is what makes that the only possible place for registration.
 
 ## Commands
 
@@ -48,19 +50,21 @@ go run ./cmd/bot -purge-author 123456789    # undo one author's contribution to 
 
 ## Architecture
 
-### The entrypoint, and why `internal/legacy` exists
+### The entrypoint, and why `internal/legacy` existed
 
 `cmd/bot/main.go` is thin on purpose and mirrors merlin's: `main` builds the logger and loads `.env`, `runGuarded` turns a panic into a logged fatal instead of a bare stderr trace, and `run` parses flags, creates the signal context, and calls `legacy.Run(ctx)`. Nothing else belongs there. Build it as `./cmd/bot`, not `.`; the root is no longer a main package.
 
-`internal/legacy` held the old `main.go`, `filter.go` and `cleanup.go`. It exists because **two `main` packages cannot share code**: making `cmd/bot` the entrypoint required the 3,200 lines it calls to live somewhere importable, and moving them verbatim was the only sequencing that keeps `go build ./...` green at every commit while ending at merlin's layout. Each later milestone moves one subsystem *out*, so the package only shrinks; M13 deletes it. Add nothing to it.
+`internal/legacy` held the old `main.go`, `filter.go` and `cleanup.go`, and **M13 deleted it**. It existed because **two `main` packages cannot share code**: making `cmd/bot` the entrypoint required the 3,200 lines it called to live somewhere importable, and moving them verbatim was the only sequencing that kept `go build ./...` green at every commit while ending at merlin's layout.
+
+The part worth keeping is how it shrank. Each milestone took one subsystem out and then let the linter report what was left unreachable, which is how the leftover wrappers in M5, M6b and M13 were each confirmed dead rather than assumed to be. A holding pen only works if something keeps emptying it.
 
 As of M6b it is one file. `cleanup.go` was replaced by `internal/maintenance`, and `filter.go` went with it because its last two wrappers existed only for that pass; the linter reporting them unused is how that was confirmed rather than assumed.
 
 **Only `internal/storage` may import bbolt, and a test enforces it.** `TestOnlyThisPackageReachesBbolt` lives in `internal/storage` and walks the whole module, because the import is the exact invariant: the bbolt API is unreachable without it, so if no file outside that package imports it then no function outside it can name a bucket, hold a handle, or start a transaction. It began life in `internal/legacy` scoped to that one package, and M11c widened it when there were eight packages above the seam rather than one.
 
-Two behaviors changed in that move, and both are about `log.Fatal`. `main()` became `Run(ctx) error`, so its six `log.Fatal` calls are returned errors, and `performDatabaseCleanup` became `CleanDatabase() error` for the same reason. `log.Fatal` calls `os.Exit`, which **skips every deferred function**, so any startup failure after `bbolt.Open` left the exclusive flock on `markov.db` held by a dying process, and the operator's natural next attempt then failed on the five-second `Open` timeout instead of on the original problem. There is now no `os.Exit` anywhere in `internal/legacy`.
+Two behaviors changed in that move, and both are about `log.Fatal`. `main()` became `Run(ctx) error`, so its six `log.Fatal` calls are returned errors, and `performDatabaseCleanup` became `CleanDatabase() error` for the same reason. `log.Fatal` calls `os.Exit`, which **skips every deferred function**, so any startup failure after `bbolt.Open` left the exclusive flock on `markov.db` held by a dying process, and the operator's natural next attempt then failed on the five-second `Open` timeout instead of on the original problem. There is no `os.Exit` anywhere outside `main` itself.
 
-Logging is bridged rather than converted. `cmd/bot` calls `slog.SetDefault`, which routes the stdlib `log` package through the slog handler, so `internal/legacy`'s ~200 `log.Printf` calls emit structured records without 200 call-site edits. `slog.SetLogLoggerLevel` must be called **before** `SetDefault` or every bridged record arrives at Info regardless of the handler's level. Convert call sites when their subsystem moves out, not before.
+Logging is still bridged, and the bridge is still load-bearing. `cmd/bot` calls `slog.SetDefault`, which routes the stdlib `log` package through the slog handler, and the plugins that came out of legacy kept their `log.Printf` calls rather than converting ~200 call sites inside milestones whose value was being reviewable as moves. `slog.SetLogLoggerLevel` must be called **before** `SetDefault` or every bridged record arrives at Info regardless of the handler's level. The newest services (health, backup, ingest, voicenote) use `slog` directly, so both forms appear in the output; converting the rest is tidying rather than a fix.
 
 `stopSignal` is still the internal shutdown broadcast, because a dozen functions take it as a `<-chan struct{}` parameter. `Run` waits on `ctx.Done()` and then closes it, which is what translates the one cancellation `cmd/bot` owns into the one every goroutine selects on. M3 replaces both with a real lifecycle.
 
@@ -267,7 +271,7 @@ Note the trap this exposed. The old inline form was `cfg.AdminUserID == "" || m.
 
 ### Ingestion asks "what is new", not "what have I forgotten"
 
-`internal/ingest` walks guilds and channels; `internal/learn` learns, and `internal/legacy` is the adapter between them until M13. That split is deliberate: reading the wrong messages wastes API budget and corrupts counts, whereas learning them wrongly is a safety question with a gate in front of it.
+`internal/ingest` walks guilds and channels, `internal/learn` learns, and `internal/plugins/ingest` is the three adapters between them plus the loop. That split is deliberate: reading the wrong messages wastes API budget and corrupts counts, whereas learning them wrongly is a safety question with a gate in front of it.
 
 **The old loop re-read the trailing `PEREGRINE_INGEST_LOOKBACK` on every tick**, which at the shipped defaults is roughly 144 passes over every message, and relied on the history bucket for dedup. That bucket is capped at `PEREGRINE_MAX_HISTORY`, so on a busy guild the older half of each window had already been evicted and was **learned again, counting its n-grams twice** (finding 13). Raising the cap would only move the corpus size at which it starts.
 
@@ -300,6 +304,18 @@ Then `internal/plugins/{chat,aggro,images,games,autopost}`, each a `core.Service
 **Two constants exist in one place because they had three.** `corpus.StartOfWeekUTC` had three implementations before M11c, and one of the disagreements between them is finding 17. `text.IsStopWord` had two, and the list being plain English function words only is half of why clustering collapsed (finding 29).
 
 **Interface type identity forces a few imports that look wrong and are not.** Go requires exact type identity on an interface method's signature, so `channels.Counter` names `activity.Channel`, `chat.Images` names `images.Attachment`, and every plugin's `Guard` names `*discordgo.Message`. Each of those could be avoided with an adapter whose only job is renaming fields, which is more code and one more place for a mistake.
+
+### Health and the counters nobody was reading
+
+`internal/plugins/health` is one service with two loops, and it exists because two things were reporting into the void.
+
+**Four counters existed specifically so that a persistent problem would be visible, and were read by no code at all**: `Dispatcher.Dropped`, `Dispatcher.Queued`, `Gate.LearnRejected` and `Gate.EmitRejected`. Peregrine drops work and refuses output by design (the dispatcher drops rather than blocking, because discordgo dispatches every event on its own goroutine; the gate refuses in both directions), every one of those decisions is correct, and every one is invisible. A queue that is persistently full and a blocklist that is firing constantly look exactly like a quiet server unless something says otherwise.
+
+**The report carries deltas as well as totals.** A lifetime count of 40,000 rejections says nothing about whether it is happening now, which is the only question worth asking of a counter on a ticker. A nonzero delta additionally gets its own record at a level that carries, naming what to do about it; the routine line gets skimmed.
+
+**The latency probe reads `Session.HeartbeatLatency()`.** It used to make a `User("@me")` REST call every two minutes purely to time it, which is asking the network for something the library already measures: finding 17's shape in a different feature. It also measured the wrong thing, since a slow REST endpoint and a struggling gateway connection are different problems.
+
+**Shutdown reports once more, before the wait.** That final line is where an operator reading a container's last output finds out whether the queue had been full, and putting it before the wait means a stuck loop cannot cost it.
 
 ### The reactor, and the consume contract
 
@@ -341,7 +357,7 @@ discordgo will not stop it. Its send helpers build a request with a nil `Allowed
 
 Every one of them used to discard its error, so a send Discord refused (missing permission, rate limit, channel deleted mid-flight) was indistinguishable from one that succeeded: the bot appeared to ignore people at random with nothing in the log. The guard logs all four operations, at deliberately different levels: a failed send or edit is an error, whereas a failed delete or reaction is Info, because failing to delete is routinely benign (somebody removed the message first, or the bot has no Manage Messages there) and alarming about it trains an operator to ignore the log.
 
-`sendMessage`, `editMessage` and `deleteMessage` were three-line adapters onto the guard in `internal/legacy`, and M11c deleted them: they existed so the call sites would not change shape twice, once for the chokepoint and again for the plugin move, and this was the second time. **`TestNothingBypassesTheGuard` now permits no adapters at all** and scans the whole module rather than one package, so outside `internal/discordguard` no function may name a session method that speaks.
+`sendMessage`, `editMessage` and `deleteMessage` were three-line adapters onto the guard in the old holding pen, and M11c deleted them: they existed so the call sites would not change shape twice, once for the chokepoint and again for the plugin move, and this was the second time. **`TestNothingBypassesTheGuard` now permits no adapters at all** and scans the whole module rather than one package, so outside `internal/discordguard` no function may name a session method that speaks.
 
 ### What peregrine deliberately did NOT port from merlin's guard
 
@@ -431,7 +447,17 @@ Merlin's pipeline, adapted. `.github/workflows/ci.yml` runs `go vet`, `golangci-
 
 The prod image tag is pinned to the commit SHA in `deployed-tag.env` on the host, with the previous value kept in `previous-tag.env`, so a rollback is editing one line rather than working out from GHCR what used to be running. The image prune is scoped `--filter "until=168h"` deliberately: a bare `docker image prune -f` on a host that just retagged can delete the previous release, which is the one thing a rollback needs to still exist.
 
-**There is no backup sidecar, and the omission is deliberate.** Merlin's works because `pg_dump` is a client asking the server for a consistent snapshot. bbolt has no equivalent, and `cp markov.db` is *not* a backup: the file is a single mmap updated by copy-on-write pages plus a meta-page flip at commit, so an external byte copy can capture a state between the page write and the flip, or mid-remap, and the result usually *appears* to work, which is the worst property a backup can have. A sidecar cannot snapshot it either, because of the exclusive flock. The correct mechanism is in-process: a read transaction calling `tx.CopyFile`, consistent by construction and non-blocking for writers. That lands in M13.
+**There is no backup sidecar, and the omission is deliberate.** Merlin's works because `pg_dump` is a client asking the server for a consistent snapshot. bbolt has no equivalent, and `cp markov.db` is *not* a backup: the file is a single mmap updated by copy-on-write pages plus a meta-page flip at commit, so an external byte copy can capture a state between the page write and the flip, or mid-remap, and the result usually *appears* to work, which is the worst property a backup can have. A sidecar cannot snapshot it either, because of the exclusive flock.
+
+Backups are in-process, in `internal/plugins/backup`: `Store.Backup` takes a read transaction and calls `tx.WriteTo`, which is consistent by construction and does not block writers. **Three retention rules, and each is a way to lose everything:**
+
+- **Write a temp name, then rename.** A half-written file with a real name is indistinguishable from a snapshot, and the one moment anybody looks in that directory is the moment they need a file that is definitely whole.
+- **Prune only files this service named**, matching both the prefix and the suffix. A retention pass loose in a directory is a delete loop pointed at whatever else is in there, and on a mounted volume that could be the corpus itself.
+- **Never prune after a failed snapshot.** Pruning on a schedule while backups quietly fail removes every good copy, one tick at a time. Same reasoning as scoping the deploy's image prune to `until=168h` so a rollback still has an image to roll back to.
+
+**The loop is deliberately not `Immediate`,** which is the one thing here that looks like an oversight. A snapshot at startup means every restart writes one, so a crash loop churns through the retention window and discards every older copy in minutes, which is exactly when the older copies matter most. Shutdown takes no final snapshot either: it is a read transaction against a corpus about to close, under a budget shared with every other service.
+
+**`PEREGRINE_BACKUP_DIR` must be a writable mount in a container.** The image runs `read_only: true`, so any path outside a volume or bind fails on the first write, and a relative path resolves against the distroless working directory. `docker-compose.prod.yml` binds `./backups` to `/backups` for this, and it is deliberately **outside** the corpus volume so that losing or removing that volume does not take the snapshots with it. Each snapshot is a full copy, so the disk cost is `KEEP` times the corpus size.
 
 `markov.db`, the whisper model and the ffmpeg binary are all gitignored. `voicenotes/models/ggml-small.bin` is 465 MiB, over GitHub's hard 100 MiB per-file limit, so a commit containing it cannot be pushed at all and the only remedy is rewriting history. `.dockerignore` exists for the same weight: the working tree is around 692 MB and `COPY . .` would ship all of it into the builder on every build.
 

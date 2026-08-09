@@ -2,6 +2,7 @@ package main
 
 import (
 	"log/slog"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 
@@ -12,12 +13,14 @@ import (
 	"github.com/6586x57890143/peregrine/internal/discordguard"
 	"github.com/6586x57890143/peregrine/internal/generate"
 	"github.com/6586x57890143/peregrine/internal/learn"
-	"github.com/6586x57890143/peregrine/internal/legacy"
 	"github.com/6586x57890143/peregrine/internal/plugins/aggro"
 	"github.com/6586x57890143/peregrine/internal/plugins/autopost"
+	"github.com/6586x57890143/peregrine/internal/plugins/backup"
 	"github.com/6586x57890143/peregrine/internal/plugins/chat"
 	"github.com/6586x57890143/peregrine/internal/plugins/games"
+	"github.com/6586x57890143/peregrine/internal/plugins/health"
 	"github.com/6586x57890143/peregrine/internal/plugins/images"
+	"github.com/6586x57890143/peregrine/internal/plugins/ingest"
 	"github.com/6586x57890143/peregrine/internal/plugins/voicenote"
 	"github.com/6586x57890143/peregrine/internal/safety"
 	"github.com/6586x57890143/peregrine/internal/storage"
@@ -44,6 +47,7 @@ func registerServices(
 	session *discordgo.Session,
 	store *storage.Store,
 	gate *safety.Gate,
+	dispatcher *core.Dispatcher,
 	log *slog.Logger,
 ) error {
 	// The guard is the single chokepoint every outbound call goes through. Built here, once,
@@ -172,17 +176,52 @@ func registerServices(
 	// registration time nobody knows it yet.
 	aggroSvc.SetBotID(reactor.BotID)
 
-	// Registration order. legacy still owns ingestion and the status line, and M13 is what
-	// deletes it.
+	// Ingestion, the corpus snapshots and the health report. These three were the last things
+	// in internal/legacy, which M13 deleted.
+	ingestSvc := ingest.New(session, store, learner, ingest.Options{
+		Tick:               cfg.IngestTick,
+		Lookback:           cfg.IngestLookback,
+		GuildConcurrency:   cfg.IngestGuildConcurrency,
+		ChannelConcurrency: cfg.IngestChannelConcurrency,
+		BatchDelay:         cfg.IngestBatchDelay,
+	})
+	backupSvc := backup.New(store, backup.Options{
+		Dir:   cfg.BackupDir,
+		Every: cfg.BackupTick,
+		Keep:  cfg.BackupKeep,
+	})
+	healthSvc := health.New(store, dispatcher, gate, health.SessionLatency(session), health.Options{
+		StatusTick:  cfg.StatusTick,
+		LatencyTick: latencyTick,
+		Threshold:   latencyThreshold,
+	})
+
+	// Registration order, and it is behaviour rather than taste. See the note above this
+	// function: chat goes last among the message-handling features because its Init arms the
+	// gateway handler, and health goes last overall so its Shutdown report is the final word.
 	registry.Register(aggroSvc)
 	registry.Register(imagesSvc)
 	registry.Register(gamesSvc)
 	registry.Register(autopostSvc)
 	registry.Register(voiceSvc)
 	registry.Register(reactor)
-	registry.Register(legacy.New(learner))
+	registry.Register(ingestSvc)
+	registry.Register(backupSvc)
+	registry.Register(healthSvc)
 	return nil
 }
+
+// The two health dials that are not configurable, and why.
+//
+// An operator has no reason to tune either: the latency check is cheap (it reads a value
+// discordgo already maintains rather than making a request) and the threshold is the line between
+// "worth a log line" and "noise that trains you to stop reading it". Neither is a decision an
+// incident would change, which is the test internal/config applies to whether something deserves
+// a variable.
+const (
+	latencyTick      = 2 * time.Minute
+	latencyThreshold = 500 * time.Millisecond
+)
 
 // emitGate adapts the safety gate to the guard's narrower interface.
 //
