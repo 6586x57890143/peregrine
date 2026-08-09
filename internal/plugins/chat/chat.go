@@ -504,13 +504,22 @@ func (s *Service) stepReply(r *reaction) bool {
 	m := r.m
 	replyStart := time.Now()
 
-	prompt := m.Content
+	// Mentions become names before anything reads the prompt. s.mentions memoizes on the
+	// reaction and stepLearn calls it for every text message anyway, so this costs nothing new.
+	// Without it a mention reaches generation as one opaque <@123> token that Canonical cannot
+	// resolve, so the most explicit way to name somebody was invisible to every name tier.
+	prompt := names.Substitute(m.Content, s.mentions(r))
 	roast := false
 	switch {
 	case r.flags["SELF_MENTION_KEYWORD"] && !r.flags["MENTIONED"] && !r.flags["REPLY_TO_BOT"]:
-		// Overheard rather than addressed: the bot is being talked ABOUT, so it answers
-		// self-referentially and always roasts.
-		prompt = "<START> peregrine"
+		// Overheard rather than addressed: the bot is being talked ABOUT, so it always roasts.
+		//
+		// The prompt used to be replaced with the fixed string "<START> peregrine" here, which
+		// threw the message away on the path the bot is most often used through: "peregrine
+		// what is up with lachy" lost "lachy" entirely, so no name tier and no topic tier ever
+		// saw it. Keeping the content is still self-referential by construction, because this
+		// branch only runs when the self-mention pattern matched, so the bot's own name is
+		// already a prompt word and seeds through tiers 1 and 5.
 		roast = true
 		log.Printf("[INFO] Activating roast mode due to a self-mention keyword. Prompt: %q", prompt)
 	default:
@@ -621,31 +630,14 @@ func (s *Service) stepLearn(r *reaction) bool {
 		})
 	}
 
-	// The author, so their own message content is associated with them. Prefer the nickname
-	// when there is one.
-	author := names.User{Name: m.Author.Username, UserID: m.Author.ID, Username: m.Author.Username}
-	if m.Member != nil && m.Member.Nick != "" {
-		author.Name = m.Member.Nick
-	}
-
-	// Avoid duplicating the author if they were already in the list, which happens when
-	// somebody mentions themselves.
-	learners := mentioned
-	present := false
-	for _, u := range learners {
-		if u.UserID == m.Author.ID {
-			present = true
-			break
-		}
-	}
-	if !present {
-		// Copied rather than appended in place, because appending would write into the slice
-		// cached on the reaction and the self-learn step reads that same slice.
-		learners = append(append([]names.User(nil), learners...), author)
-	}
+	// The author, whose own message content gets associated with them. The append that used to
+	// follow, putting them into the mentioned slice so associate would see them, is gone:
+	// Learner.Message merges the author into that set itself now. This step did it and the
+	// backfill did not, so every backfilled message learned no associations at all.
+	author := names.Primary(m.Author, m.Member)
 
 	if err := s.store.Update(func(w *storage.Writer) error {
-		return s.learner.Message(w, m.Content, m.ID, author, learners)
+		return s.learner.Message(w, m.Content, m.ID, author, mentioned)
 	}); err != nil {
 		log.Printf("[WARN] learning message %s failed: %v", m.ID, err)
 	}

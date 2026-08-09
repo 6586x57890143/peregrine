@@ -49,8 +49,13 @@ func TestResolveReturnsBothSpellingsOfAPerson(t *testing.T) {
 	if len(users) != 2 {
 		t.Fatalf("Resolve returned %d users, want the username and the nickname: %+v", len(users), users)
 	}
-	if users[0].Name != "alice" || users[1].Name != "birdlover" {
-		t.Errorf("names = %q and %q, want alice and birdlover", users[0].Name, users[1].Name)
+	// DISPLAY FORM FIRST, and the order is load-bearing rather than incidental: Primary returns
+	// this slice's first entry and Substitute uses the first spelling it sees for an ID, so both
+	// would start writing a lowercase handle into the corpus where a human would have typed the
+	// nickname.
+	if users[0].Name != "birdlover" || users[1].Name != "alice" {
+		t.Errorf("names = %q and %q, want the nickname birdlover before the username alice",
+			users[0].Name, users[1].Name)
 	}
 	// Both entries are the same person, so the ID set holds one.
 	if len(seen) != 1 {
@@ -256,5 +261,98 @@ func TestNilMentionsAreSkipped(t *testing.T) {
 	users, _ := names.Resolve(s, []*discordgo.User{nil, {ID: snowflake(1), Username: "alice"}}, "")
 	if len(users) != 1 {
 		t.Errorf("users = %+v, want just alice", users)
+	}
+}
+
+// TestSpellingsCoversAllThreeNames.
+//
+// A Discord user has up to three, and people type whichever they see. GlobalName was missing
+// from all three sites that hand-built this, which since usernames became lowercase handles is
+// the one most people are actually addressed by.
+func TestSpellingsCoversAllThreeNames(t *testing.T) {
+	u := &discordgo.User{ID: snowflake(1), Username: "alice", GlobalName: "Alice A"}
+	member := &discordgo.Member{Nick: "birdlover"}
+
+	got := names.Spellings(u, member)
+	if len(got) != 3 {
+		t.Fatalf("Spellings = %+v, want the nickname, the global name and the username", got)
+	}
+	// Display first, which Primary and Substitute both depend on.
+	for i, want := range []string{"birdlover", "Alice A", "alice"} {
+		if got[i].Name != want {
+			t.Errorf("Spellings[%d].Name = %q, want %q", i, got[i].Name, want)
+		}
+	}
+	// Every entry is the same person under the same canonical form, which is what lets
+	// Record write them as aliases pointing at one name.
+	for _, u := range got {
+		if u.UserID != snowflake(1) || u.Username != "alice" {
+			t.Errorf("entry %+v does not carry the canonical identity", u)
+		}
+	}
+}
+
+// TestSpellingsCollapsesDuplicates. A nickname identical to the username is one name, and a
+// person whose global name only differs in case is not two people.
+func TestSpellingsCollapsesDuplicates(t *testing.T) {
+	u := &discordgo.User{ID: snowflake(1), Username: "alice", GlobalName: "Alice"}
+	got := names.Spellings(u, &discordgo.Member{Nick: "alice"})
+	if len(got) != 1 {
+		t.Errorf("Spellings = %+v, want one spelling", got)
+	}
+}
+
+// TestPrimaryToleratesANilUser, because indexing Spellings would panic and a nil Author has
+// turned up in a fixture here before. Production always having one is not a reason to write the
+// version that crashes if it does not.
+func TestPrimaryToleratesANilUser(t *testing.T) {
+	if got := names.Primary(nil, nil); got != (names.User{}) {
+		t.Errorf("Primary(nil, nil) = %+v, want the zero User", got)
+	}
+	got := names.Primary(&discordgo.User{ID: snowflake(1), Username: "alice"}, nil)
+	if got.Name != "alice" {
+		t.Errorf("Primary = %+v, want the username when there is nothing else", got)
+	}
+}
+
+// TestSubstituteTurnsMentionsIntoNames.
+//
+// The tokenizer keeps <@123> as ONE token, so without this the most explicit way to name
+// somebody reaches generation as a blob Canonical cannot resolve, and the corpus stores an ID
+// where a name belongs.
+func TestSubstituteTurnsMentionsIntoNames(t *testing.T) {
+	users := []names.User{
+		{Name: "birdlover", UserID: snowflake(1), Username: "alice"},
+		{Name: "alice", UserID: snowflake(1), Username: "alice"},
+		{Name: "bob", UserID: snowflake(2), Username: "bob"},
+	}
+
+	in := "<@" + snowflake(1) + "> and <@!" + snowflake(2) + "> are at it again"
+	want := "birdlover and bob are at it again"
+	if got := names.Substitute(in, users); got != want {
+		t.Errorf("Substitute = %q, want %q", got, want)
+	}
+}
+
+// TestSubstituteLeavesAnUnknownIDAlone. Stripping it would drop a word out of the middle of a
+// sentence and cost the structure around it, and leaving it is exactly today's behaviour for
+// every mention.
+func TestSubstituteLeavesAnUnknownIDAlone(t *testing.T) {
+	users := []names.User{{Name: "alice", UserID: snowflake(1), Username: "alice"}}
+
+	in := "<@" + snowflake(9) + "> said something"
+	if got := names.Substitute(in, users); got != in {
+		t.Errorf("Substitute = %q, want it unchanged", got)
+	}
+}
+
+// TestSubstituteIgnoresRoleMentions. A role is not a person this package can name, and <@&123>
+// has an ampersand where the pattern wants a digit.
+func TestSubstituteIgnoresRoleMentions(t *testing.T) {
+	users := []names.User{{Name: "alice", UserID: snowflake(1), Username: "alice"}}
+
+	in := "<@&" + snowflake(1) + "> get in here"
+	if got := names.Substitute(in, users); got != in {
+		t.Errorf("Substitute = %q, want a role mention left alone", got)
 	}
 }

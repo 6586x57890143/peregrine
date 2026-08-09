@@ -155,14 +155,9 @@ type learner struct {
 func (l learner) Learn(m *discordgo.Message, guildID string) error {
 	mentioned := names.OfMessage(l.session, l.store, &discordgo.MessageCreate{Message: m}, guildID)
 
-	author := names.User{
-		Name:     m.Author.Username,
-		UserID:   m.Author.ID,
-		Username: m.Author.Username,
-	}
-	if m.Member != nil && m.Member.Nick != "" {
-		author.Name = m.Member.Nick
-	}
+	// One answer to "what is this person called", shared with the live handler. This was
+	// hand-built here and hand-built again in chat, and neither copy knew about GlobalName.
+	author := names.Primary(m.Author, m.Member)
 
 	return l.store.Update(func(w *storage.Writer) error {
 		return l.learner.Message(w, m.Content, m.ID, author, mentioned)

@@ -60,10 +60,20 @@ func author(id int) names.User {
 	return names.User{Name: "u" + strconv.Itoa(id), UserID: snowflake(id), Username: "u" + strconv.Itoa(id)}
 }
 
+// learnOne learns a message THE WAY THE BACKFILL DOES, with a nil mentioned list.
+//
+// It used to pass []names.User{who}, mirroring the live chat handler, which appended the author
+// to that slice before calling. The backfill did not, and associate returns early on an empty
+// name set, so every backfilled message learned no associations at all. Passing the author here
+// is what hid that for a whole milestone: the shape every test exercised was the only shape that
+// worked.
+//
+// Nil is now the interesting case, because Message merges the author in itself. Tests that want
+// the other shape pass a list explicitly.
 func learnOne(t *testing.T, s *storage.Store, l *Learner, text, msgID string, who names.User) {
 	t.Helper()
 	if err := s.Update(func(w *storage.Writer) error {
-		return l.Message(w, text, msgID, who, []names.User{who})
+		return l.Message(w, text, msgID, who, nil)
 	}); err != nil {
 		t.Fatalf("Message: %v", err)
 	}
@@ -243,7 +253,7 @@ func TestCooccurrenceIsWindowed(t *testing.T) {
 	// A named person is required, because both association indexes are gated on one.
 	who := author(7)
 	if err := s.Update(func(w *storage.Writer) error {
-		return l.Message(w, "alpha bravo charlie delta echo foxtrot golf", snowflake(8), who, []names.User{who})
+		return l.Message(w, "alpha bravo charlie delta echo foxtrot golf", snowflake(8), who, nil)
 	}); err != nil {
 		t.Fatalf("Message: %v", err)
 	}
@@ -279,7 +289,7 @@ func TestCooccurrenceWindowZeroIsUnbounded(t *testing.T) {
 
 	who := author(7)
 	if err := s.Update(func(w *storage.Writer) error {
-		return l.Message(w, "alpha bravo charlie delta echo foxtrot golf", snowflake(9), who, []names.User{who})
+		return l.Message(w, "alpha bravo charlie delta echo foxtrot golf", snowflake(9), who, nil)
 	}); err != nil {
 		t.Fatalf("Message: %v", err)
 	}
@@ -307,7 +317,7 @@ func TestCooccurrenceRecordsBothDirections(t *testing.T) {
 
 	who := author(7)
 	if err := s.Update(func(w *storage.Writer) error {
-		return l.Message(w, "alpha bravo", snowflake(10), who, []names.User{who})
+		return l.Message(w, "alpha bravo", snowflake(10), who, nil)
 	}); err != nil {
 		t.Fatalf("Message: %v", err)
 	}
@@ -333,6 +343,60 @@ func TestCooccurrenceRecordsBothDirections(t *testing.T) {
 	}
 }
 
+// TestTheAuthorIsAlwaysAName is the regression pin for the backfill learning no associations.
+//
+// The live chat handler appended the author to its mentioned slice before calling Message; the
+// backfill passed only the @mentions, which for most messages is nothing. associate returns
+// early on an empty name set, so a backfilled message wrote NEITHER index: not name_topic, which
+// every name-aware seed tier reads, and not topic_word, which tiers 3 and 6 and all of Jump
+// read. A corpus is mostly backfill, so both stayed nearly empty while the bot looked like it
+// was learning fine, because n-grams are written outside that guard.
+//
+// This is A1's shape one subsystem over: one entry point, two callers, one of them doing an
+// extra step. Message merges the author in itself now, so a third caller cannot get it wrong.
+//
+// Verified by reverting: drop the authorName merge in Message and both halves of this fail, as
+// do the four co-occurrence tests above, which now learn the way the backfill does.
+func TestTheAuthorIsAlwaysAName(t *testing.T) {
+	s, _ := fixture(t)
+	gate := safety.NewGate(nil, slog.New(slog.NewTextHandler(io.Discard, nil)), false)
+	l := New(gate, Options{MaxNGram: 3, MaxHistory: 1000, CooccurrenceWindow: 5})
+
+	// Nil, exactly as ingest.learner.Learn passes it for a message that mentions nobody.
+	who := author(7)
+	if err := s.Update(func(w *storage.Writer) error {
+		return l.Message(w, "gigi posted another cursed image", snowflake(12), who, nil)
+	}); err != nil {
+		t.Fatalf("Message: %v", err)
+	}
+
+	if err := s.View(func(r *storage.Reader) error {
+		topics, err := r.NameTopicsFor(who.Username)
+		if err != nil {
+			return err
+		}
+		if len(topics) == 0 {
+			t.Error("the author has no name-topic associations, so every name-aware seed tier " +
+				"has nothing to read for anybody who was not @mentioned")
+		}
+		if _, ok := topics["cursed"]; !ok {
+			t.Errorf("the author is not associated with their own vocabulary: %v", topics)
+		}
+
+		assoc, err := r.TopicWordsFor("cursed")
+		if err != nil {
+			return err
+		}
+		if len(assoc) == 0 {
+			t.Error("no word-to-word associations were written, so tiers 3 and 6 and Jump have " +
+				"nothing to read")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestStopWordsAreExcludedFromAssociations. Without this, "the" is the top association of
 // every word in the corpus and the topic heuristics measure nothing. It is also half the
 // reason clustering collapsed (finding 29).
@@ -343,7 +407,7 @@ func TestStopWordsAreExcludedFromAssociations(t *testing.T) {
 
 	who := author(7)
 	if err := s.Update(func(w *storage.Writer) error {
-		return l.Message(w, "peregrine and the bird", snowflake(11), who, []names.User{who})
+		return l.Message(w, "peregrine and the bird", snowflake(11), who, nil)
 	}); err != nil {
 		t.Fatalf("Message: %v", err)
 	}
