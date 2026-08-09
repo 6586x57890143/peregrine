@@ -205,6 +205,26 @@ Every runtime path used to be resolved against the working directory, so startin
 
 The dictionary load used to be `log.Fatalf`, so a missing 64 KB word list killed learning, generation, replies and everything else along with word games. It now logs a warning and sets `wordGamesAvailable = false`. Treat this as the general rule: peregrine is a bag of loosely related engagement behaviors, and exactly one of them failing should disable that one. `log.Fatal` is for "the token is missing" and "the corpus will not open", nothing else.
 
+### The reactor, and the consume contract
+
+`handleMessage` is a table of named steps in `internal/legacy/reactor.go`, each returning whether it **consumed** the message. The runner stops at the first one that does.
+
+**Consumed means "this was addressed to me", not "I did something".** The aggro step reacts and the reply step posts, and neither consumes, because a message that earns a reply is still conversation and must still be learned from. Only a command consumes. `TestOnlyCommandsConsume` parses the file and fails if any other step returns `true`, because a step that starts consuming silently stops learning for whatever it matches and no behavioural test would notice.
+
+That contract is what closed finding 9. A `return` statement would have fixed the one branch and left the shape available to the next command somebody adds: `!leaderboard` answered and then fell through into the reply generator and the learn step, so the bot replied to its own command as if it were conversation and taught itself the string `!leaderboard`.
+
+**Two orderings are load-bearing.** The learn gate is first, so a message the bot will not learn from is also not replied to or reacted to. Commands come before reply and learn, which is the entire point.
+
+**Commands match the whole trimmed message, not a prefix.** A prefix match makes it impossible to talk *about* a command, so "you should try !leaderboard sometime" would be swallowed and answered.
+
+**`!wordgame` is not a command when word games are off**, because consuming it would mean silently ignoring a message for a feature that is not running. `!leaderboard` is deliberately *not* gated on the feature flag: its chat half reads the stats bucket, which is populated regardless.
+
+**The steps are still in `internal/legacy`, and that is deliberate.** `SPEC.md` §2 puts them under `internal/plugins`; the state they close over (`activeWordGames`, `birdAggroTargetID`, `recentImageURLs`, `leaderboard`) is the engagement features, which is M11's row. Moving control flow and state in one commit would mean reviewing an eight-hundred-line move for a two-line behavioural change. Each step is already a closed unit over one subsystem, so M11's move is mechanical.
+
+**Self-learning is keyed by the reply's own message ID.** Both it and the learn step used the *user's* ID, and `learnMessage` dedupes on that ID, so whichever transaction committed first won and the other became a no-op: one message was silently discarded per interaction, and which one depended on a goroutine race (finding 6). This was data loss, not inefficiency.
+
+**`reaction.names()` memoizes `extractNamesFromMessage`.** It was called three times per message, and each call makes a `GuildMember` REST request per mention plus a read transaction. Use the cached list; if you append to it, copy first, because the self-learn step reads the same slice.
+
 ### Every outbound Discord call goes through `internal/discordguard`
 
 **Nothing peregrine posts may ping, and this is where that is enforced.** Peregrine's output is Markov text assembled from arbitrary user messages, so every send is untrusted-input-shaped *by construction*: a user mention that got learned is a corpus token like any other, and the generator emits it again whenever the chain walks through it. Nobody chose that and nobody can predict when it fires.
@@ -217,7 +237,9 @@ discordgo will not stop it. Its send helpers build a request with a nil `Allowed
 
 **`CheckEmit` moved here from the generation exit, and that closed real holes.** It used to cover the reply path only, so the autonomous poster, the word-game announcements and the transcription results all reached Discord ungated. Generation is not the only thing that produces text: the worst case was the transcript path, where someone could have had the bot say anything by saying it out loud.
 
-**Deletes are not content-gated and reactions are.** A delete says nothing and cannot ping, so gating it would stop the bot cleaning up during exactly the incident it needs to. A reaction is the bot visibly participating, so `PAUSE_ALL_WRITES` has to stop it.
+**Deletes are not content-gated and reactions are.** A delete says nothing and cannot ping, so gating it would stop the bot cleaning up during exactly the incident it needs to. A reaction is the bot visibly participating, so `PAUSE_ALL_WRITES` has to stop it. `Unreact` is the mirror image and is *not* pause-gated: taking a reaction back is withdrawing, and refusing it would leave the bot's mark on someone's message with no way to remove it until the pause lifts.
+
+**A forbidden-call list is only as good as its enumeration.** The M10b split dropped a `MessageReactionRemove` call and `TestNothingBypassesTheGuard` did not notice, because that method was missing from the list. When the guard grows a method, the list grows with it.
 
 **`PEREGRINE_IGNORE_CHANNELS` is enforced in the guard, not the reply path.** An operator setting it means "not in there", not "not in reply to a message in there", so the autonomous poster and word games have to respect it. It does not stop *learning* from those channels, which is the same asymmetry `PAUSE_ALL_WRITES` has.
 

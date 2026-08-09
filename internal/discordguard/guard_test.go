@@ -11,16 +11,18 @@ import (
 
 // fakeSession records what would have gone to Discord.
 type fakeSession struct {
-	sends     []*discordgo.MessageSend
-	sendChans []string
-	edits     []*discordgo.MessageEdit
-	deletes   [][2]string
-	reactions [][3]string
+	sends       []*discordgo.MessageSend
+	sendChans   []string
+	edits       []*discordgo.MessageEdit
+	deletes     [][2]string
+	reactions   [][3]string
+	unreactions [][4]string
 
-	sendErr   error
-	editErr   error
-	deleteErr error
-	reactErr  error
+	sendErr    error
+	editErr    error
+	deleteErr  error
+	reactErr   error
+	unreactErr error
 }
 
 func (f *fakeSession) ChannelMessageSendComplex(channelID string, data *discordgo.MessageSend, _ ...discordgo.RequestOption) (*discordgo.Message, error) {
@@ -48,6 +50,11 @@ func (f *fakeSession) ChannelMessageDelete(channelID, messageID string, _ ...dis
 func (f *fakeSession) MessageReactionAdd(channelID, messageID, emoji string, _ ...discordgo.RequestOption) error {
 	f.reactions = append(f.reactions, [3]string{channelID, messageID, emoji})
 	return f.reactErr
+}
+
+func (f *fakeSession) MessageReactionRemove(channelID, messageID, emoji, userID string, _ ...discordgo.RequestOption) error {
+	f.unreactions = append(f.unreactions, [4]string{channelID, messageID, emoji, userID})
+	return f.unreactErr
 }
 
 // allowAll and blockAll are the two gate behaviours worth testing against.
@@ -363,5 +370,38 @@ func TestNilLoggerIsUsable(t *testing.T) {
 	g := New(f, allowAll{}, nil, nil)
 	if _, ok := g.Send("chan", "hello"); ok {
 		t.Error("expected failure")
+	}
+}
+
+// TestUnreactIsNotPauseGated, which is the one asymmetry with React worth pinning.
+//
+// Removing a reaction is the bot WITHDRAWING rather than participating. An operator who
+// has hit the emergency stop wants that to succeed: refusing it would leave the bot's mark
+// on somebody's message with no way to take it back until the pause is lifted.
+func TestUnreactIsNotPauseGated(t *testing.T) {
+	f := &fakeSession{}
+	g := newGuard(f, &blockAll{})
+
+	if !g.Unreact("chan", "m1", "\U0001F426", "bot") {
+		t.Error("Unreact was refused while writes were paused; taking a reaction back is " +
+			"the opposite of participating and must still work")
+	}
+	if len(f.unreactions) != 1 {
+		t.Fatalf("got %d reaction removals, want 1", len(f.unreactions))
+	}
+	if got := f.unreactions[0]; got != [4]string{"chan", "m1", "\U0001F426", "bot"} {
+		t.Errorf("Unreact passed %v", got)
+	}
+}
+
+func TestUnreactRespectsTheIgnoreListAndReportsFailure(t *testing.T) {
+	f := &fakeSession{}
+	if g := newGuard(f, allowAll{}, "quiet"); g.Unreact("quiet", "m", "x", "bot") {
+		t.Error("removed a reaction in an ignored channel")
+	}
+
+	f2 := &fakeSession{unreactErr: errors.New("gone")}
+	if g := newGuard(f2, allowAll{}); g.Unreact("chan", "m", "x", "bot") {
+		t.Error("a failed removal reported success")
 	}
 }
