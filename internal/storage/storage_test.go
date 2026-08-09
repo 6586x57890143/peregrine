@@ -1219,3 +1219,212 @@ func TestOpenDoesNotStampATopicTotalOnAnEmptyCorpus(t *testing.T) {
 		t.Fatalf("View: %v", err)
 	}
 }
+
+// ------------------------------------------------------------------ M9 cursors
+
+// TestCursorRoundTrips covers the basic contract: an unread channel has no cursor, and a
+// stored one comes back as the same ID.
+func TestCursorRoundTrips(t *testing.T) {
+	s := dbtest.Store(t)
+
+	if err := s.View(func(r *storage.Reader) error {
+		if got := r.Cursor("chan"); got != "" {
+			t.Errorf("an unread channel has cursor %q, want empty. Empty is what ingest "+
+				"reads as \"never seen\", which is what triggers the lookback bootstrap", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("View: %v", err)
+	}
+
+	const id = "1234567890123456789"
+	if err := s.Update(func(w *storage.Writer) error { return w.SetCursor("chan", id) }); err != nil {
+		t.Fatalf("SetCursor: %v", err)
+	}
+	if err := s.View(func(r *storage.Reader) error {
+		if got := r.Cursor("chan"); got != id {
+			t.Errorf("Cursor = %q, want %q", got, id)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("View: %v", err)
+	}
+}
+
+// TestCursorNeverMovesBackwards is the property that matters, not a courtesy.
+//
+// Two things can hand this an older ID: a batch processed out of order, and two ingest
+// passes overlapping on one channel. Either would rewind the mark and make the next pass
+// re-read and re-learn everything between, which is finding 13 arriving by a different
+// route. A monotonic cursor cannot do that however confused its caller is.
+func TestCursorNeverMovesBackwards(t *testing.T) {
+	s := dbtest.Store(t)
+
+	const newer = "2000000000000000000"
+	const older = "1000000000000000000"
+
+	if err := s.Update(func(w *storage.Writer) error {
+		if err := w.SetCursor("chan", newer); err != nil {
+			return err
+		}
+		return w.SetCursor("chan", older)
+	}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	if err := s.View(func(r *storage.Reader) error {
+		if got := r.Cursor("chan"); got != newer {
+			t.Errorf("cursor moved backwards to %q, want it to stay at %q", got, newer)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("View: %v", err)
+	}
+}
+
+// TestCursorComparesChronologicallyNotLexically. Snowflakes as decimal strings sort wrong:
+// a 19-digit ID is numerically larger than a 20-digit one only if you compare bytes. This
+// is the same trap as the history keys in finding 10, and it matters more here because a
+// wrong comparison silently rewinds the mark.
+func TestCursorComparesChronologicallyNotLexically(t *testing.T) {
+	s := dbtest.Store(t)
+
+	// 19 digits then 20 digits. Byte-wise "9..." > "1...", so a string comparison would
+	// refuse the genuinely newer ID.
+	const short = "9999999999999999999"
+	const long = "10000000000000000000"
+
+	if err := s.Update(func(w *storage.Writer) error {
+		if err := w.SetCursor("chan", short); err != nil {
+			return err
+		}
+		return w.SetCursor("chan", long)
+	}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	if err := s.View(func(r *storage.Reader) error {
+		if got := r.Cursor("chan"); got != long {
+			t.Errorf("cursor = %q, want %q. Comparing snowflakes as strings gets this "+
+				"backwards and rewinds the mark, which re-learns everything between", got, long)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("View: %v", err)
+	}
+}
+
+// TestSetCursorRefusesNonsense. A message ID that is not a snowflake is an error rather
+// than a key, which is the same answer LearnNgram gives an empty prefix: the caller
+// invented it, and storing it would mean the cursor can never be compared again.
+func TestSetCursorRefusesNonsense(t *testing.T) {
+	s := dbtest.Store(t)
+
+	for _, bad := range []string{"", "not-a-snowflake", "12.5", "-1"} {
+		err := s.Update(func(w *storage.Writer) error { return w.SetCursor("chan", bad) })
+		if err == nil {
+			t.Errorf("SetCursor accepted %q as a message ID", bad)
+		}
+	}
+	if err := s.Update(func(w *storage.Writer) error {
+		return w.SetCursor("", "1234567890123456789")
+	}); err == nil {
+		t.Error("SetCursor accepted an empty channel ID")
+	}
+}
+
+// TestForgetCursorMakesAChannelUnread, so an operator can re-ingest one channel without
+// discarding the corpus.
+func TestForgetCursorMakesAChannelUnread(t *testing.T) {
+	s := dbtest.Store(t)
+
+	if err := s.Update(func(w *storage.Writer) error {
+		return w.SetCursor("chan", "1234567890123456789")
+	}); err != nil {
+		t.Fatalf("SetCursor: %v", err)
+	}
+	if err := s.Update(func(w *storage.Writer) error { return w.ForgetCursor("chan") }); err != nil {
+		t.Fatalf("ForgetCursor: %v", err)
+	}
+	if err := s.View(func(r *storage.Reader) error {
+		if got := r.Cursor("chan"); got != "" {
+			t.Errorf("cursor = %q after ForgetCursor, want empty", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("View: %v", err)
+	}
+}
+
+// TestCursorsAreIndependentPerChannel, because they are the whole point: one busy channel
+// must not affect what a quiet one re-reads.
+func TestCursorsAreIndependentPerChannel(t *testing.T) {
+	s := dbtest.Store(t)
+
+	if err := s.Update(func(w *storage.Writer) error {
+		if err := w.SetCursor("a", "1000000000000000001"); err != nil {
+			return err
+		}
+		return w.SetCursor("b", "2000000000000000002")
+	}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	seen := map[string]string{}
+	if err := s.View(func(r *storage.Reader) error {
+		return r.ForEachCursor(func(channelID, messageID string) error {
+			seen[channelID] = messageID
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("ForEachCursor: %v", err)
+	}
+
+	if seen["a"] != "1000000000000000001" || seen["b"] != "2000000000000000002" {
+		t.Errorf("ForEachCursor returned %v", seen)
+	}
+	if len(seen) != 2 {
+		t.Errorf("saw %d cursors, want 2", len(seen))
+	}
+}
+
+// TestAddingTheCursorBucketDidNotBreakAnExistingCorpus.
+//
+// A new bucket is backward compatible because Open creates every bucket it knows about
+// with CreateBucketIfNotExists, so a corpus written before M9 gains an empty one and needs
+// no schema bump. Worth pinning because the alternative, bumping SchemaVersion, would have
+// forced every operator to discard their corpus for a feature that reads nothing from it.
+func TestAddingTheCursorBucketDidNotBreakAnExistingCorpus(t *testing.T) {
+	path := dbtest.Path(t)
+
+	first, err := storage.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := first.Update(func(w *storage.Writer) error {
+		return w.LearnNgram("the bird", "flew", "author")
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	reopened, err := storage.Open(path)
+	if err != nil {
+		t.Fatalf("reopen after adding a bucket must not need a schema bump: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+
+	if err := reopened.View(func(r *storage.Reader) error {
+		if got := r.Cursor("chan"); got != "" {
+			t.Errorf("a corpus with no cursors reports %q", got)
+		}
+		if r.CorpusEmpty() {
+			t.Error("the existing corpus was lost")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("View: %v", err)
+	}
+}

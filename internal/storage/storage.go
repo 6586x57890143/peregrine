@@ -47,6 +47,7 @@ const (
 	bucketStats      = "stats"       // <user id>                      -> JSON corpus.WeeklyStat
 	bucketLeaderfoo  = "leaderboard" // fixed key                      -> JSON
 	bucketCluster    = "cluster"     // <cluster id>                   -> JSON
+	bucketCursor     = "cursor"      // <channel id>                   -> snowflake be64
 	bucketMeta       = "meta"        // schema_version, counters
 )
 
@@ -56,7 +57,7 @@ var allBuckets = []string{
 	bucketNgram, bucketNgramAuth, bucketKNSucc, bucketKNPre, bucketKNPreCount,
 	bucketTopic, bucketTopicWord, bucketNameTopic, bucketName,
 	bucketHistory, bucketImage, bucketStats, bucketLeaderfoo, bucketCluster,
-	bucketMeta,
+	bucketCursor, bucketMeta,
 }
 
 // Meta keys.
