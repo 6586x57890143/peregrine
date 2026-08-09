@@ -2,9 +2,17 @@ services:
   bot:
     # Pinned to the exact commit CI built, not :latest. Rolling back is then
     # editing one line in deployed-tag.env and re-running compose, instead of
-    # hoping a mutable tag still points where you think it does. The default
-    # keeps a hand-run `docker compose up` working on a host that has never
-    # been deployed to. See README's Runbook.
+    # hoping a mutable tag still points where you think it does.
+    #
+    # THE :latest FALLBACK IS A LAST RESORT, NOT A CONVENIENCE. CI does push that
+    # tag, but the deploy script ends with `docker logout ghcr.io`, so pulling it
+    # by hand on the host fails with a bare `unauthorized` against a private
+    # package. Always source deployed-tag.env before a hand-run compose: the
+    # pinned SHA is already in the local image cache from the last deploy, so it
+    # needs no registry access at all. The fallback only helps on a host with
+    # GHCR credentials and no deployed-tag.env, which in practice means a
+    # developer's machine. See README's Runbook, where omitting this step broke
+    # the first production deploy.
     image: ghcr.io/6586x57890143/peregrine:${PEREGRINE_IMAGE_TAG:-latest}
     read_only: true
     cap_drop:

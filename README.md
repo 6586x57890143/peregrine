@@ -187,19 +187,26 @@ Set `PEREGRINE_PAUSE_ALL_WRITES=1` in `.env` and restart the container. That ref
 
 **Back up and restore the corpus**
 
-Backups are taken in-process into `./backups` once the M13 ticker lands. Do **not** back up the corpus by copying `markov.db` from the host while the bot is running: bbolt is a single mmap updated by copy-on-write pages plus a meta-page flip, so an external byte copy can capture a torn state, and it will usually appear to work. See the long comment in `docker-compose.prod.yml`.
+Snapshots are taken in-process into whatever `PEREGRINE_BACKUP_DIR` points at, which the prod compose binds to `./backups`. Empty disables them and is the default. Do **not** back up the corpus by copying `markov.db` from the host while the bot is running: bbolt is a single mmap updated by copy-on-write pages plus a meta-page flip, so an external byte copy can capture a torn state, and it will usually appear to work. See the long comment in `docker-compose.prod.yml`.
 
 To restore, stop the bot, replace the file inside the `corpus` volume, and start it again.
 
 **Start the corpus over**
 
 ```sh
-docker compose -f docker-compose.prod.yml down
+docker compose -f docker-compose.prod.yml down     # stops AND REMOVES the container
 docker volume rm peregrine_corpus
+set -a && . ./deployed-tag.env && set +a           # pin the tag, or you fall through to :latest
 docker compose -f docker-compose.prod.yml up -d
 ```
 
-Required once when deploying M6b, since the key layout changed and old data is not migrated. Skipping it does not corrupt anything: `storage.Open` refuses the old file and the container fails to start with an error saying to do this.
+Three things here are each a step somebody skips.
+
+`down` rather than `stop`, because **a stopped container still holds its volumes** and `volume rm` is refused while it exists. `down` does not remove named volumes itself, which is why the explicit `volume rm` sits between the two.
+
+Sourcing `deployed-tag.env` is not optional even though the rollback recipe above is the only other place it appears. Without it the compose file falls through to its `:-latest` default, and although CI does push `:latest`, the deploy script ends with `docker logout ghcr.io`, so a hand-run pull of a private package fails with a bare `unauthorized`. The pinned SHA is already in the local image cache from the last deploy, so pinning it means no registry access at all. This omission was a real papercut: the recipe was followed on the first production deploy and failed at exactly this step.
+
+Skipping the whole thing does not corrupt anything. `storage.Open` refuses a corpus it does not recognise and the container fails to start with an error naming this command, which is what happened on the first deploy to a host that had run a pre-M6 build by hand.
 
 ## Development
 
