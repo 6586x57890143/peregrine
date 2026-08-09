@@ -6,7 +6,7 @@ Sibling project to [merlin](../merlin), whose deployment conventions this repo f
 
 ## Status
 
-Mid-restructure. The bot works and runs, but it is being taken from a single 3,200-line `main.go` to a proper package layout one subsystem at a time, with a catalogue of known defects being closed along the way. See `SPEC.md` §8 for the defect list and §9 for the milestone order.
+Deployed and running. The restructure from a single 3,200-line `main.go` to a proper package layout is finished, and the catalogue of defects closed along the way is in `SPEC.md` §8, with the milestone order in §9.
 
 **The restructure is complete.** Milestones 0 through 13 are done, except M8 which was dropped for the reasons in `SPEC.md` finding 29, and M12b (a transcription engine) which is the one row left open. The layout is the one `SPEC.md` §2 describes: `cmd/bot` wires, `internal/core` owns the lifecycle, `internal/storage` is the only package that knows a bucket exists, `internal/markov` is the generation engine, and the features are nine packages under `internal/plugins`. **`internal/legacy` is deleted**, which was the point of the whole sequence: it went 3,200 lines, then one file, then 250 lines, then nothing.
 
@@ -184,6 +184,20 @@ This works because the image is pinned to an exact commit SHA rather than a muta
 **Stop it saying something immediately**
 
 Set `PEREGRINE_PAUSE_ALL_WRITES=1` in `.env` and restart the container. That refuses every outbound message process-wide while leaving reads and learning alone. It requires SSH and a restart, which is a known weakness during exactly the incident it exists for; a Discord-reachable equivalent is an open decision in `SPEC.md` §10.
+
+**Host bind mounts need uid 65532**
+
+The image runs `USER nonroot`, uid 65532. A **named volume** inherits the image directory's ownership when it is created empty, which is why the corpus needs no intervention: the Dockerfile chowns `/data` to 65532. A **bind mount keeps its host ownership**, so anything bound in from the host needs permissions that let 65532 at it, or the container fails on first access.
+
+```sh
+cd /home/deploy/peregrine
+sudo chgrp 65532 blocklist.txt && chmod 640 blocklist.txt   # the container reads this
+sudo chgrp 65532 backups       && chmod 775 backups         # the container writes here
+```
+
+Group rather than world, and still owned by `deploy`, so the blocklist stays editable mid-incident without sudo. That is the whole reason it is a bind rather than baked into the image.
+
+Both halves bit on the first production deploy. The blocklist at mode 0600 gave `permission denied` in a restart loop, which at least failed loudly. `./backups` owned by `deploy` fails **quietly**, a tick after startup rather than during it, because the backup loop is deliberately not `Immediate`, so nobody watching the boot logs sees it.
 
 **Back up and restore the corpus**
 
