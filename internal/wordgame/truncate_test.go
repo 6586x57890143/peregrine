@@ -1,4 +1,4 @@
-package wordgames
+package wordgame
 
 import (
 	"testing"
@@ -31,18 +31,18 @@ func TestTruncateRunes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := truncateRunes(tt.in, tt.max)
+			got := TruncateRunes(tt.in, tt.max)
 			if got != tt.want {
-				t.Errorf("truncateRunes(%q, %d) = %q, want %q", tt.in, tt.max, got, tt.want)
+				t.Errorf("TruncateRunes(%q, %d) = %q, want %q", tt.in, tt.max, got, tt.want)
 			}
 			// The property that actually matters, independent of the exact
 			// expected strings above: output is always valid UTF-8 and never
 			// longer than the limit in runes.
 			if !utf8.ValidString(got) {
-				t.Errorf("truncateRunes(%q, %d) produced invalid UTF-8: %q", tt.in, tt.max, got)
+				t.Errorf("TruncateRunes(%q, %d) produced invalid UTF-8: %q", tt.in, tt.max, got)
 			}
 			if n := utf8.RuneCountInString(got); n > tt.max {
-				t.Errorf("truncateRunes(%q, %d) returned %d runes, over the limit", tt.in, tt.max, n)
+				t.Errorf("TruncateRunes(%q, %d) returned %d runes, over the limit", tt.in, tt.max, n)
 			}
 		})
 	}
@@ -55,7 +55,7 @@ func TestTruncateRunes(t *testing.T) {
 func TestTruncateRunesNeverSplitsARune(t *testing.T) {
 	const s = "aé\U0001F600b\U0001F926cç\U0001F680dñ\U0001F308e"
 	for max := 0; max <= utf8.RuneCountInString(s)+2; max++ {
-		got := truncateRunes(s, max)
+		got := TruncateRunes(s, max)
 		if !utf8.ValidString(got) {
 			t.Errorf("max=%d produced invalid UTF-8: %q", max, got)
 		}
@@ -71,15 +71,16 @@ func TestTruncateRunesNeverSplitsARune(t *testing.T) {
 // word list took down every unrelated feature with it. An empty path now means
 // the embedded copy, which cannot go missing at runtime.
 func TestLoadDictionaryUsesEmbedded(t *testing.T) {
-	if err := LoadDictionary(""); err != nil {
+	d, err := LoadDictionary("", DictionaryOptions{})
+	if err != nil {
 		t.Fatalf("LoadDictionary(\"\") on the embedded dictionary: %v", err)
 	}
-	if len(wordList) == 0 {
+	if d.Len() == 0 {
 		t.Fatal("embedded dictionary loaded but produced no words")
 	}
-	for _, w := range wordList {
-		if len(w) <= 4 {
-			t.Fatalf("word list contains %q, shorter than the minimum length filter", w)
+	for _, w := range d.words {
+		if n := utf8.RuneCountInString(w); n < 5 || n > 12 {
+			t.Fatalf("word list contains %q with %d runes, outside the default bounds", w, n)
 		}
 	}
 }
@@ -89,7 +90,7 @@ func TestLoadDictionaryUsesEmbedded(t *testing.T) {
 // place. The caller turns this into "word games disabled" plus a warning, never
 // into process exit.
 func TestLoadDictionaryMissingFileErrors(t *testing.T) {
-	if err := LoadDictionary("testdata/does-not-exist.txt"); err == nil {
+	if _, err := LoadDictionary("testdata/does-not-exist.txt", DictionaryOptions{}); err == nil {
 		t.Fatal("expected an error for a missing dictionary override, got nil")
 	}
 }

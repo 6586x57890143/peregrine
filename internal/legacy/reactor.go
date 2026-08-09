@@ -1,6 +1,8 @@
 package legacy
 
 import (
+	"context"
+	"errors"
 	"log"
 	"math/rand/v2"
 	"path/filepath"
@@ -8,7 +10,7 @@ import (
 	"time"
 
 	"github.com/6586x57890143/peregrine/internal/storage"
-	"github.com/6586x57890143/peregrine/wordgames"
+	"github.com/6586x57890143/peregrine/internal/wordgame"
 	"github.com/bwmarrin/discordgo"
 )
 
@@ -210,128 +212,120 @@ func stepClassify(r *reaction) bool {
 	return false
 }
 
-// stepWordGame runs the scramble game: a winning guess if one is active, otherwise a
-// chance to start one.
+// stepWordGame runs the scramble game: a winning guess if one is live in this channel,
+// otherwise a chance to start one.
 //
-// Does NOT consume, which is a deliberate preservation of existing behaviour rather than
-// an oversight. A guess is ordinary chat, so the message still reaches the reply and
-// learn steps as it did before. Whether it SHOULD is a real question, since the win path
-// deletes the guess message and learning something the bot then deleted is odd, but that
-// is a behaviour change with no finding behind it and does not belong in the same commit
-// as one. Recorded in SPEC.md section 10.
+// All the state and all the timing belong to internal/wordgame now. What is left here is
+// the Discord half: announce, delete, record a win. That split is what lets every
+// announcement go through the guard, because the Manager has no session to send with.
+//
+// Does NOT consume, which preserves existing behaviour rather than being an oversight. A
+// guess is ordinary chat, so the message still reaches the reply and learn steps. Whether
+// it should is a real question, since the win path deletes the guess message and learning
+// something the bot then deleted is odd, but that is a behaviour change with no finding
+// behind it. Recorded in SPEC.md section 10.
 func stepWordGame(r *reaction) bool {
-	if !cfg.EnableWordGames || !wordGamesAvailable {
+	if !cfg.EnableWordGames || !games.Available() {
 		return false
 	}
 	s, m := r.s, r.m
 
-	wordGameMutex.Lock()
-	defer wordGameMutex.Unlock()
-
-	game, gameExists := activeWordGames[m.ChannelID]
-	if !gameExists {
-		maybeStartWordGame(s, m)
-		return false
-	}
-	if !game.CheckGuess(m.Content) {
+	won, solved := games.Guess(m.ChannelID, m.Content)
+	if !solved {
+		// No win. Note the activity, and start a game if the channel has earned one.
+		if games.Note(m.ChannelID) {
+			startWordGame(m.ChannelID)
+		}
 		return false
 	}
 
-	solveTime := time.Since(game.StartTime)
-	winnerUsername := m.Author.Username
+	winner := m.Author.Username
 	if m.Member != nil && m.Member.Nick != "" {
-		winnerUsername = m.Member.Nick
+		winner = m.Member.Nick
 	}
 
-	// Announce the winner and set the announcement for delayed deletion.
-	//
-	// Through the guard, which matters here for a reason that is not obvious: the
-	// winner's nickname is interpolated into this string, and a nickname is
-	// user-controlled text that can contain a role mention. Even a message the bot
-	// composes itself is untrusted-input-shaped.
-	winMessage, ok := guard.Send(m.ChannelID, winnerMessage(winnerUsername, game.OriginalWord, solveTime))
-	if ok {
-		go func(channelID, messageID string) {
-			time.Sleep(30 * time.Second)
-			deleteMessage(s, channelID, messageID)
-		}(m.ChannelID, winMessage.ID)
+	// Through the guard, which matters for a reason that is not obvious: the winner's
+	// nickname is interpolated into this string, and a nickname is user-controlled text
+	// that can contain a role mention. Even a message the bot composes itself is
+	// untrusted-input-shaped.
+	if announcement, ok := guard.Send(m.ChannelID, winnerMessage(winner, won.Word, time.Since(won.StartedAt))); ok {
+		games.DeleteLater(m.ChannelID, announcement.ID)
 	}
 
-	leaderboard.AddWin(m.Author.ID, winnerUsername)
-	_ = store.Update(func(w *storage.Writer) error {
+	leaderboard.AddWin(m.Author.ID, winner)
+	if err := store.Update(func(w *storage.Writer) error {
 		return saveLeaderboard(w, leaderboard)
-	})
+	}); err != nil {
+		log.Printf("[WORDGAME] failed to persist a win: %v", err)
+	}
 
-	// Clean up messages. These two used to discard their errors with a bare `_ =`,
-	// which is the pattern finding 8's neighbours were full of.
-	deleteMessage(s, m.ChannelID, game.MessageID) // the original puzzle
-	deleteMessage(s, m.ChannelID, m.ID)           // the winning message
-
-	delete(activeWordGames, m.ChannelID)
+	// Tidy up: the puzzle and the winning guess.
+	deleteMessage(s, m.ChannelID, won.MessageID)
+	deleteMessage(s, m.ChannelID, m.ID)
 	return false
 }
 
-// maybeStartWordGame starts a game if the channel has been busy enough. The caller holds
-// wordGameMutex.
-func maybeStartWordGame(s *discordgo.Session, m *discordgo.MessageCreate) {
-	activityMutex.Lock()
-	defer activityMutex.Unlock()
-
-	now := time.Now()
-	newTimestamps := []time.Time{}
-	for _, ts := range channelActivity[m.ChannelID] {
-		if now.Sub(ts) < 5*time.Minute {
-			newTimestamps = append(newTimestamps, ts)
-		}
-	}
-	newTimestamps = append(newTimestamps, now)
-	channelActivity[m.ChannelID] = newTimestamps
-
-	// At least five messages in the last five minutes, then a 2.5% chance per message.
-	if len(newTimestamps) < 5 || rand.Float64() >= 0.025 {
-		return
-	}
-
-	game, err := wordgames.NewScrambleGame()
+// startWordGame begins a puzzle and announces it.
+//
+// Announcing and recording the message ID are two steps because the ID does not exist
+// until the send has happened, and the send can be refused: the guard turns down a paused
+// bot or an ignored channel. A game whose announcement was refused simply has nothing to
+// delete when it ends, which is correct rather than a special case.
+func startWordGame(channelID string) {
+	g, err := games.Start(channelID)
 	if err != nil {
-		log.Printf("[WORDGAME] Failed to create new game: %v", err)
+		// ErrGameInProgress is ordinary and ErrNoDictionary is checked by the caller, so
+		// neither is worth more than a debug line here.
 		return
 	}
-	msg, ok := guard.Send(m.ChannelID, scrambleMessage(game.ScrambledWord))
+	msg, ok := guard.Send(channelID, scrambleMessage(g.Scrambled))
 	if !ok {
+		// The announcement was refused, so nobody can play. Ending the game immediately
+		// beats leaving an invisible puzzle that blocks the channel until it times out.
+		games.Abandon(channelID)
 		return
 	}
-	game.MessageID = msg.ID
-	activeWordGames[m.ChannelID] = game
-	channelActivity[m.ChannelID] = []time.Time{} // reset activity after starting
-	log.Printf("[WORDGAME] Started a new game in channel %s.", m.ChannelID)
-	go expireWordGame(s, m.ChannelID, msg.ID, game.OriginalWord)
+	games.Announced(channelID, msg.ID)
+	log.Printf("[WORDGAME] Started a game in channel %s.", channelID)
 }
 
-// expireWordGame ends a game nobody solved.
+// startIntervalWordGame posts a puzzle on a timer, in interval mode.
 //
-// This consolidates three copies of the same orphan goroutine-plus-Sleep timer, which is
-// why they had drifted apart. They still fire against a closed session after shutdown;
-// M11 makes them ctx-bound, which is the other half of that finding.
-func expireWordGame(s *discordgo.Session, channelID, messageID, originalWord string) {
-	time.Sleep(60 * time.Second)
-
-	wordGameMutex.Lock()
-	defer wordGameMutex.Unlock()
-
-	g, exists := activeWordGames[channelID]
-	if !exists || g.MessageID != messageID {
+// It picks the busiest channel the bot can see, for the same reason the activity trigger
+// exists at all: a puzzle in a dead channel is the bot talking to itself. Restricted to the
+// autonomous-post allowlist when one is set, because an operator who has said "only speak
+// unprompted in these channels" has said it about this too.
+func startIntervalWordGame(ctx context.Context, s *discordgo.Session) {
+	if !games.Available() {
 		return
 	}
-	if timeoutMsg, ok := guard.Send(channelID, timeUpMessage(originalWord)); ok {
-		go func(cid, mid string) {
-			time.Sleep(30 * time.Second)
-			deleteMessage(s, cid, mid)
-		}(channelID, timeoutMsg.ID)
+
+	channelID := busiestChannel(ctx, s, cfg.AutonomousPostChannels)
+	if channelID == "" {
+		log.Println("[WORDGAME] No active channel found for an interval game.")
+		return
 	}
-	deleteMessage(s, channelID, messageID)
-	delete(activeWordGames, channelID)
-	log.Printf("[WORDGAME] Game timed out in channel %s.", channelID)
+	startWordGame(channelID)
+}
+
+// sweepWordGames ends expired puzzles and clears announcements whose time is up.
+//
+// One loop, driven by core.RunLoop and therefore panic-isolated and context-bound. It
+// replaces up to three goroutines per game, each of which slept and then acted with no
+// context: after shutdown they woke against a closed session and logged failures for a bot
+// that had stopped, and the count was bounded only by how often people played.
+func sweepWordGames(s *discordgo.Session) {
+	for _, g := range games.Expired() {
+		if announcement, ok := guard.Send(g.ChannelID, timeUpMessage(g.Word)); ok {
+			games.DeleteLater(g.ChannelID, announcement.ID)
+		}
+		deleteMessage(s, g.ChannelID, g.MessageID)
+		log.Printf("[WORDGAME] Game timed out in channel %s.", g.ChannelID)
+	}
+
+	for _, p := range games.DueDeletions() {
+		deleteMessage(s, p.ChannelID, p.MessageID)
+	}
 }
 
 // stepCommands handles the two bang commands, and it is the reason the short-circuit
@@ -354,7 +348,7 @@ func stepCommands(r *reaction) bool {
 		// is not a command, so it falls through and is treated as chat, which is what it
 		// is. Consuming it would mean the bot silently ignored a message for a feature
 		// that is not running.
-		if cfg.EnableWordGames && wordGamesAvailable {
+		if cfg.EnableWordGames && games.Available() {
 			cmdWordGame(r)
 			return true
 		}
@@ -408,7 +402,8 @@ func cmdLeaderboard(r *reaction) {
 		nameScores[displayNameFor(s, m.GuildID, userID)] = score
 	}
 
-	sendMessage(s, m.ChannelID, leaderboard.Format()+"\n\n"+wordgames.FormatChatLeaderboard(nameScores))
+	sendMessage(s, m.ChannelID,
+		leaderboard.Format(time.Now())+"\n\n"+wordgame.FormatChatLeaderboard(nameScores))
 }
 
 // displayNameFor resolves a user ID to the best available name: guild nickname, then
@@ -443,27 +438,25 @@ func cmdWordGame(r *reaction) {
 		return
 	}
 
-	wordGameMutex.Lock()
-	defer wordGameMutex.Unlock()
-
-	if _, exists := activeWordGames[r.m.ChannelID]; exists {
+	g, err := games.Start(r.m.ChannelID)
+	switch {
+	case errors.Is(err, wordgame.ErrGameInProgress):
+		// Reported to the channel, because the operator asked for something and deserves
+		// to know why it did not happen.
 		sendMessage(r.s, r.m.ChannelID, "A word game is already in progress in this channel!")
 		return
+	case err != nil:
+		log.Printf("[WORDGAME] Failed to start a game on request: %v", err)
+		return
 	}
 
-	game, err := wordgames.NewScrambleGame()
-	if err != nil {
-		log.Printf("[WORDGAME] Failed to create new game: %v", err)
-		return
-	}
-	msg, ok := guard.Send(r.m.ChannelID, scrambleMessage(game.ScrambledWord))
+	msg, ok := guard.Send(r.m.ChannelID, scrambleMessage(g.Scrambled))
 	if !ok {
+		games.Abandon(r.m.ChannelID)
 		return
 	}
-	game.MessageID = msg.ID
-	activeWordGames[r.m.ChannelID] = game
-	log.Printf("[WORDGAME] Started a new game in channel %s.", r.m.ChannelID)
-	go expireWordGame(r.s, r.m.ChannelID, msg.ID, game.OriginalWord)
+	games.Announced(r.m.ChannelID, msg.ID)
+	log.Printf("[WORDGAME] Started a game on request in channel %s.", r.m.ChannelID)
 }
 
 // stepAggro reacts to a message from the current aggro target.

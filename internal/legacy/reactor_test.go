@@ -106,7 +106,7 @@ func TestSharedMessageIDLosesOneMessage(t *testing.T) {
 func TestCommandsConsumeTheMessage(t *testing.T) {
 	gateFixture(t)
 	cfg.EnableWordGames = true
-	wordGamesAvailable = true
+	games = testManager(t, "peregrine")
 
 	cases := map[string]bool{
 		"!leaderboard":   true,
@@ -162,7 +162,7 @@ func TestCommandForMatchesTheWholeMessage(t *testing.T) {
 func TestWordgameIsNotACommandWhenTheFeatureIsOff(t *testing.T) {
 	gateFixture(t)
 	cfg.EnableWordGames = false
-	wordGamesAvailable = false
+	games = testManager(t)
 
 	r := &reaction{
 		m:     &discordgo.MessageCreate{Message: &discordgo.Message{Content: "!wordgame"}},
