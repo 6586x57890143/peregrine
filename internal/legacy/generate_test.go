@@ -245,3 +245,219 @@ func TestGeneratedOutputPassesTheEmitGate(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------- the co-occurrence window
+
+// TestCooccurrenceWindowBoundsWhatIsLearned is the write-path half of M7b and closes the
+// rest of finding 12.
+//
+// The old loop was all-pairs, so it was quadratic in message length AND it ran inside the
+// single write transaction that serializes every other write in the process. A 200-word
+// message produced nearly 40,000 read-add-write pairs and blocked all ingestion while it
+// did.
+//
+// The window is a model change as much as an optimization, and in the right direction:
+// "co-occurs anywhere in the same message" is a claim that gets weaker as messages get
+// longer, because a long message links every word in it to every other. Proximity is
+// what association actually means.
+//
+// The fixture needs a mentioned user, because the association loop only runs when a
+// message involves a recognized name.
+func TestCooccurrenceWindowBoundsWhatIsLearned(t *testing.T) {
+	s := gateFixture(t)
+	cfg.CooccurrenceWindow = 2
+
+	// Ten distinct non-stop words. "alpha" and "kilo" are eight apart, well outside a
+	// window of two; "alpha" and "bravo" are adjacent.
+	const msg = "alpha bravo charlie delta echo foxtrot golf hotel india kilo"
+	if err := s.Update(func(w *storage.Writer) error {
+		return learnMessage(w, msg, snowflake(4242), "999",
+			MentionedUser{Name: "tester", UserID: "1", Username: "tester"},
+			[]MentionedUser{{Name: "tester", UserID: "1", Username: "tester"}})
+	}); err != nil {
+		t.Fatalf("learnMessage: %v", err)
+	}
+
+	if err := s.View(func(r *storage.Reader) error {
+		assoc, err := r.TopicWordsFor("alpha")
+		if err != nil {
+			return err
+		}
+		if _, ok := assoc["bravo"]; !ok {
+			t.Error("an adjacent word was not associated, so the window is too tight to " +
+				"record anything and the index is now useless")
+		}
+		if _, ok := assoc["kilo"]; ok {
+			t.Error("a word eight positions away was associated with a window of 2, so the " +
+				"window is not being applied and this is still the all-pairs loop")
+		}
+		// Exactly the two words on each side, minus the ones that fall off the start.
+		if len(assoc) != 2 {
+			t.Errorf("alpha has %d associations, want 2 (bravo and charlie): %v", len(assoc), assoc)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("View: %v", err)
+	}
+}
+
+// TestCooccurrenceWindowZeroIsUnbounded. 0 restores the old all-pairs behaviour, which
+// has to remain expressible so an operator can compare, and .env.example says it warns.
+func TestCooccurrenceWindowZeroIsUnbounded(t *testing.T) {
+	s := gateFixture(t)
+	cfg.CooccurrenceWindow = 0
+
+	const msg = "alpha bravo charlie delta echo foxtrot golf hotel india kilo"
+	if err := s.Update(func(w *storage.Writer) error {
+		return learnMessage(w, msg, snowflake(4243), "999",
+			MentionedUser{Name: "tester", UserID: "1", Username: "tester"},
+			[]MentionedUser{{Name: "tester", UserID: "1", Username: "tester"}})
+	}); err != nil {
+		t.Fatalf("learnMessage: %v", err)
+	}
+
+	if err := s.View(func(r *storage.Reader) error {
+		assoc, err := r.TopicWordsFor("alpha")
+		if err != nil {
+			return err
+		}
+		if _, ok := assoc["kilo"]; !ok {
+			t.Error("with a window of 0 the furthest word must still be associated, or 0 " +
+				"does not mean unbounded")
+		}
+		if len(assoc) != 9 {
+			t.Errorf("alpha has %d associations, want 9 (every other word)", len(assoc))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("View: %v", err)
+	}
+}
+
+// TestCooccurrenceWindowRecordsBothDirections. The index is direction-sensitive: it
+// stores the position of the ASSOCIATE, so (a, b) and (b, a) carry different position
+// sums and the readers use that. A window that only looked forward would halve the
+// index and silently change what every positional heuristic sees.
+func TestCooccurrenceWindowRecordsBothDirections(t *testing.T) {
+	s := gateFixture(t)
+	cfg.CooccurrenceWindow = 2
+
+	const msg = "alpha bravo charlie delta echo"
+	if err := s.Update(func(w *storage.Writer) error {
+		return learnMessage(w, msg, snowflake(4244), "999",
+			MentionedUser{Name: "tester", UserID: "1", Username: "tester"},
+			[]MentionedUser{{Name: "tester", UserID: "1", Username: "tester"}})
+	}); err != nil {
+		t.Fatalf("learnMessage: %v", err)
+	}
+
+	if err := s.View(func(r *storage.Reader) error {
+		forward, err := r.TopicWord("alpha", "bravo")
+		if err != nil {
+			return err
+		}
+		backward, err := r.TopicWord("bravo", "alpha")
+		if err != nil {
+			return err
+		}
+		if forward.Count == 0 || backward.Count == 0 {
+			t.Fatalf("both directions must be recorded, got forward=%d backward=%d",
+				forward.Count, backward.Count)
+		}
+		if forward.MeanPosition() == backward.MeanPosition() {
+			t.Error("the two directions carry the same mean position, which means the " +
+				"position being stored is not the associate's and the positional " +
+				"heuristics are reading a constant")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("View: %v", err)
+	}
+}
+
+// ------------------------------------------------------- per-channel memory (G8)
+
+// TestConversationMemoryIsPerChannel is the pin for finding G8. One shared memory meant a
+// reply in one channel was steered by an unrelated conversation in another, which is not
+// chaos, it is simply wrong context: the reply reads as a non-sequitur to the thread it
+// is in.
+func TestConversationMemoryIsPerChannel(t *testing.T) {
+	resetChannelMemories(t)
+
+	memoryFor("channel-a").AddMessage("alpha bravo charlie")
+	memoryFor("channel-b").AddMessage("xray yankee zulu")
+
+	a := memoryFor("channel-a").GetWeightedWords()
+	b := memoryFor("channel-b").GetWeightedWords()
+
+	if !containsWord(a, "alpha") {
+		t.Error("channel A lost its own message")
+	}
+	if containsWord(a, "xray") {
+		t.Error("channel A can see channel B's message, which is the bug G8 describes")
+	}
+	if !containsWord(b, "xray") {
+		t.Error("channel B lost its own message")
+	}
+	if containsWord(b, "alpha") {
+		t.Error("channel B can see channel A's message")
+	}
+}
+
+// TestConversationMemoryIsBounded. The old single memory did not need a bound; a map
+// keyed by channel ID does, because a bot can be added to any number of guilds and this
+// is the kind of leak that never shows up in testing, since a test only ever uses one
+// channel.
+func TestConversationMemoryIsBounded(t *testing.T) {
+	resetChannelMemories(t)
+
+	for i := range maxRememberedChannels * 2 {
+		memoryFor("channel-" + itoa(i)).AddMessage("some content here")
+	}
+
+	convMemoriesMu.Lock()
+	n := len(convMemories)
+	convMemoriesMu.Unlock()
+
+	if n > maxRememberedChannels {
+		t.Errorf("remembering %d channels against a cap of %d", n, maxRememberedChannels)
+	}
+	if n == 0 {
+		t.Error("eviction emptied the map entirely")
+	}
+
+	// The most recently touched channel must have survived, or eviction is picking the
+	// wrong end and the bot forgets the conversation it is currently in.
+	last := "channel-" + itoa(maxRememberedChannels*2-1)
+	convMemoriesMu.Lock()
+	_, kept := convMemories[last]
+	convMemoriesMu.Unlock()
+	if !kept {
+		t.Error("the most recently used channel was evicted")
+	}
+}
+
+// resetChannelMemories clears the map and restores it afterwards, so these tests do not
+// leak into each other or into the generation tests.
+func resetChannelMemories(t *testing.T) {
+	t.Helper()
+	convMemoriesMu.Lock()
+	saved := convMemories
+	convMemories = map[string]*channelMemory{}
+	convMemoriesMu.Unlock()
+
+	t.Cleanup(func() {
+		convMemoriesMu.Lock()
+		convMemories = saved
+		convMemoriesMu.Unlock()
+	})
+}
+
+func containsWord(words []string, want string) bool {
+	for _, w := range words {
+		if w == want {
+			return true
+		}
+	}
+	return false
+}

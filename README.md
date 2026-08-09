@@ -8,7 +8,7 @@ Sibling project to [merlin](../merlin), whose deployment conventions this repo f
 
 Mid-restructure. The bot works and runs, but it is being taken from a single 3,200-line `main.go` to a proper package layout one subsystem at a time, with a catalogue of known defects being closed along the way. See `SPEC.md` §8 for the defect list and §9 for the milestone order.
 
-**Milestones 0 through 7a are complete:** repo hygiene and CI/CD, the `cmd/bot` entrypoint, `internal/config`, the `internal/core` lifecycle, `internal/text` plus `internal/filter`, `internal/safety`, the storage layer (`internal/corpus`, `internal/storage`, `internal/dbtest`, `internal/maintenance`), and the generation engine `internal/markov`.
+**Milestones 0 through 7b are complete:** repo hygiene and CI/CD, the `cmd/bot` entrypoint, `internal/config`, the `internal/core` lifecycle, `internal/text` plus `internal/filter`, `internal/safety`, the storage layer (`internal/corpus`, `internal/storage`, `internal/dbtest`, `internal/maintenance`), and the generation engine `internal/markov`.
 
 M6b is what put the bot on the seam, and it is the commit that closes the worst bug in the review rather than designing around it. `internal/legacy` no longer imports bbolt at all, so nothing in it can hold a database handle, name a bucket, or start a transaction: generation used to run inside a read transaction and call two helpers that each opened their own, which is a hang with no timeout and no recovery that got likelier as the corpus grew. A test pins the import, because the import is the whole invariant.
 
@@ -16,7 +16,11 @@ M6b is what put the bot on the seam, and it is the commit that closes the worst 
 
 M7a also turned on the anti-poisoning gate: a continuation must have come from `PEREGRINE_MIN_DISTINCT_AUTHORS` different people before the bot will generate it, regardless of how often it was seen. Note the consequence on a **fresh corpus**, which looks like a fault and is not: until several people have said similar things, almost nothing clears a threshold of 2 and the bot is close to mute.
 
-**M8 is dropped rather than built.** Concept clustering is being deleted, not rebuilt: it derived from a single index that generation can query directly, its merge threshold collapses every cluster into one blob, and fixing its codec would have handed that blob the highest-weight seed tier. `SPEC.md` §8 finding 29 has the arithmetic. Its one useful idea, transitive association, becomes a bounded query-time two-hop tier in M7b.
+**M7b finished the pipeline around it.** Seed selection moved into the engine as seven weighted tiers; sentence length is one model instead of three that disagreed, with a target sampled short per sentence; the persona is one mechanism driving both the vocabulary bias and the post-pass instead of two independent coin flips; conversation memory is per channel, so a reply is no longer steered by an unrelated conversation in another channel; and word co-occurrence is windowed on the learn path, which cuts a 200-word message from nearly 40,000 database writes to about 2,000 inside the transaction that serializes all ingestion.
+
+Reading the golden samples caught something reasoning had not: a seed drawn from an association tier can dead-end immediately, producing one-word replies. The bot now re-seeds up to three times and stays silent below two words, because a one-word reply reads as a malfunction rather than as a short joke.
+
+**M8 is dropped rather than built.** Concept clustering is deleted, not rebuilt: it derived from a single index that generation can query directly, its merge threshold collapses every cluster into one blob, and fixing its codec would have handed that blob the highest-weight seed tier. `SPEC.md` §8 finding 29 has the arithmetic. Its one useful idea, transitive association, is now a bounded query-time two-hop tier in seed selection.
 
 All three crash bugs are now closed: the shutdown WaitGroup race that could panic on exit (M3), the `*rand.Rand` shared across every message goroutine (M3), and the global vocabulary map written concurrently, which was a Go runtime *fatal error* rather than a recoverable panic (M4).
 
