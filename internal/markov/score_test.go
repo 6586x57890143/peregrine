@@ -101,7 +101,8 @@ func TestTheEndSentinelIsNotGatedOnAuthorDiversity(t *testing.T) {
 	g := New(f, p, seeded(1, 2))
 
 	s := newStep([]string{"is", "loose"})
-	s.MinWords = 0 // the sentence has earned its ending
+	// The sentence has earned its ending: floor and target both already reached.
+	s.Length = Length{Min: 0, Max: 18, Target: 0}
 	got, err := g.Next(s)
 	if err != nil {
 		t.Fatalf("Next: %v", err)

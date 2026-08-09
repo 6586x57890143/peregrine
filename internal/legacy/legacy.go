@@ -1004,10 +1004,22 @@ func learnMessage(w *storage.Writer, msg, msgID, botID string, author MentionedU
 	// If any names were involved, update global word-to-word associations. This
 	// ensures the global graph is built from user-provided context.
 	//
-	// Still all-pairs and still O(n^2) in message length, which is finding 12 and
-	// belongs to M7's co-occurrence window. What changed is the cost per pair: each
-	// one is now a 16-byte read-add-write on its own key instead of a member of a
-	// JSON map that grows without bound.
+	// WINDOWED as of M7b, which closes the rest of finding 12. This was all-pairs and
+	// therefore quadratic in message length, running inside the single write
+	// transaction that serializes every other write in the process: a 200-word message
+	// produced nearly 40,000 read-add-write pairs and blocked all ingestion while it
+	// did. With a window of 5 the same message produces about 2,000.
+	//
+	// The window is a genuine model change and not only an optimization, and it is a
+	// change in the right direction. "Co-occurs anywhere in the same message" is a
+	// weak claim that gets weaker as messages get longer, since a 200-word message
+	// links every word in it to every other. Proximity is what association actually
+	// means, and bounding it makes long messages contribute proportionally rather than
+	// quadratically. A window of 0 restores the old behaviour and config warns.
+	//
+	// Both directions of each pair are still recorded, because the index is
+	// direction-sensitive: it stores the position of the ASSOCIATE, so (a, b) and
+	// (b, a) carry different position sums and the readers use that.
 	//
 	// The separate topic-cluster pass that used to follow this is gone, and it was
 	// pure duplication: it recorded the same word pairs from the same messages under
@@ -1016,6 +1028,7 @@ func learnMessage(w *storage.Writer, msg, msgID, botID string, author MentionedU
 	// this loop stores, so the layout has one co-occurrence index rather than two
 	// that could disagree (SPEC.md section 8, finding 28).
 	if len(canonicalNames) > 0 {
+		window := cfg.CooccurrenceWindow
 		for i, wordA := range words {
 			lwA := toLowerCaseExceptURLs(wordA)
 			if lwA == "<end>" {
@@ -1024,11 +1037,18 @@ func learnMessage(w *storage.Writer, msg, msgID, botID string, author MentionedU
 			if _, isStop := stopWords[lwA]; isStop {
 				continue
 			}
-			for j, wordB := range words {
+
+			lo, hi := 0, len(words)-1
+			if window > 0 {
+				lo = max(i-window, 0)
+				hi = min(i+window, len(words)-1)
+			}
+
+			for j := lo; j <= hi; j++ {
 				if i == j {
 					continue
 				}
-				lwB := toLowerCaseExceptURLs(wordB)
+				lwB := toLowerCaseExceptURLs(words[j])
 				if lwB == "<end>" {
 					continue
 				}
@@ -1148,6 +1168,64 @@ func (cm *ConversationMemory) GetWeightedWords() []string {
 		}
 	}
 	return weightedWords
+}
+
+// Conversation memory is PER CHANNEL as of M7b, closing finding G8.
+//
+// There used to be one package-level ConversationMemory shared by every channel in
+// every guild, so a reply in one channel was steered by whatever had been said in an
+// unrelated one. That is not chaos, which would be fine, it is simply wrong context:
+// the reply reads as a non-sequitur to the thread it is in, and the bot looks like it
+// is not paying attention rather than like it is being funny.
+//
+// The map is bounded, which the old single memory did not need to be. An unbounded map
+// keyed by channel ID is a slow leak in a bot that can be added to any number of
+// guilds, and it is the kind that never shows up in testing because a test only ever
+// uses one channel. Eviction is oldest-touched-first rather than a real LRU: the
+// difference does not matter for a cap in the hundreds, and a timestamp per channel is
+// cheaper to reason about than an intrusive list.
+const maxRememberedChannels = 200
+
+var (
+	convMemories   = map[string]*channelMemory{}
+	convMemoriesMu sync.Mutex
+)
+
+type channelMemory struct {
+	mem      ConversationMemory
+	lastUsed time.Time
+}
+
+// memoryFor returns the memory for one channel, creating it if needed.
+func memoryFor(channelID string) *ConversationMemory {
+	convMemoriesMu.Lock()
+	defer convMemoriesMu.Unlock()
+
+	if cm, ok := convMemories[channelID]; ok {
+		cm.lastUsed = time.Now()
+		return &cm.mem
+	}
+
+	if len(convMemories) >= maxRememberedChannels {
+		evictOldestChannelMemory()
+	}
+	cm := &channelMemory{lastUsed: time.Now()}
+	convMemories[channelID] = cm
+	return &cm.mem
+}
+
+// evictOldestChannelMemory drops the least recently used entry. Caller holds the lock.
+func evictOldestChannelMemory() {
+	var oldestID string
+	var oldest time.Time
+	for id, cm := range convMemories {
+		if oldestID == "" || cm.lastUsed.Before(oldest) {
+			oldestID, oldest = id, cm.lastUsed
+		}
+	}
+	if oldestID != "" {
+		delete(convMemories, oldestID)
+	}
 }
 
 // extractNamesFromMessage returns Discord usernames and display names mentioned in
@@ -1448,285 +1526,14 @@ func cleanSentence(s *discordgo.Session, str string) string {
 	return text.CleanSentence(str, sessionEmoji{s: s})
 }
 
-// applyEdgyStyle adds a configurable, context-aware "edgy" flavor to sentences.
-func applyEdgyStyle(s string, isAboutName bool) string {
-	fields := strings.Fields(s)
-	// Only apply style to sentences of a reasonable length to avoid nonsensical short phrases.
-	if len(fields) < 4 {
-		return s
-	}
-
-	s = strings.ToLower(s)
-	openers := []string{"ngl", "tbh", "bruh", "like", "i guess", "idk but", "listen", "ok so", "fr tho", "no cap", "deadass", "lowkey", "bet", "sheesh", "valid"}
-	closers := []string{"lol", "lmao", "whatever", "i guess", "or something", "...", "smh", "for real", "periodt", "iykyk", "no cap", "fr fr", "ong"}
-	interjections := []string{"ngl", "fr", "tbh", "like", "i mean", "lowkey", "bet"}
-	metaComments := []string{" (i think)", " (just saying)", " (don't quote me)", " (or so they say)", " (allegedly)"}
-
-	// Base chance to apply style is lower.
-	chance := 0.35
-	// If the sentence is about a recognized person, be more likely to be edgy (for roasting).
-	if isAboutName {
-		chance = 0.65
-	}
-
-	// Adjust chance based on sentence length for contextual intensity.
-	lengthFactor := math.Min(1.0, float64(len(fields))/20.0) // Max intensity at ~20 words
-	chance *= (0.7 + 0.6*lengthFactor)                       // Scale chance between 70% and 130% of base
-
-	if rand.Float64() < chance {
-		styleType := rand.IntN(4) // 0: opener, 1: closer, 2: interjection, 3: meta-comment
-
-		switch styleType {
-		case 0:
-			s = openers[rand.IntN(len(openers))] + " " + s
-		case 1:
-			s += " " + closers[rand.IntN(len(closers))]
-		case 2:
-			// Insert a mid-sentence interjection
-			if len(fields) > 3 {
-				insertPos := 1 + rand.IntN(len(fields)-2) // Avoid very beginning or end
-				interjection := interjections[rand.IntN(len(interjections))]
-				fields = append(fields[:insertPos], append([]string{interjection}, fields[insertPos:]...)...)
-				s = strings.Join(fields, " ")
-			}
-		case 3:
-			// Insert a meta-comment
-			if len(fields) > 2 {
-				insertPos := 1 + rand.IntN(len(fields)-1) // Avoid very beginning
-				metaComment := metaComments[rand.IntN(len(metaComments))]
-				// Append to the previous word to avoid extra spaces
-				fields[insertPos-1] += metaComment
-				s = strings.Join(fields, " ")
-			}
-		}
-	}
-	return s
-}
-
-// findBestSeed analyzes the prompt and context to find the highest-quality starting
-// seed.
-//
-// Two of the seven priority tiers it used to have are gone, and both for the same
-// reason: they read buckets that recorded nothing the surviving indexes do not.
-//
-// The concept-cluster tier scored at weight 50, higher than everything else here, and
-// had never once fired. Cluster members were persisted with string keys and decoded
-// into map[int]float32, which fails for every cluster, and the decode was guarded by
-// `err == nil` with no else, so the tier silently contributed nothing for the whole
-// life of the bot (SPEC.md section 8, finding 27). It is also unfixable as written:
-// the members are text.Interner ids, and those depend on insertion order, so an id
-// written to disk means a different word to the next process. M8 rebuilds it.
-//
-// The two topic-cluster tiers read a bucket that stored the same word pairs as the
-// topic-word index, minus the position data, so tiers 2 and 4 asked the topic-word
-// index a question it could already answer. They are folded into the name-topic and
-// topic-word tiers below, keeping their weights (finding 28).
-func findBestSeed(r *storage.Reader, in *text.Interner, promptWords, recentWords, recognizedNames []string) string {
-	type candidate struct {
-		key    int
-		weight float64
-	}
-	candidateMap := make(map[int]float64)
-
-	addCandidate := func(key int, weight float64) {
-		if existingWeight, ok := candidateMap[key]; !ok || weight > existingWeight {
-			candidateMap[key] = weight
-		}
-	}
-
-	// 1. High Priority: Multi-word n-grams from the prompt.
-	//
-	// n starts at 1 rather than at MaxNGram-1 downward being cut off, because a
-	// single-word prefix is a legitimate n-gram context in the new layout: the key is
-	// <prefix> NUL <next>, so "bird" has successors of its own.
-	for n := cfg.MaxNGram - 1; n >= 1; n-- {
-		for i := 0; i <= len(promptWords)-n; i++ {
-			key := toLowerCaseExceptURLs(strings.Join(promptWords[i:i+n], " "))
-			if r.HasSuccessors(key) {
-				addCandidate(in.Intern(key), float64(n*30))
-			}
-		}
-	}
-
-	// 2. Name Expansion: topics this message's names are associated with. This is the
-	// former name-cluster tier, answered from the name-topic index at its old weight.
-	for _, name := range recognizedNames {
-		assocs, err := r.NameTopicsFor(toLowerCaseExceptURLs(name))
-		if err != nil {
-			log.Printf("[WARN] findBestSeed: name-topic lookup for %s failed: %v", name, err)
-			continue
-		}
-		for topic, data := range assocs {
-			addCandidate(in.Intern(topic), 25.0+math.Sqrt(float64(data.Count)))
-		}
-	}
-
-	// 3. Associative Expansion: Find words related to the prompt words.
-	for _, word := range promptWords {
-		topic := toLowerCaseExceptURLs(word)
-		assocs, err := r.TopicWordsFor(topic)
-		if err != nil {
-			log.Printf("[WARN] findBestSeed: topic-word lookup for %s failed: %v", topic, err)
-			continue
-		}
-		for associatedWord, data := range assocs {
-			if associatedWord != topic && data.Count > 1 {
-				addCandidate(in.Intern(associatedWord), 18.0+math.Sqrt(float64(data.Count)))
-			}
-		}
-	}
-
-	// 4. Medium-High Priority: Topics directly associated with the most recent
-	// recognized name, restricted to ones the chain can actually continue from.
-	if len(recognizedNames) > 0 {
-		name := toLowerCaseExceptURLs(recognizedNames[len(recognizedNames)-1])
-		assocs, err := r.NameTopicsFor(name)
-		if err != nil {
-			log.Printf("[WARN] findBestSeed: name-topic lookup for %s failed: %v", name, err)
-		} else {
-			for topic, data := range assocs {
-				if r.HasSuccessors(topic) {
-					addCandidate(in.Intern(topic), 10.0+math.Sqrt(float64(data.Count)))
-				}
-			}
-		}
-	}
-
-	// 5. Medium Priority: Single words from the prompt.
-	for _, word := range promptWords {
-		lw := toLowerCaseExceptURLs(word)
-		if r.HasSuccessors(lw) {
-			addCandidate(in.Intern(lw), 15.0)
-		}
-	}
-
-	// 6. Low Priority: Recent context fallback.
-	for n := cfg.MaxNGram - 1; n >= 1; n-- {
-		for i := 0; i <= len(recentWords)-n; i++ {
-			key := toLowerCaseExceptURLs(strings.Join(recentWords[i:i+n], " "))
-			if r.HasSuccessors(key) {
-				addCandidate(in.Intern(key), float64(n))
-			}
-		}
-	}
-
-	if len(candidateMap) == 0 {
-		// Absolute fallback: any real prefix beats a sentinel with no continuations.
-		if prefix, ok := r.FirstPrefix(); ok {
-			return prefix
-		}
-		return "<START>"
-	}
-
-	candidates := make([]candidate, 0, len(candidateMap))
-	for key, weight := range candidateMap {
-		candidates = append(candidates, candidate{key, weight})
-	}
-
-	// Weighted random selection.
-	total := 0.0
-	for _, c := range candidates {
-		total += c.weight
-	}
-	if total > 0 {
-		r_val := rand.Float64() * total
-		for _, c := range candidates {
-			r_val -= c.weight
-			if r_val <= 0 {
-				return in.Word(c.key)
-			}
-		}
-		return in.Word(candidates[len(candidates)-1].key)
-	}
-
-	return in.Word(candidates[0].key)
-}
-
-// findJumpWord attempts to find a related word when generation hits a dead end.
-//
-// The concept-cluster pivot that used to sit between the two surviving tiers is gone
-// for the reasons on findBestSeed: it had never fired, and its members are interner
-// ids that cannot mean anything across processes. M8 owns the replacement.
-//
-// The interner parameter went with it. Nothing left here needs one.
-func findJumpWord(r *storage.Reader, promptWords, currentWords, recognizedNames []string) string {
-	// 1. Name-Centric Pivot: Prioritize finding a topic related to a recognized name.
-	if len(recognizedNames) > 0 {
-		// Use the most recently mentioned name as the primary context.
-		name := toLowerCaseExceptURLs(recognizedNames[len(recognizedNames)-1])
-		if topicAssoc, err := r.NameTopicsFor(name); err == nil {
-			bestJump := ""
-			closestDist := 0.5 // Target the middle of the sentence for a pivot
-			for topic, data := range topicAssoc {
-				if data.Count > 1 { // Require at least two occurrences to be a stable topic
-					dist := math.Abs(data.MeanPosition() - 0.5)
-					if dist < closestDist {
-						closestDist = dist
-						bestJump = topic
-					}
-				}
-			}
-			if bestJump != "" {
-				log.Printf("[INFO] Generation stuck, jumping via name->topic: '%s'", bestJump)
-				return bestJump
-			}
-		}
-	}
-
-	// 2. Topic-Centric Pivot: Fallback to finding a word related to the last topic.
-	// Cap the context words to a reasonable limit before combining.
-	const maxContext = 5
-	var searchContext []string
-	if len(currentWords) > maxContext {
-		searchContext = currentWords[len(currentWords)-maxContext:]
-	} else {
-		searchContext = currentWords
-	}
-	searchContext = append(promptWords, searchContext...)
-
-	// Create a set of words already in the sentence to avoid repetition.
-	sentenceSet := make(map[string]struct{})
-	for _, w := range currentWords {
-		sentenceSet[toLowerCaseExceptURLs(w)] = struct{}{}
-	}
-
-	bestJump := ""
-	bestScore := 0.0
-
-	for i := len(searchContext) - 1; i >= 0; i-- {
-		topic := toLowerCaseExceptURLs(searchContext[i])
-		wordAssoc, err := r.TopicWordsFor(topic)
-		if err != nil {
-			log.Printf("[WARN] findJumpWord: topic-word lookup for %s failed: %v", topic, err)
-			continue
-		}
-
-		for word, data := range wordAssoc {
-			// Don't jump to the topic word itself or a word already used.
-			if _, exists := sentenceSet[word]; exists || word == topic || data.Count <= 1 {
-				continue
-			}
-
-			// Combine association strength (primary) with positional preference
-			// (secondary).
-			strengthScore := math.Sqrt(float64(data.Count))
-			posScore := 1.0 - math.Abs(data.MeanPosition()-0.5) // value from 0.5 to 1.0
-
-			score := strengthScore * posScore
-			if score > bestScore {
-				bestScore = score
-				bestJump = word
-			}
-		}
-	}
-
-	if bestJump != "" {
-		log.Printf("[INFO] Generation stuck, jumping via topic->word: '%s'", bestJump)
-		return bestJump
-	}
-
-	return ""
-}
+// Three functions that used to sit here are gone, and all three went to the same
+// place. findBestSeed and findJumpWord are markov.Seed and markov.Generator.Jump,
+// which is what let their two dead concept-cluster tiers be replaced by one bounded
+// query-time two-hop expansion rather than by a rebuilt cluster bucket (SPEC.md
+// section 8, finding 29). applyEdgyStyle is markov.Style, which shares its Persona and
+// its lexicon with the in-sampler bias instead of deciding independently of it
+// (finding G6), and which chooses where to insert filler by position weight rather
+// than by a flat draw over the sentence interior.
 
 // generateSentenceWithContext builds a sentence using the markov DB, prompt, and recent context.
 func generateSentenceWithContext(s *discordgo.Session, prompt string, isRoast bool, convMemory *ConversationMemory) (string, error) {
@@ -1745,12 +1552,44 @@ func generateSentenceWithContext(s *discordgo.Session, prompt string, isRoast bo
 	// database on every reply purely to answer "is there anything in here".
 	err := store.View(func(r *storage.Reader) error {
 		if r.CorpusEmpty() {
-			sentence = append(sentence, "...")
+			// Nothing learned yet, so there is nothing to say. This used to emit a
+			// three-dot placeholder, which the two-word floor below would now discard
+			// anyway; returning nothing states the intent instead of relying on that.
+			// CorpusEmpty is one cursor First(), replacing a Bucket.Stats() call that
+			// walked every page in the largest bucket on every reply (finding 11).
 			return nil
 		}
 
-		// Initial generation attempt
-		sentence, recognizedNames, _ = generateSentenceAttempt(r, promptWords, recentWords, prompt, isRoast)
+		// Up to three attempts, keeping the longest, and this is a RE-SEED rather than
+		// the discard-and-retry that M7b deleted. The distinction matters because they
+		// look alike. The old mechanism threw away an end token and continued from the
+		// same prefix, which fought the length decision; this abandons the whole attempt
+		// and draws a different seed, which is the only response available to the real
+		// failure mode.
+		//
+		// That failure mode showed up in the golden samples rather than in reasoning,
+		// which is the point of reading them: a seed drawn from a non-prompt tier can
+		// dead-end on its very first step, because the length floor is a logit penalty
+		// on the end token and a penalty does nothing when there are no eligible
+		// candidates at all. The result was one-word replies like "roof" and "coping".
+		// A short reply lands; a one-word non-sequitur reads as the bot malfunctioning.
+		//
+		// Attempts are cheap: they share this transaction, and the corpus reads they
+		// repeat are the ones storage has cheap answers for.
+		const attempts = 3
+		for i := range attempts {
+			words, names, _ := generateSentenceAttempt(r, promptWords, recentWords, prompt, isRoast)
+			if len(words) > len(sentence) {
+				sentence, recognizedNames = words, names
+			}
+			if len(sentence) >= cfg.MinWords {
+				break
+			}
+			if i == attempts-1 {
+				log.Printf("[INFO] generation reached only %d words in %d attempts for prompt %q",
+					len(sentence), attempts, prompt)
+			}
+		}
 		return nil
 	})
 
@@ -1758,13 +1597,29 @@ func generateSentenceWithContext(s *discordgo.Session, prompt string, isRoast bo
 		return "", err
 	}
 
+	// Below two words there is nothing worth posting, and silence is the safe default
+	// this bot already uses when the emit gate refuses. One word is not a punchy reply,
+	// it is a reply that looks broken, and an unexplained silence is indistinguishable
+	// from the bot choosing not to answer, which it does all the time anyway.
+	if len(sentence) < 2 {
+		return "", nil
+	}
+
 	// Clean final sentence
 	final := strings.Join(sentence, " ")
-	final = strings.ReplaceAll(final, "<end>", "") // Remove any <end> tokens
+	final = strings.ReplaceAll(final, markov.EndToken, "") // Remove any end sentinels
 	final = cleanSentence(s, final)
-	// Only apply edgy style if no recognized name seed was used
-	isAboutName := len(recognizedNames) > 0
-	final = applyEdgyStyle(final, isAboutName)
+
+	// The persona post-pass. One mechanism with the in-sampler lexicon bias now, rather
+	// than applyEdgyStyle deciding independently of whatever the scorer had decided
+	// (SPEC.md finding G6). The comment this replaced said "only apply edgy style if no
+	// recognized name seed was used" and then passed isAboutName straight through, which
+	// does the opposite; the behaviour was right and the comment was wrong.
+	persona := markov.PersonaNeutral
+	if isRoast {
+		persona = markov.PersonaRoast
+	}
+	final = markov.Style(nil, markov.DefaultWeights(), final, persona, len(recognizedNames) > 0)
 
 	// THE EMIT GATE.
 	//
@@ -1851,39 +1706,45 @@ func generateSentenceAttempt(r *storage.Reader, promptWords, recentWords []strin
 		}
 	}
 
-	// The interner is constructed inline because findBestSeed is now its only user: it
-	// keys its candidate map by id. The scorer used to share this one, which is why it
-	// was a variable. M7b moves seed selection into the engine and the interner goes
-	// with it. Per-call is still the requirement, not merely the convention, for the
-	// reason recorded on text.Interner: ids depend on insertion order, so one that
-	// outlived a call would mean different words to different callers.
-	seed := findBestSeed(r, text.NewInterner(), promptWords, recentWords, recognizedNames)
-	if seed == "" || seed == "<START>" {
-		if len(promptWords) > 0 {
-			seed = promptWords[0]
-		} else {
-			seed = "<START>"
+	// Seed selection is the engine's now, and the two-hop tier inside it is what
+	// replaces the concept-cluster tier that had never once fired (SPEC.md finding 29).
+	// The text.Interner that used to key the candidate map went with it: the engine
+	// works in strings, so there is no longer an id anywhere near this path, which is
+	// the strongest available form of "nothing may persist an interner id".
+	seedIn := markov.SeedInput{
+		PromptWords: promptWords,
+		RecentWords: recentWords,
+		Names:       recognizedNames,
+	}
+	seed := g.Seed(seedIn)
+	if seed == "" {
+		// The corpus offered nothing. Falling back to a prompt word is better than a
+		// sentinel, because at worst it echoes and at best the prompt word has
+		// continuations the seed tiers happened not to rank.
+		if len(promptWords) == 0 {
+			return nil, recognizedNames, aggregatedAssoc
 		}
+		seed = promptWords[0]
 	}
 
 	words := tokenize(seed)
-	sentence := append([]string{}, words...)
 
-	// Length bounds, unchanged from M6b and deliberately so: M7b replaces all three
-	// competing length mechanisms with one model, and changing them here would mean
-	// tuning the engine against bounds that are about to move.
-	minWords := 5 + rand.IntN(4)
-	maxWords := 30 + rand.IntN(15)
+	// ONE length model, replacing three mechanisms that competed: an end-token
+	// multiplier below 40% progress, a discard-and-retry, and a 30 + rand(15) loop
+	// bound. The target is sampled per sentence and skewed short, and the engine shifts
+	// the end-token logit against it, so there is a single answer to how long this
+	// should be (SPEC.md finding G7).
+	length := markov.NewLength(markov.DefaultSource{}, cfg.MinWords, cfg.MaxWords)
 
 	step := &markov.Step{
 		Prefix:       append([]string{}, words...),
-		Sentence:     sentence,
+		Sentence:     append([]string{}, words...),
 		Prompt:       originalPrompt,
 		PromptSet:    wordSet(promptWords),
 		RecentSet:    wordSet(recentWords),
-		Used:         make(map[string]int, maxWords),
-		Ngrams:       make(map[string]struct{}, maxWords*3),
-		MinWords:     minWords,
+		Used:         make(map[string]int, length.Max),
+		Ngrams:       make(map[string]struct{}, length.Max*3),
+		Length:       length,
 		CoreTopics:   coreTopics,
 		CurrentTopic: seed,
 		NameAssoc:    aggregatedAssoc,
@@ -1895,11 +1756,11 @@ func generateSentenceAttempt(r *storage.Reader, promptWords, recentWords []strin
 		step.Used[w]++
 	}
 
-	for range maxWords {
+	for !length.Done(len(step.Sentence)) {
 		if len(step.Prefix) == 0 {
 			break
 		}
-		step.Position = float64(len(step.Sentence)) / float64(maxWords)
+		step.Position = float64(len(step.Sentence)) / float64(length.Max)
 
 		next, err := g.Next(step)
 		if err != nil {
@@ -1908,19 +1769,18 @@ func generateSentenceAttempt(r *storage.Reader, promptWords, recentWords []strin
 		}
 
 		if next == markov.EndToken {
-			// The floor is still enforced here rather than in the engine, which only
-			// penalizes the sentinel. M7b makes this one length model.
-			if len(step.Sentence) >= minWords {
-				break
-			}
-			next = ""
+			// Unconditional. The floor lives in the length model as a logit penalty, so
+			// there is no discard-and-retry here: if the model chose to end despite that
+			// penalty, the alternatives were worse and overriding it would put the
+			// decision back in two places.
+			break
 		}
 
 		if next == "" {
 			// A dead end. Either the prefix has no continuation, or the
 			// author-diversity gate refused everything that did, which on a young
 			// corpus is the common case and is the gate working.
-			jump := findJumpWord(r, promptWords, step.Sentence, recognizedNames)
+			jump := g.Jump(seedIn, step.Sentence)
 			if jump == "" {
 				break
 			}
@@ -1965,7 +1825,11 @@ func wordSet(words []string) map[string]struct{} {
 // -----------------------------------------------------------------------------
 
 // messageCreate handles incoming messages: optionally reply and always learn.
-var globalConvMemory ConversationMemory // Declare a global instance of ConversationMemory
+//
+// The package-level globalConvMemory that used to be declared here is gone. It was one
+// 50-entry decayed memory shared by every channel in every guild, so a reply in one
+// channel was steered by an unrelated conversation in another. Conversation memory is
+// keyed by channel ID now, in a bounded map (finding G8).
 
 // sendMessage, editMessage and deleteMessage exist because every Discord call
 // below used to discard its error, so a send Discord refused (missing
@@ -2050,8 +1914,9 @@ func handleMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 	// above and again inside learnMessage. Replacement remains available in
 	// internal/filter for display paths that want it; nothing on this path does.
 
-	// Add message to conversation memory
-	globalConvMemory.AddMessage(m.Content)
+	// Add message to this channel's conversation memory. Per channel, so context does
+	// not bleed across unrelated threads.
+	memoryFor(m.ChannelID).AddMessage(m.Content)
 
 	// --- Word Game Event Logic ---
 	if cfg.EnableWordGames && wordGamesAvailable {
@@ -2302,15 +2167,17 @@ func handleMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 			log.Printf("[INFO] Activating 'roast' mode due to self-mention keyword. Using prompt: %q", promptForGeneration)
 		} else if flags["MENTIONED"] || flags["REPLY_TO_BOT"] {
 			// If directly mentioned or replied to, there's still a chance for a roast.
-			roastChance := 0.10 // Base 10% chance for a roast
-			// (Optional: Add logic here to increase roastChance if the message sentiment is negative)
-			if rand.Float64() < roastChance {
+			// PEREGRINE_ROAST_CHANCE as of M7b, where this was a hardcoded 0.10.
+			if rand.Float64() < cfg.RoastChance {
 				isRoast = true
 				log.Printf("[INFO] Activating 'roast' mode for direct interaction.")
 			}
 		}
 
-		reply, err := generateSentenceWithContext(s, promptForGeneration, isRoast, &globalConvMemory)
+		// Per-channel memory as of M7b. This used to be one package-level memory shared
+		// by every channel in every guild, so a reply here was steered by whatever had
+		// been said somewhere unrelated (SPEC.md finding G8).
+		reply, err := generateSentenceWithContext(s, promptForGeneration, isRoast, memoryFor(m.ChannelID))
 		if err != nil {
 			log.Printf("[ERR] reply generation failed: %v", err)
 		} else if reply != "" {

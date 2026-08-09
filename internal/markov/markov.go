@@ -73,6 +73,17 @@ type Corpus interface {
 	// PrefixTotal is c(prefix, .), the normalizer of the discounted term.
 	PrefixTotal(prefix string) uint64
 
+	// HasSuccessors is the cheap yes-or-no. Seed selection asks it dozens of times
+	// per reply, once per candidate n-gram and once per two-hop candidate, and only
+	// needs the answer rather than the list. It is NOT a byte-prefix match: keys are
+	// <prefix> NUL <next>, so a query for "the" must not be satisfied by "the cat"
+	// keys.
+	HasSuccessors(prefix string) bool
+
+	// FirstPrefix is the absolute fallback when no seed tier matches, because a real
+	// prefix with continuations beats a sentinel with none.
+	FirstPrefix() (string, bool)
+
 	// KNStats carries N1+(prefix .) and N1+(. token).
 	KNStats(prefix, token string) (corpus.KNStats, error)
 
@@ -160,6 +171,18 @@ type Params struct {
 	// that attack from persistence into collusion (SPEC.md section 4, A6).
 	MinDistinctAuthors int
 
+	// MinWords and MaxWords bound sentence length. The target is sampled between them
+	// once per sentence, skewed short: a forty-word Markov ramble reads as a
+	// malfunction in a chat channel and a six-word non-sequitur reads as a joke.
+	MinWords int
+	MaxWords int
+
+	// CooccurrenceWindow bounds how far apart two words can be and still count as
+	// co-occurring on the LEARN path. 0 means unbounded, which is the all-pairs loop
+	// this replaces: quadratic in message length, inside the single write transaction
+	// that serializes all ingestion.
+	CooccurrenceWindow int
+
 	// PromptRelevance is the logit added to a candidate that appears in the prompt.
 	//
 	// Its units changed in M7a and its old values are now out of range on purpose.
@@ -225,12 +248,28 @@ type Weights struct {
 	BigramRepeat    float64
 	TrigramRepeat   float64
 
-	// EndEarly penalizes the end sentinel before the sentence has earned it.
-	EndEarly float64
+	// EndEarly, EndLate and EndLateCap are the length model's three regimes: a
+	// penalty below the floor easing to zero at the target, then a bonus growing past
+	// the target so a sentence that has outstayed its welcome ends on its own rather
+	// than only at the hard cap. See length.go.
+	//
+	// EndLateCap exists because an end token that becomes certain regardless of
+	// context makes every long sentence stop in the same grammatical place, which
+	// reads as a template.
+	EndEarly   float64
+	EndLate    float64
+	EndLateCap float64
 
 	// Connective is the mid-sentence nudge toward and/but/then/because, and away
 	// from them at the very end.
 	Connective float64
+
+	// StyleChance and StyleChanceName are the probability that the persona post-pass
+	// adds filler, the second when the reply is about a recognized person. A reply
+	// about someone specific is the one most worth making sharper, which is legacy's
+	// judgement and is kept.
+	StyleChance     float64
+	StyleChanceName float64
 }
 
 // DefaultWeights are the starting point, to be moved by reading golden samples.
@@ -256,7 +295,11 @@ func DefaultWeights() Weights {
 		BigramRepeat:    -1.60,
 		TrigramRepeat:   -3.00,
 		EndEarly:        -2.30,
+		EndLate:         0.35,
+		EndLateCap:      1.80,
 		Connective:      0.15,
+		StyleChance:     0.35,
+		StyleChanceName: 0.65,
 	}
 }
 
