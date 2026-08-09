@@ -8,7 +8,7 @@ Sibling project to [merlin](../merlin), whose deployment conventions this repo f
 
 Mid-restructure. The bot works and runs, but it is being taken from a single 3,200-line `main.go` to a proper package layout one subsystem at a time, with a catalogue of known defects being closed along the way. See `SPEC.md` §8 for the defect list and §9 for the milestone order.
 
-**Milestones 0 through 7b and all of 10 are complete:** repo hygiene and CI/CD, the `cmd/bot` entrypoint, `internal/config`, the `internal/core` lifecycle, `internal/text` plus `internal/filter`, `internal/safety`, the storage layer (`internal/corpus`, `internal/storage`, `internal/dbtest`, `internal/maintenance`), the generation engine `internal/markov`, the send chokepoint `internal/discordguard`, and the message reactor. M8 is dropped; M9 and M11 through M13 are outstanding.
+**Milestones 0 through 10 are complete**, except M8 which is dropped: repo hygiene and CI/CD, the `cmd/bot` entrypoint, `internal/config`, the `internal/core` lifecycle, `internal/text` plus `internal/filter`, `internal/safety`, the storage layer (`internal/corpus`, `internal/storage`, `internal/dbtest`, `internal/maintenance`), the generation engine `internal/markov`, the send chokepoint `internal/discordguard`, the message reactor, and `internal/ingest`. M11 through M13 are outstanding.
 
 M6b is what put the bot on the seam, and it is the commit that closes the worst bug in the review rather than designing around it. `internal/legacy` no longer imports bbolt at all, so nothing in it can hold a database handle, name a bucket, or start a transaction: generation used to run inside a read transaction and call two helpers that each opened their own, which is a hang with no timeout and no recovery that got likelier as the corpus grew. A test pins the import, because the import is the whole invariant.
 
@@ -40,6 +40,10 @@ Nothing is outstanding on the safety list now. What remains before a deploy is t
 **M10b turned the message handler into a reactor and found a data-loss bug on the way.** Handling one message is now a list of named steps, each reporting whether it consumed the message, and the run stops at the first one that does. That is what stops a command falling through: `!leaderboard` used to be answered and then *also* replied to as if it were conversation, after which the bot taught itself the string `!leaderboard`.
 
 The other half is worse and had been happening on every single reply. Self-learning stored the bot's reply under the *user's* message ID, and the learn step stored the user's message under the same ID, and the corpus dedupes on that ID: whichever transaction committed first won, so one of the two messages was silently thrown away, and which one depended on a goroutine race. Replies are keyed by their own ID now.
+
+**M9 stopped the backfill corrupting the corpus.** The history walk re-read the whole trailing 24 hours every 10 minutes, roughly 144 passes over every message, and recognised what it had already learned by consulting a 10,000-entry dedup window. On a busy server the older half of each pass had already fallen out of that window and was learned again, so its n-grams were counted two or three or ten times. Generation samples on raw frequency, so the model was quietly biased toward whichever messages happened to land in the re-read band.
+
+It now keeps a per-channel high-water mark and asks Discord only for what came after it, which makes the question "what is new" rather than "what have I forgotten" and no longer depends on how much the bot remembers. `PEREGRINE_INGEST_LOOKBACK` survives as a bound on the *first* pass over a channel. The channel fan-out is bounded too, where it used to be one unbounded goroutine per channel per guild, and the pre-scan that paged every channel to count messages and then threw them away is gone: an idle channel now costs exactly one request.
 
 ## Quick start
 
