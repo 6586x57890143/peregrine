@@ -96,6 +96,11 @@ type SeedInput struct {
 // nothing, and this does not.
 func (g *Generator) Seed(in SeedInput) string {
 	cands := map[string]float64{}
+
+	// The candidates that came from what the user typed. Exempt from the author-diversity
+	// gate below, because echoing somebody's own words back is not poisoning.
+	fromPrompt := map[string]struct{}{}
+
 	add := func(key string, weight float64) {
 		if key == "" || weight <= 0 {
 			return
@@ -116,6 +121,7 @@ func (g *Generator) Seed(in SeedInput) string {
 			key := strings.Join(in.PromptWords[i:i+n], " ")
 			if g.corpus.HasSuccessors(key) {
 				add(key, float64(n)*weightPromptNgram)
+				fromPrompt[key] = struct{}{}
 			}
 		}
 	}
@@ -161,6 +167,7 @@ func (g *Generator) Seed(in SeedInput) string {
 	for _, word := range in.PromptWords {
 		if g.corpus.HasSuccessors(word) {
 			add(word, weightPromptWord)
+			fromPrompt[word] = struct{}{}
 		}
 	}
 
@@ -179,7 +186,7 @@ func (g *Generator) Seed(in SeedInput) string {
 		}
 	}
 
-	return g.drawSeed(cands)
+	return g.drawAttestedSeed(cands, fromPrompt)
 }
 
 // twoHop returns transitively associated words with decayed weights.
@@ -312,6 +319,54 @@ func (g *Generator) drawSeed(cands map[string]float64) string {
 	return keys[len(keys)-1]
 }
 
+// drawAttestedSeed draws a seed and rejects one the author-diversity gate would refuse,
+// redrawing a bounded number of times.
+//
+// The gate has to reach the seed for the same reason it has to reach the jump: the seed is a
+// token the bot emits, and the corpus tiers (name-topic, topic-word, two-hop, recent) are
+// built from co-occurrence indexes that carry no author attribution at all. Without this, a
+// phrase one person repeated could be refused by the sampler at every step and still be the
+// first word of the reply.
+//
+// prompt is the set of candidates that came from what the USER typed, and those are exempt.
+// Echoing somebody's own words back is not poisoning, and refusing to seed from the prompt
+// would make the bot least responsive exactly when it was addressed directly.
+//
+// Checked on the DRAWN candidate rather than filtered up front, deliberately: attestation is a
+// Successors scan, and there can be hundreds of candidates on a busy prompt. A bounded redraw
+// costs a handful of scans on the reply path where filtering would cost one per candidate.
+func (g *Generator) drawAttestedSeed(cands map[string]float64, prompt map[string]struct{}) string {
+	if g.params.MinDistinctAuthors <= 0 {
+		return g.drawSeed(cands)
+	}
+
+	// Enough attempts to get past a few unattested candidates, few enough that a corpus
+	// where nothing qualifies does not turn every reply into a scan of it. Falling through
+	// to "" means the caller falls back to a prompt word or stays silent, which is the same
+	// outcome an empty corpus produces.
+	const attempts = 8
+	for range attempts {
+		seed := g.drawSeed(cands)
+		if seed == "" {
+			return ""
+		}
+		if _, fromPrompt := prompt[seed]; fromPrompt {
+			return seed
+		}
+		// A multi-word seed is a stored prefix, and its own continuations are what the
+		// sampler will gate at the first step, so attestation of the whole phrase is what
+		// matters rather than of one token in it.
+		if g.attested(seed) {
+			return seed
+		}
+		delete(cands, seed)
+		if len(cands) == 0 {
+			return ""
+		}
+	}
+	return ""
+}
+
 // Jump finds a related word when generation dead-ends mid-sentence.
 //
 // Same machinery as the two-hop expansion rather than a second implementation, which
@@ -392,6 +447,21 @@ func (g *Generator) bestPivot(source string, used map[string]struct{}, nameSourc
 		if !g.corpus.HasSuccessors(word) {
 			continue
 		}
+		// THE AUTHOR-DIVERSITY GATE APPLIES HERE TOO, and this was a hole.
+		//
+		// The gate lives in eligible(), which filters the sampler's candidates. Jump is a
+		// SECOND producer of words: on a dead end it picks a token out of the co-occurrence
+		// indexes and appends it to the sentence directly, and those indexes carry no author
+		// attribution at all. So a phrase one person repeated forty times was refused by the
+		// sampler and then handed back by the jump, which is finding A6 defeated by the exact
+		// shape design principle 3 exists to prevent: a check at one of two producers.
+		//
+		// It went unnoticed because the test that would have caught it seeded the corpus with
+		// no mentioned users, and both association indexes are gated on a name being present,
+		// so the jump had nothing to find. Found in M11c when that fixture became realistic.
+		if !g.attested(word) {
+			continue
+		}
 
 		// Association strength, discounted by how far the word's usual position is from
 		// the middle. Ties broken by token so the choice is deterministic.
@@ -418,4 +488,40 @@ func toAssocPos(in map[string]corpus.TopicAssoc) map[string]assocPos {
 		out[k] = assocPos{count: v.Count, mean: v.MeanPosition()}
 	}
 	return out
+}
+
+// attested reports whether a word is one the corpus has seen several people use, which is
+// what the author-diversity gate means for a token that is not a candidate continuation.
+//
+// The gate is naturally a property of an EDGE: ngram_auth records (prefix, next, author), so
+// "how many distinct people said this continuation" is answerable and "how many distinct
+// people said this word" is not, without a reverse index the layout deliberately does not
+// carry. The closest honest question is whether the chain can leave this word along an edge
+// that several people used, and that is what this asks.
+//
+// It is a filter and it does not relax, for the same reason eligible() does not: a control
+// that yields the moment it has an effect is not a control. When it refuses everything the
+// jump simply fails and the sentence ends, which is the same outcome a dead end already has.
+//
+// Cost: one Successors scan, on a path that runs at most once per dead end per sentence, and
+// only for candidates that have already passed the cheaper checks above.
+func (g *Generator) attested(word string) bool {
+	min := g.params.MinDistinctAuthors
+	if min <= 0 {
+		return true
+	}
+	succ, err := g.corpus.Successors(word)
+	if err != nil {
+		return false
+	}
+	for _, s := range succ {
+		// The end sentinel is exempt in eligible() because gating a sentence's ability to end
+		// on how other people ended theirs is a length bug wearing a safety hat. It is NOT
+		// exempt here: "the only thing following this word is the end of a message somebody
+		// once sent" is not evidence that several people use the word.
+		if s.Token != EndToken && s.Authors >= uint32(min) {
+			return true
+		}
+	}
+	return false
 }

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `peregrine` is a Markov-chain Discord engagement bot (Go 1.25, `discordgo` v0.29, `bbolt` v1.5). It learns from channel messages and replies in the server's own voice. Full design doc: [`SPEC.md`](./SPEC.md). Read it before any non-trivial change, especially §4 (safety and threat model) and §5 (the generation pipeline). The bot lives in a meme-heavy server and exists to cause engagement, fun and chaos, so **output that lands matters more than output that is grammatical**, and several things that look like bugs are deliberate register. The things that are actually bugs are catalogued in §8.
 
-**The repository is mid-restructure.** It is being taken from a single 3,200-line `package main` to merlin's `cmd/` plus `internal/` layout, one subsystem per milestone (`SPEC.md` §9). The entrypoint is `cmd/bot`, and most of what it calls still lives in `internal/legacy/legacy.go`, which started as the old `main.go` moved verbatim. A comment saying "M7b replaces this" means exactly that. Do not treat the current shape as the intended shape, and in particular do not add anything new to `internal/legacy`: it is a holding pen that only shrinks. Storage, config, safety, the lifecycle, the tokenizer, the filters, the generation engine, the sends, ingestion, the word games and now activity tracking have all left it; the reactor steps and the state they close over have not, and M11c is the milestone that moves them.
+**The repository is mid-restructure.** It is being taken from a single 3,200-line `package main` to merlin's `cmd/` plus `internal/` layout, one subsystem per milestone (`SPEC.md` §9). The entrypoint is `cmd/bot`, and `internal/legacy` is what remains of the old `main.go`. Do not add anything to it: it is a holding pen that only shrinks. As of M11c it is **250 lines**: the ingestion pass, the corpus status line and the Discord latency probe. Everything else has left. M13 takes those three and deletes the package.
 
 ## Commands
 
@@ -30,7 +30,7 @@ em=$'\342\200\224' ell=$'\342\200\246' ldq=$'\342\200\234' rdq=$'\342\200\235'
 grep -rnI --exclude-dir=.git -e "$em" -e "$ell" -e "$ldq" -e "$rdq" .
 ```
 
-**One exception, and it is load-bearing:** `tokenRegex` in `internal/legacy/legacy.go` contains a literal right single quote inside its character class so the tokenizer can handle curly-apostrophe contractions. The CI check deliberately does not scan for that character. Do not "clean it up": removing it silently changes what the bot learns.
+**One exception, and it is load-bearing:** `tokenRegex` in `internal/text/text.go` contains a literal right single quote inside its character class so the tokenizer can handle curly-apostrophe contractions. The CI check deliberately does not scan for that character. Do not "clean it up": removing it silently changes what the bot learns.
 
 Local run:
 ```sh
@@ -56,7 +56,7 @@ go run ./cmd/bot -purge-author 123456789    # undo one author's contribution to 
 
 As of M6b it is one file. `cleanup.go` was replaced by `internal/maintenance`, and `filter.go` went with it because its last two wrappers existed only for that pass; the linter reporting them unused is how that was confirmed rather than assumed.
 
-**`internal/legacy` must not import bbolt, and a test enforces it.** `TestThisPackageCannotReachBbolt` globs every `.go` file in the package and fails on the import, because the import is the exact invariant: the bbolt API is unreachable without it, so if no file imports it then no function here can name a bucket, hold a handle, or start a transaction. It scans the whole directory rather than `legacy.go` alone, so a new file cannot reintroduce the dependency next to a test that only looks at the old one.
+**Only `internal/storage` may import bbolt, and a test enforces it.** `TestOnlyThisPackageReachesBbolt` lives in `internal/storage` and walks the whole module, because the import is the exact invariant: the bbolt API is unreachable without it, so if no file outside that package imports it then no function outside it can name a bucket, hold a handle, or start a transaction. It began life in `internal/legacy` scoped to that one package, and M11c widened it when there were eight packages above the seam rather than one.
 
 Two behaviors changed in that move, and both are about `log.Fatal`. `main()` became `Run(ctx) error`, so its six `log.Fatal` calls are returned errors, and `performDatabaseCleanup` became `CleanDatabase() error` for the same reason. `log.Fatal` calls `os.Exit`, which **skips every deferred function**, so any startup failure after `bbolt.Open` left the exclusive flock on `markov.db` held by a dying process, and the operator's natural next attempt then failed on the five-second `Open` timeout instead of on the original problem. There is now no `os.Exit` anywhere in `internal/legacy`.
 
@@ -259,7 +259,7 @@ Two behaviour changes to know before debugging them as outages: **aggro has no t
 
 ### Authorization is one function and only one
 
-`authorized()` in `internal/legacy/reactor.go` is the only authorization check in the codebase and the only place permitted to name `cfg.AdminUserID`. `TestAuthorizationIsAChokepoint` parses the package and fails if anything else does.
+`games.Service.Authorized` is the only authorization check in the codebase and the only place that reads the admin user ID. It moved there with the commands in M11c; the AST test that pinned it in `internal/legacy` went with them.
 
 It took two milestones because the value and the shape are different problems. M2 replaced a hardcoded Discord ID with a fail-closed environment variable, which fixed the value; it stayed an inline comparison in one command body, which left the shape. The second command to need authorization would reimplement it, and the way an inline reimplementation goes wrong is the empty case, which fails **open**: a missing variable becomes a public operator command. A behavioural test cannot cover that, because it would have to know about the command nobody has written yet.
 
@@ -267,7 +267,7 @@ Note the trap this exposed. The old inline form was `cfg.AdminUserID == "" || m.
 
 ### Ingestion asks "what is new", not "what have I forgotten"
 
-`internal/ingest` walks guilds and channels; `internal/legacy` still learns. That split is deliberate: reading the wrong messages wastes API budget and corrupts counts, whereas learning them wrongly is a safety question with a gate in front of it.
+`internal/ingest` walks guilds and channels; `internal/learn` learns, and `internal/legacy` is the adapter between them until M13. That split is deliberate: reading the wrong messages wastes API budget and corrupts counts, whereas learning them wrongly is a safety question with a gate in front of it.
 
 **The old loop re-read the trailing `PEREGRINE_INGEST_LOOKBACK` on every tick**, which at the shipped defaults is roughly 144 passes over every message, and relied on the history bucket for dedup. That bucket is capped at `PEREGRINE_MAX_HISTORY`, so on a busy guild the older half of each window had already been evicted and was **learned again, counting its n-grams twice** (finding 13). Raising the cap would only move the corpus size at which it starts.
 
@@ -283,9 +283,27 @@ Note the trap this exposed. The old inline form was `cfg.AdminUserID == "" || m.
 
 **A channel worker swallows its error on purpose.** `errgroup` cancels its context on the first error returned, so a guild the bot cannot read would abandon the ones it can. Failing to list guilds *is* fatal, because there is nothing to walk and a cheerful log line would hide a revoked token.
 
+### The plugin layout, and what each package may reach
+
+As of M11c the features are packages. Five of them are shared and hold no feature state:
+
+- **`internal/names`** answers who a message is about. Its two phases are split by transaction duration rather than tidiness: `Resolve` makes REST calls and touches no corpus, `FromContent` reads the corpus and makes no network call, and it takes the `*storage.Reader` it is already inside so the version that could nest does not compile.
+- **`internal/learn`** is the only way anything enters the corpus, and `CheckLearn` lives inside `Learner.Message`. The AST test that pins that moved with it.
+- **`internal/generate`** is the glue from a prompt to a sentence, plus the per-channel conversation memory. There is **no emit gate here**: it moved to the guard in M10a and leaving a copy would invite the belief that a producer gates itself, which is how three paths reached Discord ungated.
+- **`internal/channels`** answers what a channel is and where the bot may speak unprompted, from the state cache, never REST. Four features needed one or both.
+- **`internal/activity`** counts traffic, described above.
+
+Then `internal/plugins/{chat,aggro,images,games,autopost}`, each a `core.Service` owning its own state. **`chat` is the reactor** and it names the others through interfaces it declares itself, which is what keeps the step table testable without five real plugins behind it.
+
+**Registration happens only in `cmd/bot`**, in `registerServices`, and the order there is behaviour: `Init` runs in registration order and `Shutdown` in reverse, so `chat` is registered last (its `Init` arms the gateway handler and its `Start` resolves the bot's identity, so everything it calls must have loaded first) and therefore stops first.
+
+**Two constants exist in one place because they had three.** `corpus.StartOfWeekUTC` had three implementations before M11c, and one of the disagreements between them is finding 17. `text.IsStopWord` had two, and the list being plain English function words only is half of why clustering collapsed (finding 29).
+
+**Interface type identity forces a few imports that look wrong and are not.** Go requires exact type identity on an interface method's signature, so `channels.Counter` names `activity.Channel`, `chat.Images` names `images.Attachment`, and every plugin's `Guard` names `*discordgo.Message`. Each of those could be avoided with an adapter whose only job is renaming fields, which is more code and one more place for a mistake.
+
 ### The reactor, and the consume contract
 
-`handleMessage` is a table of named steps in `internal/legacy/reactor.go`, each returning whether it **consumed** the message. The runner stops at the first one that does.
+`chat.handle` runs a table of named steps in `internal/plugins/chat/chat.go`, each returning whether it **consumed** the message. The runner stops at the first one that does.
 
 **Consumed means "this was addressed to me", not "I did something".** The aggro step reacts and the reply step posts, and neither consumes, because a message that earns a reply is still conversation and must still be learned from. Only a command consumes. `TestOnlyCommandsConsume` parses the file and fails if any other step returns `true`, because a step that starts consuming silently stops learning for whatever it matches and no behavioural test would notice.
 
@@ -296,8 +314,6 @@ That contract is what closed finding 9. A `return` statement would have fixed th
 **Commands match the whole trimmed message, not a prefix.** A prefix match makes it impossible to talk *about* a command, so "you should try !leaderboard sometime" would be swallowed and answered.
 
 **`!wordgame` is not a command when word games are off**, because consuming it would mean silently ignoring a message for a feature that is not running. `!leaderboard` is deliberately *not* gated on the feature flag: its chat half reads the stats bucket, which is populated regardless.
-
-**The steps are still in `internal/legacy`, and that is deliberate.** `SPEC.md` §2 puts them under `internal/plugins`; the state they close over (`activeWordGames`, `birdAggroTargetID`, `recentImageURLs`, `leaderboard`) is the engagement features, which is M11's row. Moving control flow and state in one commit would mean reviewing an eight-hundred-line move for a two-line behavioural change. Each step is already a closed unit over one subsystem, so M11's move is mechanical.
 
 **Self-learning is keyed by the reply's own message ID.** Both it and the learn step used the *user's* ID, and `learnMessage` dedupes on that ID, so whichever transaction committed first won and the other became a no-op: one message was silently discarded per interaction, and which one depended on a goroutine race (finding 6). This was data loss, not inefficiency.
 
@@ -325,7 +341,7 @@ discordgo will not stop it. Its send helpers build a request with a nil `Allowed
 
 Every one of them used to discard its error, so a send Discord refused (missing permission, rate limit, channel deleted mid-flight) was indistinguishable from one that succeeded: the bot appeared to ignore people at random with nothing in the log. The guard logs all four operations, at deliberately different levels: a failed send or edit is an error, whereas a failed delete or reaction is Info, because failing to delete is routinely benign (somebody removed the message first, or the bot has no Manage Messages there) and alarming about it trains an operator to ignore the log.
 
-`sendMessage`, `editMessage` and `deleteMessage` in `internal/legacy/legacy.go` are now three-line adapters onto the guard. They still take a `*discordgo.Session` that they ignore, so the call sites do not change shape twice: once here and again when M10b gives the plugins a guard instead of a session. They are the only functions `TestNothingBypassesTheGuard` permits to name a raw session method, and the list is explicit so adding a fourth is a deliberate edit with a reviewer looking at it.
+`sendMessage`, `editMessage` and `deleteMessage` were three-line adapters onto the guard in `internal/legacy`, and M11c deleted them: they existed so the call sites would not change shape twice, once for the chokepoint and again for the plugin move, and this was the second time. **`TestNothingBypassesTheGuard` now permits no adapters at all** and scans the whole module rather than one package, so outside `internal/discordguard` no function may name a session method that speaks.
 
 ### What peregrine deliberately did NOT port from merlin's guard
 
@@ -357,6 +373,10 @@ The engine is `internal/markov` as of M7a. Read `SPEC.md` §5 for the full speci
 
 **Prefix lookups are lowercased at the point of lookup, and that is defence rather than a fixed bug.** Learning lowercases the prefix before storing it; the generation path did not lowercase before looking it up. M6b added it, and the honest position is that it changed no behavior: every producer of the generation prefix is already lowercase, because the seed's candidates are all interned from lowercased sources, every later word is a stored successor token, and the one branch that could have introduced a raw prompt word is unreachable with a non-empty corpus. The reason to normalize anyway is that the alternative is an invariant held by five separate producers agreeing, none of which states it, against a lookup whose failure mode is silently returning no candidates. M7 normalizes once at the storage boundary. `TestGenerateWithAMixedCasePromptFindsTheCorpus` says in its own comment that it does not distinguish the two implementations, because a test that looks like a regression pin and is not one is worse than no test.
 
+**The author-diversity gate applies to all THREE producers of words, not just the sampler.** This was a hole until M11c and it is worth reading before touching any of them. Generation puts a word into a sentence from three places: `eligible()` filters the sampler's candidates, `Jump` picks a token when the chain dead-ends, and `Seed` picks the first word. The last two read the co-occurrence indexes, which store a count and a position sum and no author attribution whatsoever, so a phrase one person repeated forty times was refused by the sampler at every step and then handed straight back by the jump. That is A6 defeated by a check at one of three producers, which is A1's shape one milestone after the principle naming it was written down (`SPEC.md` §8, finding 31).
+
+`Generator.attested` is the check, and two of its asymmetries are deliberate. The end sentinel is exempt in `eligible()` and **not** in `attested`, because "the only thing following this word is the end of a message somebody once sent" is not evidence that several people use it. And a seed derived from the **prompt** is exempt, because echoing somebody's own words back is not poisoning: refusing to would make the bot least responsive exactly when it was addressed directly.
+
 **The author-diversity gate is a filter, not a logit, and it does not relax.** A penalty is something a determined poisoner can out-repeat. When the filter empties the candidate set the step is a dead end and the sentence ends early; relaxing the threshold when it bites would make it not a control. The end sentinel is exempt, because gating it would mean a sentence cannot end until several people ended a message the same way. **Know the operational consequence before you debug it as an outage:** at the default of 2, a young corpus has almost no continuation with two authors, so the bot is close to mute until ingestion catches up.
 
 **One length model, and do not add a second.** A target is sampled per sentence between `MIN_WORDS` and `MAX_WORDS`, skewed short; the end token is penalized below the floor, eased to neutral at the target, and rewarded past it with a cap. That single mechanism replaced three that could disagree, so a new length rule anywhere else recreates the problem. The floor penalty is finite rather than `-Inf` on purpose: a context whose only continuation is the sentinel must still be able to end. Short and punchy reads as a joke; long reads as a malfunction.
@@ -381,11 +401,11 @@ The engine is `internal/markov` as of M7a. Read `SPEC.md` §5 for the full speci
 
 **Filtering the corpus cannot bound the output, even in principle.** A Markov chain composes novel sequences from n-grams learned separately, so fragments that were individually innocuous can join into something the operator has to answer for. Input filtering lowers the rate; only an output gate bounds the result. This is why there are two gates and not one, and why removing the output gate as redundant would be wrong.
 
-**Gates go at chokepoints, never at call sites.** `gate.CheckLearn` is called **inside `learnMessage`**, not at any of its four callers. That placement is the entire fix for the worst finding in the review: the live handler filtered, but the historical backfill, self-learning and voice transcripts passed content through raw, and since the backfill re-read the trailing 24 hours every ten minutes, a message the live path blocked was learned anyway, unfiltered, minutes later. A check at one of four call sites is not a check. A fifth caller is now covered without anyone remembering to cover it.
+**Gates go at chokepoints, never at call sites.** `gate.CheckLearn` is called **inside `learn.Learner.Message`**, not at any of its callers. That placement is the entire fix for the worst finding in the review: the live handler filtered, but the historical backfill, self-learning and voice transcripts passed content through raw, and since the backfill re-read the trailing 24 hours every ten minutes, a message the live path blocked was learned anyway, unfiltered, minutes later. A check at one of four call sites is not a check. A fifth caller is now covered without anyone remembering to cover it.
 
-Do not hoist it to the call sites for performance. `internal/legacy/learngate_test.go` parses the package and fails if the call leaves `learnMessage`'s body, because that regression passes every behavioural test.
+Do not hoist it to the call sites for performance. `internal/learn/learn_test.go` parses the package and fails if the call leaves `Learner.Message`'s body, because that regression passes every behavioural test.
 
-**Reject, never launder, on the learning path.** `Verdict` deliberately has no field for rewritten text, which makes laundering unexpressible here rather than merely discouraged. A rewritten message is still learned, with its structure intact and a harmless token sitting in the offending word's grammatical position: the bot has been taught the sentence. The `m.Content = filterSlurs(m.Content)` that used to sit in the live handler is gone, and removing it was load-bearing in a second way: with the gate in place, laundering *before* the gate would hand it pre-cleaned text and defeat it.
+**Reject, never launder, on the learning path.** `Verdict` deliberately has no field for rewritten text, which makes laundering unexpressible here rather than merely discouraged. A rewritten message is still learned, with its structure intact and a harmless token sitting in the offending word's grammatical position: the bot has been taught the sentence. The `m.Content = filterSlurs(m.Content)` that used to sit in the live handler is gone, and removing it was load-bearing in a second way: with the gate in place, laundering *before* the gate would hand it pre-cleaned text and defeat it. A denylist test on `safety.Verdict`'s field names keeps a rewritten-text field from appearing later; it is a denylist rather than an allowlist so that innocuous additions do not fail it and train somebody to update the list without reading why.
 
 **Match on a normalized form, never raw text.** `safety.Normalize` case-folds, applies NFKD, strips combining marks and format characters, folds Cyrillic and Greek confusables plus leet substitutions to ASCII, collapses whitespace, joins runs of three-or-more spaced single letters, and caps repeated characters at two. Blocklist patterns are written against that form and **must not** re-enumerate evasions it already removes; enumerating them by hand is a game the defender loses.
 
