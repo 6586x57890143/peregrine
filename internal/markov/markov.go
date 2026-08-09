@@ -222,8 +222,13 @@ type Weights struct {
 	// server whose register is short interjections (SPEC.md finding G10).
 	Significance float64
 
-	// IsName gives a small edge to learned display names.
+	// IsName gives a small edge to learned display names, ANY of them.
 	IsName float64
+
+	// PromptName rewards naming the person the prompt named, which IsName cannot
+	// distinguish: it treats every learned name alike, so a reply to a message about one
+	// person was as likely to name a different one.
+	PromptName float64
 
 	// Persona is the roast and aggro vocabulary bias. The lexicon it reads is a
 	// package variable rather than a map rebuilt per candidate per step, which is
@@ -286,6 +291,7 @@ func DefaultWeights() Weights {
 		CurrentTopic:    0.35,
 		Significance:    0.20,
 		IsName:          0.25,
+		PromptName:      0.90,
 		Persona:         0.80,
 		RecentContext:   0.25,
 		PromptGravity:   0.80,

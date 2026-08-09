@@ -245,9 +245,24 @@ func (g *Generator) attempt(r *storage.Reader, promptWords, recentWords []string
 	engine := markov.New(r, g.opts.Params(), nil)
 
 	var recognized []string
+	// BOTH SPELLINGS are collected, and that is the point rather than belt and braces. The
+	// canonical form is what the name-topic index is keyed by, and the surface form is what
+	// people typed and therefore what the n-gram index actually learned, so a seed tier and a
+	// scoring bonus that only knew one of them would miss half the time.
+	promptNames := map[string]struct{}{}
+	var nameTokens []string
 	for _, word := range promptWords {
-		if name, ok := names.Canonical(r, word); ok {
-			recognized = append(recognized, name)
+		name, ok := names.Canonical(r, word)
+		if !ok {
+			continue
+		}
+		recognized = append(recognized, name)
+		for _, spelling := range []string{name, word} {
+			if _, dup := promptNames[spelling]; dup {
+				continue
+			}
+			promptNames[spelling] = struct{}{}
+			nameTokens = append(nameTokens, spelling)
 		}
 	}
 
@@ -289,6 +304,7 @@ func (g *Generator) attempt(r *storage.Reader, promptWords, recentWords []string
 		PromptWords: promptWords,
 		RecentWords: recentWords,
 		Names:       recognized,
+		NameTokens:  nameTokens,
 	}
 	seed := engine.Seed(seedIn)
 	if seed == "" {
@@ -320,6 +336,7 @@ func (g *Generator) attempt(r *storage.Reader, promptWords, recentWords []string
 		CoreTopics:   coreTopics,
 		CurrentTopic: seed,
 		NameAssoc:    assoc,
+		PromptNames:  promptNames,
 	}
 	if roast {
 		step.Persona = markov.PersonaRoast
@@ -327,6 +344,12 @@ func (g *Generator) attempt(r *storage.Reader, promptWords, recentWords []string
 	for _, w := range words {
 		step.Used[w]++
 	}
+
+	// chose records whether the sentence ended because the model picked the end sentinel, as
+	// opposed to running out of chain or hitting the cap. TrimDangling needs the distinction:
+	// somebody really did end a message on that word, which is evidence, whereas a sentence
+	// that merely stopped is not.
+	chose := false
 
 	for !length.Done(len(step.Sentence)) {
 		if len(step.Prefix) == 0 {
@@ -345,6 +368,7 @@ func (g *Generator) attempt(r *storage.Reader, promptWords, recentWords []string
 			// there is no discard-and-retry here: if the model chose to end despite that
 			// penalty, the alternatives were worse, and overriding it would put the
 			// decision back in two places.
+			chose = true
 			break
 		}
 
@@ -352,7 +376,12 @@ func (g *Generator) attempt(r *storage.Reader, promptWords, recentWords []string
 			// A dead end. Either the prefix has no continuation, or the author-diversity
 			// gate refused everything that did, which on a young corpus is the common case
 			// and is the gate working.
-			jump := engine.Jump(seedIn, step.Sentence)
+			//
+			// Jump decides for itself whether jumping is worth it here, and often it is not:
+			// a jump appends a word with no n-gram relationship to the one before it, so the
+			// join is guaranteed rough. Its bounds live in the engine because the golden
+			// harness makes the same call and the two must not disagree.
+			jump := engine.Jump(seedIn, step)
 			if jump == "" {
 				break
 			}
@@ -376,6 +405,9 @@ func (g *Generator) attempt(r *storage.Reader, promptWords, recentWords []string
 		}
 	}
 
+	if !chose {
+		step.Sentence = markov.TrimDangling(step.Sentence)
+	}
 	return step.Sentence, recognized
 }
 
