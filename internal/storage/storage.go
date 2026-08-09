@@ -43,7 +43,7 @@ const (
 	bucketNameTopic  = "name_topic"  // <name> NUL <topic>             -> count u64 | posSum f64
 	bucketName       = "name"        // <name key>                     -> JSON corpus.Name
 	bucketHistory    = "history"     // <snowflake be64>               -> unix nano
-	bucketImage      = "image"       // <url>                          -> unix nano
+	bucketImage      = "image"       // <msgID be64> NUL <url>         -> author be64
 	bucketStats      = "stats"       // <user id>                      -> JSON corpus.WeeklyStat
 	bucketLeaderfoo  = "leaderboard" // fixed key                      -> JSON
 	bucketCluster    = "cluster"     // <cluster id>                   -> JSON
@@ -76,7 +76,17 @@ const (
 // value of each prefix key, so converting it means reading and rewriting the entire
 // corpus, and the corpus is re-derivable from Discord history anyway. Open refuses a
 // corpus it does not recognize rather than silently reading garbage.
-const SchemaVersion = 1
+//
+// Version 2 rekeys the image cache from <url> to <message snowflake> NUL <url> so
+// that reposting can be attributed, capped per author, and revoked when the source
+// message is deleted (SPEC.md section 4, A7).
+//
+// Version 2 DOES have a migration, and the asymmetry with version 1 is the point
+// rather than an inconsistency. The corpus is expensive to lose and expensive to
+// convert, so it is refused. The image cache is a hundred-entry cache of URLs that
+// refills itself within minutes of live traffic, so upgradeToV2 simply empties it.
+// The rule this sets is: migrate what is cheap to discard, refuse what is not.
+const SchemaVersion = 2
 
 // ErrSchemaMismatch is returned by Open when the file on disk was written by a
 // different layout.
@@ -135,6 +145,14 @@ func (s *Store) initialize() error {
 
 		case decodeUint64(stored) == SchemaVersion:
 
+		case decodeUint64(stored) == 1:
+			if err := upgradeToV2(tx); err != nil {
+				return err
+			}
+			if err := meta.Put([]byte(metaSchemaVersion), encodeUint64(SchemaVersion)); err != nil {
+				return err
+			}
+
 		default:
 			return fmt.Errorf("%w: corpus is version %d, this binary speaks version %d",
 				ErrSchemaMismatch, decodeUint64(stored), SchemaVersion)
@@ -142,6 +160,34 @@ func (s *Store) initialize() error {
 
 		return backfillTopicTotal(tx)
 	})
+}
+
+// upgradeToV2 empties the image cache, which is the whole of the version 1 to 2
+// migration.
+//
+// Version 2 rekeys that bucket from <url> to <message snowflake> NUL <url>, and a
+// version 1 entry read under the new codec would fail splitImageKey and be skipped
+// forever while still counting against the cache size. Rather than translate them,
+// which is impossible anyway because the old layout recorded neither the message nor
+// the author, the cache is emptied: it is a hundred URLs that refill themselves from
+// live traffic within minutes.
+//
+// The counter is reset in the same transaction as the delete, so the two cannot
+// disagree about how full the cache is. That mattering is the reason the trims are
+// counter-driven rather than Stats()-driven in the first place (finding 11).
+func upgradeToV2(tx *bbolt.Tx) error {
+	// The bucket is known to exist: initialize creates every bucket in allBuckets
+	// before it looks at the version, so there is no not-found case to tolerate here.
+	if err := tx.DeleteBucket([]byte(bucketImage)); err != nil {
+		return fmt.Errorf("upgrade to v2, drop image cache: %w", err)
+	}
+	if _, err := tx.CreateBucket([]byte(bucketImage)); err != nil {
+		return fmt.Errorf("upgrade to v2, recreate image cache: %w", err)
+	}
+	if err := tx.Bucket([]byte(bucketMeta)).Delete([]byte(metaImageCount)); err != nil {
+		return fmt.Errorf("upgrade to v2, reset image counter: %w", err)
+	}
+	return nil
 }
 
 // backfillTopicTotal derives count:topic_total once for a corpus written before that
