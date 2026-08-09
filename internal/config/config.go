@@ -139,10 +139,23 @@ type Config struct {
 	AutonomousSkipChance   float64       // PEREGRINE_AUTONOMOUS_SKIP_CHANCE
 
 	// Engagement: word games.
-	EnableWordGames    bool          // PEREGRINE_ENABLE_WORD_GAMES
-	WordGameMode       string        // PEREGRINE_WORDGAME_FREQUENCY_MODE
-	WordGameInterval   time.Duration // PEREGRINE_WORDGAME_INTERVAL
-	WordGameDictionary string        // PEREGRINE_WORDGAME_DICTIONARY
+	//
+	// Every number here was a literal in the middle of the message handler until M11.
+	// They are not tuning knobs for their own sake: the timeout and the announcement TTL
+	// govern how much of the channel the game occupies, and the activity trigger governs
+	// whether the bot interrupts a conversation or joins one.
+	EnableWordGames           bool          // PEREGRINE_ENABLE_WORD_GAMES
+	WordGameMode              string        // PEREGRINE_WORDGAME_FREQUENCY_MODE
+	WordGameInterval          time.Duration // PEREGRINE_WORDGAME_INTERVAL
+	WordGameDictionary        string        // PEREGRINE_WORDGAME_DICTIONARY
+	WordGameTimeout           time.Duration // PEREGRINE_WORDGAME_TIMEOUT
+	WordGameAnnounceTTL       time.Duration // PEREGRINE_WORDGAME_ANNOUNCE_TTL
+	WordGameActivityWindow    time.Duration // PEREGRINE_WORDGAME_ACTIVITY_WINDOW
+	WordGameActivityThreshold int           // PEREGRINE_WORDGAME_ACTIVITY_THRESHOLD
+	WordGameTriggerChance     float64       // PEREGRINE_WORDGAME_TRIGGER_CHANCE
+	WordGameMinLength         int           // PEREGRINE_WORDGAME_MIN_LENGTH
+	WordGameMaxLength         int           // PEREGRINE_WORDGAME_MAX_LENGTH
+	WordGameSweepTick         time.Duration // PEREGRINE_WORDGAME_SWEEP_TICK
 
 	// Transcription. Off by default, and that default deliberately differs from
 	// the old in-code constant, which was true: transcription shells out to
@@ -311,13 +324,47 @@ func Load() (*Config, error) {
 		AutonomousPostTick:   l.dur("PEREGRINE_AUTONOMOUS_POST_TICK", 10*time.Minute, time.Minute, 30*24*time.Hour),
 		AutonomousSkipChance: l.float("PEREGRINE_AUTONOMOUS_SKIP_CHANCE", 0.90, 0, 1),
 
-		EnableWordGames: l.boolVal("PEREGRINE_ENABLE_WORD_GAMES", false),
-		WordGameMode:    l.enum("PEREGRINE_WORDGAME_FREQUENCY_MODE", WordGameModeInterval, WordGameModeInterval, WordGameModeActivity),
-		// 2 minutes is today's value and it is a leftover from testing rather
-		// than a decision. Kept so this milestone changes no behavior; M11 picks
-		// a real one when word games are turned on deliberately.
-		WordGameInterval:   l.dur("PEREGRINE_WORDGAME_INTERVAL", 2*time.Minute, time.Minute, 24*time.Hour),
+		// Word games are ON by default as of M11. They were switched off by a
+		// compile-time constant, then by a flag defaulting false, and the whole point of
+		// the feature is engagement: a game nobody can play is not a conservative
+		// default, it is a feature that does not exist. The failure mode of having it on
+		// is that the bot occasionally posts a puzzle, which is what it is for.
+		EnableWordGames: l.boolVal("PEREGRINE_ENABLE_WORD_GAMES", true),
+		WordGameMode:    l.enum("PEREGRINE_WORDGAME_FREQUENCY_MODE", WordGameModeActivity, WordGameModeInterval, WordGameModeActivity),
+
+		// 30 minutes, not the 2 minutes that stood here. Two was plainly a leftover from
+		// testing: a puzzle every two minutes in a busy channel is the bot talking over
+		// the conversation rather than joining it. The minimum is raised to 5 for the
+		// same reason, since anything under that is the old value by another name.
+		WordGameInterval:   l.dur("PEREGRINE_WORDGAME_INTERVAL", 30*time.Minute, 5*time.Minute, 24*time.Hour),
 		WordGameDictionary: l.str("PEREGRINE_WORDGAME_DICTIONARY", ""),
+
+		// The numbers that used to be literals inside the handler.
+		//
+		// The timeout is how long people get to answer, and 60 seconds is what it was.
+		// The announce TTL is how long a win or timeout message survives before the bot
+		// tidies it away; 0 keeps it, which an operator who wants a visible history
+		// should set.
+		WordGameTimeout:     l.dur("PEREGRINE_WORDGAME_TIMEOUT", time.Minute, 10*time.Second, time.Hour),
+		WordGameAnnounceTTL: l.dur("PEREGRINE_WORDGAME_ANNOUNCE_TTL", 30*time.Second, 0, 24*time.Hour),
+
+		// A game starts when a channel has seen THRESHOLD messages within WINDOW, then on
+		// a TRIGGER_CHANCE roll per message. All three were literals: 5, 5 minutes and
+		// 0.025.
+		WordGameActivityWindow:    l.dur("PEREGRINE_WORDGAME_ACTIVITY_WINDOW", 5*time.Minute, time.Minute, 24*time.Hour),
+		WordGameActivityThreshold: l.intVal("PEREGRINE_WORDGAME_ACTIVITY_THRESHOLD", 5, 1, 1000),
+		WordGameTriggerChance:     l.float("PEREGRINE_WORDGAME_TRIGGER_CHANCE", 0.025, 0, 1),
+
+		// Word length in RUNES. The old filter was `len(word) > 4` on bytes, so an
+		// accented five-letter word counted as six.
+		WordGameMinLength: l.intVal("PEREGRINE_WORDGAME_MIN_LENGTH", 5, 3, 40),
+		WordGameMaxLength: l.intVal("PEREGRINE_WORDGAME_MAX_LENGTH", 12, 3, 40),
+
+		// How often expired games and due deletions are swept. This is the resolution of
+		// the timeout, so a game can outlive its deadline by up to one tick, which is a
+		// trade worth making: a puzzle ending a few seconds late is invisible, whereas the
+		// goroutine per game this replaces outlived shutdown.
+		WordGameSweepTick: l.dur("PEREGRINE_WORDGAME_SWEEP_TICK", 5*time.Second, time.Second, time.Minute),
 
 		EnableTranscription: l.boolVal("PEREGRINE_ENABLE_TRANSCRIPTION", false),
 	}

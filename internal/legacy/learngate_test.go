@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/6586x57890143/peregrine/internal/config"
 	"github.com/6586x57890143/peregrine/internal/corpus"
@@ -17,7 +18,7 @@ import (
 	"github.com/6586x57890143/peregrine/internal/discordguard"
 	"github.com/6586x57890143/peregrine/internal/safety"
 	"github.com/6586x57890143/peregrine/internal/storage"
-	"github.com/6586x57890143/peregrine/wordgames"
+	"github.com/6586x57890143/peregrine/internal/wordgame"
 	"github.com/bwmarrin/discordgo"
 )
 
@@ -57,7 +58,13 @@ func gateFixture(t *testing.T) *storage.Store {
 	// The word-game leaderboard, which Init loads in production. Nil here made
 	// cmdLeaderboard panic on leaderboard.Format() rather than fail an assertion, which
 	// is how the first version of the finding-9 pin reported a revert.
-	leaderboard = wordgames.NewLeaderboard()
+	leaderboard = wordgame.NewLeaderboard(time.Now())
+
+	// A manager with no dictionary by default, so Available() is false and the word-game
+	// step declines. A test that wants games calls testManager itself. Defaulting to
+	// unavailable rather than available is the safer direction: a fixture that silently
+	// started puzzles would make unrelated tests depend on a random trigger.
+	games = testManager(t)
 
 	store = s
 	// The generation dials carry the shipped defaults rather than zero values, so these
@@ -98,6 +105,33 @@ func gateFixture(t *testing.T) *storage.Store {
 	guard = discordguard.New(sent, emitGate{g: gate}, nil, nil)
 
 	return s
+}
+
+// testManager builds a word-game Manager over the given words, or an unavailable one when
+// given none.
+//
+// It writes a temporary dictionary rather than reaching into wordgame's unexported fields,
+// because a test-only exported constructor would be production API that exists for tests.
+// The embedded list would work too but costs a 6,800-line parse per fixture and gives the
+// test no control over which word comes up.
+//
+// TriggerChance is 0, so a game never starts by chance: a fixture that occasionally posted
+// a puzzle would make unrelated tests flaky in a way nobody would attribute to word games.
+func testManager(t *testing.T, words ...string) *wordgame.Manager {
+	t.Helper()
+	if len(words) == 0 {
+		return wordgame.NewManager(nil, nil, wordgame.Options{})
+	}
+
+	path := filepath.Join(t.TempDir(), "words.txt")
+	if err := os.WriteFile(path, []byte(strings.Join(words, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write test dictionary: %v", err)
+	}
+	dict, err := wordgame.LoadDictionary(path, wordgame.DictionaryOptions{MinLength: 3, MaxLength: 40})
+	if err != nil {
+		t.Fatalf("LoadDictionary: %v", err)
+	}
+	return wordgame.NewManager(dict, nil, wordgame.Options{TriggerChance: 0})
 }
 
 // sent records what the fixture's guard would have sent. Reset per fixture, so a test
