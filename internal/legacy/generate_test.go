@@ -3,6 +3,8 @@ package legacy
 import (
 	"strings"
 	"testing"
+
+	"github.com/6586x57890143/peregrine/internal/storage"
 )
 
 // This file exercises the whole read path against a real corpus: seed selection,
@@ -21,6 +23,115 @@ func teach(t *testing.T, lines ...string) {
 	t.Helper()
 	for i, line := range lines {
 		learn(t, store, line, snowflake(100+i))
+	}
+}
+
+// teachAs is teach with a chosen author, for the author-diversity gate.
+func teachAs(t *testing.T, authorID string, idBase int, lines ...string) {
+	t.Helper()
+	for i, line := range lines {
+		if err := store.Update(func(w *storage.Writer) error {
+			return learnMessage(w, line, snowflake(idBase+i), "999",
+				MentionedUser{Name: authorID, UserID: authorID, Username: authorID}, nil)
+		}); err != nil {
+			t.Fatalf("learnMessage as %s: %v", authorID, err)
+		}
+	}
+}
+
+// TestGenParamsMapsEveryConfiguredDial exists because the mapping from Config to
+// markov.Params is eight assignments of the same two types, so a transposition (TopP
+// taking cfg.TopK, say) would compile, would pass every behavioural test in the suite,
+// and would silently mean the operator's dials do something other than what they say.
+//
+// Distinct values per field are what make a transposition detectable at all.
+func TestGenParamsMapsEveryConfiguredDial(t *testing.T) {
+	gateFixture(t)
+
+	cfg.MaxNGram = 4
+	cfg.Temperature = 1.7
+	cfg.TopK = 33
+	cfg.TopP = 0.81
+	cfg.KNDiscount = 0.62
+	cfg.KNRawMix = 0.41
+	cfg.MinDistinctAuthors = 3
+	cfg.PromptRelevanceBoost = 0.9
+
+	got := genParams()
+	checks := []struct {
+		name      string
+		got, want any
+	}{
+		{"MaxNGram", got.MaxNGram, 4},
+		{"Temperature", got.Temperature, 1.7},
+		{"TopK", got.TopK, 33},
+		{"TopP", got.TopP, 0.81},
+		{"KNDiscount", got.KNDiscount, 0.62},
+		{"KNRawMix", got.KNRawMix, 0.41},
+		{"MinDistinctAuthors", got.MinDistinctAuthors, 3},
+		{"PromptRelevance", got.PromptRelevance, 0.9},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("genParams().%s = %v, want %v", c.name, c.got, c.want)
+		}
+	}
+}
+
+// TestGenerationHonoursTheConfiguredAuthorGate is the wiring pin for A6 at the level
+// that matters to an operator: the engine's own tests prove the gate works, and this
+// proves the bot's configuration reaches it.
+//
+// Without this, PEREGRINE_MIN_DISTINCT_AUTHORS could be read into Config, dropped on
+// the floor in genParams, and every test in the repo would still pass while the
+// anti-poisoning control did nothing.
+func TestGenerationHonoursTheConfiguredAuthorGate(t *testing.T) {
+	gateFixture(t)
+	cfg.MinDistinctAuthors = 2
+
+	// One author, said many times. This is the shape of the real attack.
+	var lines []string
+	for range 40 {
+		lines = append(lines, "the bird should sayhorriblething")
+	}
+	teachAs(t, "poisoner", 500, lines...)
+
+	for range 30 {
+		got, err := generateSentenceWithContext(nil, "the bird should", false, &ConversationMemory{})
+		if err != nil {
+			t.Fatalf("generateSentenceWithContext: %v", err)
+		}
+		if strings.Contains(got, "sayhorriblething") {
+			t.Fatalf("generated %q from a phrase only one author ever said, with "+
+				"MinDistinctAuthors=2. The gate is configured but not reaching the engine", got)
+		}
+	}
+}
+
+// TestGenerationAllowsWhatTwoAuthorsSaid is the other direction, so the test above
+// cannot be satisfied by a gate that refuses everything.
+func TestGenerationAllowsWhatTwoAuthorsSaid(t *testing.T) {
+	gateFixture(t)
+	cfg.MinDistinctAuthors = 2
+
+	teachAs(t, "alice", 600, "the bird is genuinelyloose today")
+	teachAs(t, "bob", 700, "the bird is genuinelyloose today")
+
+	var found bool
+	for range 30 {
+		got, err := generateSentenceWithContext(nil, "the bird is", false, &ConversationMemory{})
+		if err != nil {
+			t.Fatalf("generateSentenceWithContext: %v", err)
+		}
+		if strings.Contains(got, "genuinelyloose") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("a continuation two distinct authors produced was never generated in 30 " +
+			"attempts; the gate must admit what it is meant to admit or the bot is silent " +
+			"on a real server rather than safe on one")
 	}
 }
 
