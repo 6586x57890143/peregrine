@@ -38,6 +38,7 @@ import (
 	"github.com/6586x57890143/peregrine/internal/config"
 	"github.com/6586x57890143/peregrine/internal/core"
 	"github.com/6586x57890143/peregrine/internal/corpus"
+	"github.com/6586x57890143/peregrine/internal/discordguard"
 	"github.com/6586x57890143/peregrine/internal/markov"
 	"github.com/6586x57890143/peregrine/internal/safety"
 	"github.com/6586x57890143/peregrine/internal/storage"
@@ -167,6 +168,28 @@ var dispatcher *core.Dispatcher
 // indistinguishable from a working one right up until the bot posts something the
 // operator has to answer for.
 var gate *safety.Gate
+
+// guard is the outbound chokepoint. Assigned by Service.Init once the session exists,
+// and never nil afterwards.
+//
+// Every Discord call that sends, edits, deletes or reacts goes through it, which is what
+// makes finding 8 unwritable rather than fixed: nothing in this package holds a path to
+// discordgo's send helpers any more except the three adapters below, and a test enforces
+// that. The reason it has to be structural is that peregrine's output is Markov text
+// built from arbitrary user messages, so every send is untrusted-input-shaped and a
+// mention that got learned pings its target forever.
+var guard *discordguard.Guard
+
+// emitGate adapts *safety.Gate to discordguard.EmitGate.
+//
+// The guard wants a bool and the gate returns a Verdict carrying the reason, the
+// category and whether to alert. The adapter throws away everything except the decision
+// on purpose: the gate has already logged and counted by the time it returns, and having
+// the guard re-log the reason would put the same incident in the log twice under two
+// different spellings.
+type emitGate struct{ g *safety.Gate }
+
+func (e emitGate) CheckEmit(text string) bool { return e.g.CheckEmit(text).Allowed }
 
 // botMentionPattern strips the bot's own mention from a message before learning it,
 // so the corpus does not fill with the bot's user ID.
@@ -330,6 +353,13 @@ func (s *Service) Init(deps core.Deps) error {
 	dispatcher = deps.Dispatcher
 	gate = deps.Gate
 	dg = deps.Session
+
+	// The guard is built here rather than in cmd/bot because it is legacy's own
+	// chokepoint and moves out with the handler in M10b. Built in Init rather than
+	// Start, because the gateway handler registered below can fire as soon as
+	// session.Open returns and it replies through the guard: a guard assigned in Start
+	// would be nil for every message that arrived in that window.
+	guard = discordguard.New(dg, emitGate{g: gate}, deps.Logger, cfg.IgnoreChannels)
 
 	lastWordGameTime = time.Now() // Initialize with current time on startup
 
@@ -1831,34 +1861,46 @@ func wordSet(words []string) map[string]struct{} {
 // channel was steered by an unrelated conversation in another. Conversation memory is
 // keyed by channel ID now, in a bounded map (finding G8).
 
-// sendMessage, editMessage and deleteMessage exist because every Discord call
-// below used to discard its error, so a send Discord refused (missing
-// permission, rate limit, channel deleted mid-flight) was indistinguishable
-// from one that worked: the bot simply appeared to ignore people at random,
-// with nothing in the log to say why.
+// sendMessage, editMessage and deleteMessage are now three-line adapters onto
+// internal/discordguard, which owns mention suppression, the outbound safety gate, the
+// ignore list and the logging.
 //
-// M10 replaces these with internal/discordguard, which owns the same logging
-// plus mention suppression and the outbound safety gate at a single chokepoint.
-// They are deliberately thin so that migration is a mechanical rename.
+// They survive as functions rather than being inlined at their call sites because they
+// take a *discordgo.Session that the guard does not need, and rewriting fourteen call
+// sites in the same commit that introduces the chokepoint would make the diff hard to
+// check for exactly the thing it has to be checked for: that nothing still reaches
+// s.ChannelMessage* directly. `TestNothingBypassesTheGuard` is what enforces that, and
+// these three are the only functions it permits to name the raw session.
+//
+// The session parameter is ignored. It is kept so the call sites do not all have to
+// change shape twice, once here and once when M10b splits the handler into plugins that
+// carry a guard rather than a session.
 func sendMessage(s *discordgo.Session, channelID, content string) {
-	if _, err := s.ChannelMessageSend(channelID, content); err != nil {
-		log.Printf("[DISCORD] send to channel %s failed: %v", channelID, err)
-	}
+	_ = s
+	guard.Send(channelID, content)
 }
 
 func editMessage(s *discordgo.Session, channelID, messageID, content string) {
-	if _, err := s.ChannelMessageEdit(channelID, messageID, content); err != nil {
-		log.Printf("[DISCORD] edit of message %s failed: %v", messageID, err)
-	}
+	_ = s
+	guard.Edit(channelID, messageID, content)
 }
 
-// deleteMessage logs at a lower urgency than the others: failing to delete is
-// routinely benign (someone already removed the message, or the bot lacks
-// Manage Messages in that channel) and is not worth alarming about.
 func deleteMessage(s *discordgo.Session, channelID, messageID string) {
-	if err := s.ChannelMessageDelete(channelID, messageID); err != nil {
-		log.Printf("[DISCORD] delete of message %s failed (often benign): %v", messageID, err)
-	}
+	_ = s
+	guard.Delete(channelID, messageID)
+}
+
+// scrambleMessage and timeUpMessage exist because the word-game announcements were
+// composed inline at two call sites each, identically, and the duplication is what let
+// the interval-mode and activity-mode branches drift apart in the first place. Naming
+// them also keeps the guard call on one line at each site, which is what makes
+// TestNothingBypassesTheGuard readable.
+func scrambleMessage(scrambled string) string {
+	return fmt.Sprintf("✨ **Word Scramble!** ✨\n\nUnscramble this word: **%s**", scrambled)
+}
+
+func timeUpMessage(original string) string {
+	return fmt.Sprintf("Time is up! The word was **%s**.", original)
 }
 
 // messageCreate is the gateway handler. It does the cheapest possible rejection
@@ -1930,9 +1972,14 @@ func handleMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 					winnerUsername = m.Member.Nick
 				}
 
-				// Announce winner and set it for delayed deletion
-				winMessage, err := s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("🎉 **%s** guessed the word **%s** in %.2f seconds!", winnerUsername, game.OriginalWord, solveTime.Seconds()))
-				if err == nil {
+				// Announce winner and set it for delayed deletion.
+				//
+				// Through the guard, which matters here for a reason that is not obvious:
+				// the winner's nickname is interpolated into this string, and a nickname
+				// is user-controlled text that can contain a role mention. So even a
+				// message the bot composes itself is untrusted-input-shaped.
+				winMessage, ok := guard.Send(m.ChannelID, fmt.Sprintf("🎉 **%s** guessed the word **%s** in %.2f seconds!", winnerUsername, game.OriginalWord, solveTime.Seconds()))
+				if ok {
 					go func(channelID, messageID string) {
 						time.Sleep(30 * time.Second)
 						deleteMessage(s, channelID, messageID)
@@ -1945,9 +1992,10 @@ func handleMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 					return saveLeaderboard(w, leaderboard)
 				})
 
-				// Clean up messages
-				_ = s.ChannelMessageDelete(m.ChannelID, game.MessageID) // Delete original puzzle
-				_ = s.ChannelMessageDelete(m.ChannelID, m.ID)           // Delete the winning message
+				// Clean up messages. These two used to discard their errors with a bare
+				// `_ =`, which is the pattern finding 8's neighbours were full of.
+				deleteMessage(s, m.ChannelID, game.MessageID) // the original puzzle
+				deleteMessage(s, m.ChannelID, m.ID)           // the winning message
 
 				// End the game
 				delete(activeWordGames, m.ChannelID)
@@ -1973,8 +2021,8 @@ func handleMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 				if err != nil {
 					log.Printf("[WORDGAME] Failed to create new game: %v", err)
 				} else {
-					msg, err := s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("✨ **Word Scramble!** ✨\n\nUnscramble this word: **%s**", game.ScrambledWord))
-					if err == nil {
+					msg, ok := guard.Send(m.ChannelID, scrambleMessage(game.ScrambledWord))
+					if ok {
 						game.MessageID = msg.ID
 						activeWordGames[m.ChannelID] = game
 						channelActivity[m.ChannelID] = []time.Time{} // Reset activity after starting
@@ -1984,8 +2032,8 @@ func handleMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 							wordGameMutex.Lock()
 							defer wordGameMutex.Unlock()
 							if g, exists := activeWordGames[channelID]; exists && g.MessageID == messageID {
-								timeoutMsg, err := s.ChannelMessageSend(channelID, fmt.Sprintf("Time's up! The word was **%s**.", originalWord))
-								if err == nil {
+								timeoutMsg, ok := guard.Send(channelID, timeUpMessage(originalWord))
+								if ok {
 									go func(cid, mid string) {
 										time.Sleep(30 * time.Second)
 										deleteMessage(s, cid, mid)
@@ -2063,8 +2111,8 @@ func handleMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 				if err != nil {
 					log.Printf("[WORDGAME] Failed to create new game: %v", err)
 				} else {
-					msg, err := s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("✨ **Word Scramble!** ✨\n\nUnscramble this word: **%s**", game.ScrambledWord))
-					if err == nil {
+					msg, ok := guard.Send(m.ChannelID, scrambleMessage(game.ScrambledWord))
+					if ok {
 						game.MessageID = msg.ID
 						activeWordGames[m.ChannelID] = game
 						log.Printf("[WORDGAME] Started a new game in channel %s.", m.ChannelID)
@@ -2073,8 +2121,8 @@ func handleMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 							wordGameMutex.Lock()
 							defer wordGameMutex.Unlock()
 							if g, exists := activeWordGames[channelID]; exists && g.MessageID == messageID {
-								timeoutMsg, err := s.ChannelMessageSend(channelID, fmt.Sprintf("Time's up! The word was **%s**.", originalWord))
-								if err == nil {
+								timeoutMsg, ok := guard.Send(channelID, timeUpMessage(originalWord))
+								if ok {
 									go func(cid, mid string) {
 										time.Sleep(30 * time.Second)
 										deleteMessage(s, cid, mid)
@@ -2100,10 +2148,10 @@ func handleMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 
 	if isTarget && !isExpired {
 		// Aggro is active. Perform API calls outside the lock.
-		err := s.MessageReactionAdd(m.ChannelID, m.ID, cfg.AggroEmoji)
-		if err != nil {
-			log.Printf("[AGGRO] Failed to add reaction: %v", err)
-		}
+		// Through the guard, so PEREGRINE_PAUSE_ALL_WRITES stops the bot reacting as
+		// well as talking. A reaction is still the bot visibly participating, and an
+		// operator hitting the emergency stop is not asking it to keep poking someone.
+		guard.React(m.ChannelID, m.ID, cfg.AggroEmoji)
 	} else if isTarget && isExpired {
 		// Aggro has expired. Update shared state and persist.
 		log.Printf("[AGGRO] Aggro expired for %s, clearing...", m.Author.Username)
@@ -2182,8 +2230,17 @@ func handleMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 			log.Printf("[ERR] reply generation failed: %v", err)
 		} else if reply != "" {
 			// Always reply directly when the bot is triggered by a message.
-			if _, err := s.ChannelMessageSendReply(m.ChannelID, reply, &discordgo.MessageReference{MessageID: m.ID, ChannelID: m.ChannelID}); err != nil {
-				log.Printf("[ERR] sending reply failed: %v", err)
+			//
+			// Through the guard, and THIS is the call site finding 8 was about.
+			// ChannelMessageSendReply sets no AllowedMentions, so Discord's default
+			// applied and the author was pinged on every single interaction. The bot
+			// answers whenever it hears its own name, so that was a notification per
+			// conversation for everyone who ever talked to it, plus every mention the
+			// generator happened to emit out of the corpus.
+			if _, ok := guard.SendReply(m.ChannelID, reply, &discordgo.MessageReference{MessageID: m.ID, ChannelID: m.ChannelID}); !ok {
+				// The guard has already logged whether this was a refusal or a
+				// failure, and which.
+				log.Printf("[RESP] reply to %s was not sent", m.Author.Username)
 			} else {
 				log.Printf("[RESP] replied to %s in %s: %q", m.Author.Username, time.Since(replyStart), reply)
 
@@ -2285,13 +2342,17 @@ func handleMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 			ext := strings.ToLower(filepath.Ext(att.Filename))
 			if ext == ".ogg" || ext == ".mp3" || ext == ".wav" {
 				// Send placeholder immediately
-				placeholder, err := s.ChannelMessageSendReply(
+				placeholder, ok := guard.SendReply(
 					m.ChannelID,
 					"🔊 transcription in progress...",
 					&discordgo.MessageReference{MessageID: m.ID, ChannelID: m.ChannelID},
 				)
-				if err != nil {
-					log.Printf("[VOICE] Failed to send placeholder message: %v", err)
+				if !ok {
+					// No placeholder means nothing to edit later, so do not queue the
+					// job: a transcription with nowhere to go would burn a Whisper run
+					// and then log an edit failure against a message ID that never
+					// existed.
+					log.Printf("[VOICE] placeholder not sent, skipping transcription")
 					continue
 				}
 
@@ -2352,13 +2413,24 @@ func handleMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 // repost has something to post. Extracted from messageCreate only so the
 // EnableImageRepost gate could wrap it as one statement; the body is unchanged.
 //
-// The s.Channel call here is a REST request on every message that carries a
-// candidate URL, purely to read the NSFW flag. It becomes a free s.State.Channel
-// lookup in M10 once IntentsGuilds is requested (SPEC.md section 8, finding 7).
+// The NSFW check reads the state cache as of M10a, not REST.
+//
+// This used to be s.Channel, a REST request on every message carrying a candidate URL,
+// purely to read one boolean. It was probably the largest rate-limit consumer in the bot.
+// s.State.Channel answers from the cache the gateway already maintains, which
+// core.NewSession populates now that it requests IntentsGuilds (SPEC.md section 8,
+// finding 7): the same missing intent that meant custom emotes had never worked was also
+// forcing this call.
+//
+// It FAILS CLOSED. A cache miss means no caching of the URL, not caching it anyway: the
+// check exists to keep the bot from reposting NSFW media into a channel of its choosing,
+// and "we could not tell" has to mean "do not" for that to be worth anything. A miss is
+// rare and transient (the cache fills on READY), and the cost of being wrong in the safe
+// direction is one image not being remembered.
 func captureImageURLs(s *discordgo.Session, m *discordgo.MessageCreate) {
-	ch, err := s.Channel(m.ChannelID)
+	ch, err := s.State.Channel(m.ChannelID)
 	if err != nil {
-		log.Printf("[WARN] Could not fetch channel info to check for NSFW status: %v", err)
+		log.Printf("[WARN] channel %s is not in the state cache, not caching this URL: %v", m.ChannelID, err)
 	} else if !ch.NSFW && !strings.Contains(strings.ToLower(ch.Name), "nsfw") {
 		imageURLMutex.Lock()
 
@@ -2562,11 +2634,12 @@ func autonomousPost(ctx context.Context, dg *discordgo.Session) {
 		return
 	}
 
-	// Send message
-	sentMsg, err := dg.ChannelMessageSend(bestChannel.ID, msg)
-	if err != nil {
-		log.Println("[AUTONOMOUS] Failed to send message:", err)
-	} else {
+	// Send message. Through the guard, which is a change in behaviour and not only in
+	// plumbing: until M10 this path reached Discord without passing CheckEmit at all,
+	// because the gate sat at the generation exit and the autonomous poster called a
+	// different one. An unprompted post is the output with the least human context
+	// around it, so it is the worst one to have been ungated.
+	if sentMsg, ok := guard.Send(bestChannel.ID, msg); ok {
 		log.Printf("[AUTONOMOUS] Sent message in #%s: %s (ID: %s)", bestChannel.Name, msg, sentMsg.ID)
 	}
 
@@ -2592,10 +2665,15 @@ func transcriptionWorker(ctx context.Context, s *discordgo.Session) {
 			}
 
 			log.Printf("[VOICE] Transcript for %s: %s", job.MsgID, transcript)
-			finalMsg := fmt.Sprintf("```\n%s\n```", transcript)
-			if _, err := s.ChannelMessageEdit(job.ChannelID, job.PlaceholderID, finalMsg); err != nil {
-				log.Printf("[VOICE] Failed to edit placeholder for message %s: %v", job.MsgID, err)
-			}
+			// Through the guard, and this is the send whose content is least under
+			// anyone's control: a Whisper transcript of arbitrary audio, posted by the
+			// bot. Until M10 it passed neither CheckEmit nor mention suppression, so
+			// someone could have had the bot say anything by saying it out loud, and a
+			// transcript containing a mention would have pinged.
+			//
+			// The code fence does not help. Discord parses mentions inside code blocks
+			// for notification purposes even though it does not render them as links.
+			editMessage(s, job.ChannelID, job.PlaceholderID, fmt.Sprintf("```\n%s\n```", transcript))
 
 			// Learn transcript
 			authorInfo := MentionedUser{
