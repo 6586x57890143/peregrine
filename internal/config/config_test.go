@@ -71,6 +71,11 @@ func TestLoadDefaults(t *testing.T) {
 		// scratch corpus this makes the bot nearly silent, which is the control
 		// working rather than a defect.
 		{"MinDistinctAuthors", cfg.MinDistinctAuthors, 2},
+		// Live as of M7b. The old length bound was 30 + rand(15) words, a paragraph.
+		{"MinWords", cfg.MinWords, 4},
+		{"MaxWords", cfg.MaxWords, 18},
+		{"CooccurrenceWindow", cfg.CooccurrenceWindow, 5},
+		{"RoastChance", cfg.RoastChance, 0.10},
 		{"IngestTick", cfg.IngestTick, 10 * time.Minute},
 		{"IngestLookback", cfg.IngestLookback, 24 * time.Hour},
 		{"IngestBatchDelay", cfg.IngestBatchDelay, 500 * time.Millisecond},
@@ -364,11 +369,12 @@ func TestDeferredSet(t *testing.T) {
 		t.Fatalf("DeferredSet with nothing set = %v, want empty", got)
 	}
 
-	// Two that are still deferred. TOP_K and KN_RAW_MIX used to stand here and no
-	// longer can, because M7a made them live: that is exactly the transition
-	// TestDeferredVarsAreNotAlsoLive below polices.
-	t.Setenv("PEREGRINE_MAX_WORDS", "18")
+	// Two that are still deferred. This list has had to be rewritten twice now, once
+	// per milestone that promoted its entries: TOP_K and KN_RAW_MIX went live in M7a,
+	// MAX_WORDS in M7b. That churn is the mechanism working, and it is exactly the
+	// transition TestDeferredVarsAreNotAlsoLive below polices.
 	t.Setenv("PEREGRINE_BACKUP_KEEP", "7")
+	t.Setenv("PEREGRINE_IGNORE_CHANNELS", "123")
 
 	got := DeferredSet()
 	if len(got) != 2 {
@@ -376,8 +382,29 @@ func TestDeferredSet(t *testing.T) {
 	}
 	// Sorted, so the log line is stable rather than reordering per run on Go's
 	// randomized map iteration.
-	if got[0] != "PEREGRINE_BACKUP_KEEP (M13)" || got[1] != "PEREGRINE_MAX_WORDS (M7b)" {
+	if got[0] != "PEREGRINE_BACKUP_KEEP (M13)" || got[1] != "PEREGRINE_IGNORE_CHANNELS (M10)" {
 		t.Errorf("DeferredSet = %v, want sorted entries carrying their milestone", got)
+	}
+}
+
+// TestClusteringVarsAreNeitherLiveNorDeferred pins the M7b decision that clustering is
+// deleted rather than rebuilt (SPEC.md section 8, finding 29).
+//
+// These two variables travelled the whole way: live fields, then deferred entries
+// pointing at M8, and now nothing. The deferred warning promises a milestone, so leaving
+// them there after M8 was dropped would promise one that is never coming, which is worse
+// than saying nothing. Setting either must now be silently inert, exactly like any other
+// unrecognized variable.
+func TestClusteringVarsAreNeitherLiveNorDeferred(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("PEREGRINE_ENABLE_CLUSTERING", "true")
+	t.Setenv("PEREGRINE_CLUSTERING_TICK", "24h")
+
+	if got := DeferredSet(); len(got) != 0 {
+		t.Errorf("DeferredSet = %v, want empty: clustering has no milestone left to defer to", got)
+	}
+	if _, err := Load(); err != nil {
+		t.Errorf("setting a retired variable must not be a startup error: %v", err)
 	}
 }
 

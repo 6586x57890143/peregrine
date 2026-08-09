@@ -95,48 +95,71 @@ func goldenCorpus() *fakeCorpus {
 	return f
 }
 
-// generate runs the whole loop the way legacy will, so the harness exercises the real
-// path rather than a single call to Next.
-func generate(g *Generator, prompt string, persona Persona, maxWords int) string {
+// generate is ONE attempt, mirroring legacy.generateSentenceAttempt: seed selection, the
+// length model, the dead-end jump. generateReply below adds the retry and the floor that
+// legacy.generateSentenceWithContext adds, and that is the function the harness prints.
+//
+// Deliberately mirrors the production caller rather than being a simplified version of
+// it, because the whole point is that reading these lines tells you what the channel will
+// look like.
+func generate(g *Generator, prompt string, persona Persona) []string {
 	promptWords := strings.Fields(prompt)
 
+	seedIn := SeedInput{PromptWords: promptWords}
+	seed := g.Seed(seedIn)
+	if seed == "" {
+		if len(promptWords) == 0 {
+			return nil
+		}
+		seed = promptWords[0]
+	}
+	words := strings.Fields(seed)
+
+	length := NewLength(g.src, g.params.MinWords, g.params.MaxWords)
+
 	s := &Step{
-		Prompt:     prompt,
-		PromptSet:  map[string]struct{}{},
-		RecentSet:  map[string]struct{}{},
-		Used:       map[string]int{},
-		Ngrams:     map[string]struct{}{},
-		CoreTopics: map[string]float64{},
-		NameAssoc:  map[string]corpus.TopicAssoc{},
-		MinWords:   4,
-		Persona:    persona,
+		Prompt:       prompt,
+		PromptSet:    map[string]struct{}{},
+		RecentSet:    map[string]struct{}{},
+		Used:         map[string]int{},
+		Ngrams:       map[string]struct{}{},
+		CoreTopics:   map[string]float64{},
+		NameAssoc:    map[string]corpus.TopicAssoc{},
+		Length:       length,
+		Persona:      persona,
+		Prefix:       append([]string{}, words...),
+		Sentence:     append([]string{}, words...),
+		CurrentTopic: seed,
 	}
 	for _, w := range promptWords {
 		s.PromptSet[w] = struct{}{}
+		s.CoreTopics[w] = 1.0
 	}
-	if len(promptWords) > 0 {
-		s.CurrentTopic = promptWords[len(promptWords)-1]
-		for _, w := range promptWords {
-			s.CoreTopics[w] = 1.0
+	for _, w := range words {
+		s.Used[w]++
+	}
+
+	for !length.Done(len(s.Sentence)) {
+		if len(s.Prefix) == 0 {
+			break
 		}
-	}
+		s.Position = float64(len(s.Sentence)) / float64(length.Max)
 
-	s.Prefix = append([]string{}, promptWords...)
-	s.Sentence = append([]string{}, promptWords...)
-
-	for len(s.Sentence) < maxWords {
-		s.Position = float64(len(s.Sentence)) / float64(maxWords)
 		next, err := g.Next(s)
-		if err != nil || next == "" {
+		if err != nil {
 			break
 		}
 		if next == EndToken {
-			if len(s.Sentence) < s.MinWords {
-				// M7a keeps legacy's floor. M7b replaces it with one length model.
-				break
-			}
 			break
 		}
+		if next == "" {
+			jump := g.Jump(seedIn, s.Sentence)
+			if jump == "" {
+				break
+			}
+			next = jump
+		}
+
 		s.Sentence = append(s.Sentence, next)
 		s.Used[next]++
 		s.Ngrams[next] = struct{}{}
@@ -151,7 +174,43 @@ func generate(g *Generator, prompt string, persona Persona, maxWords int) string
 			s.Prefix = s.Prefix[1:]
 		}
 	}
-	return strings.Join(s.Sentence, " ")
+
+	return s.Sentence
+}
+
+// generateReply is what a caller actually posts: the bounded re-seed and the two-word
+// floor from legacy.generateSentenceWithContext, on top of one or more attempts.
+//
+// Both belong here rather than only in legacy, because the harness exists to show what a
+// channel will look like. Without them it printed one-word lines like "roof" and
+// "coping", which the bot suppresses, and a harness that prints output the bot cannot
+// produce is worse than no harness.
+//
+// The re-seed is not the discard-and-retry that M7b deleted. That one threw away an end
+// token and continued from the same prefix, fighting the length decision; this abandons
+// the attempt and draws a different seed, which is the only response available when a
+// seed dead-ends on its first step because nothing it can reach is eligible.
+func generateReply(g *Generator, prompt string, persona Persona, styled bool) string {
+	var best []string
+	const attempts = 3
+	for range attempts {
+		words := generate(g, prompt, persona)
+		if len(words) > len(best) {
+			best = words
+		}
+		if len(best) >= g.params.MinWords {
+			break
+		}
+	}
+	if len(best) < 2 {
+		return ""
+	}
+
+	out := strings.Join(best, " ")
+	if styled {
+		out = g.Style(out, persona, false)
+	}
+	return out
 }
 
 func TestGenerateGolden(t *testing.T) {
@@ -172,13 +231,13 @@ func TestGenerateGolden(t *testing.T) {
 				g := New(f, p, seeded(0xC0FFEE, 0xBADF00D))
 				var lines []string
 				for range 3 {
-					lines = append(lines, generate(g, prompt, PersonaNeutral, 18))
+					lines = append(lines, generateReply(g, prompt, PersonaNeutral, false))
 				}
 				t.Logf("  %-16s -> %s", prompt, strings.Join(lines, " | "))
 			}
 
 			g := New(f, p, seeded(0xC0FFEE, 0xBADF00D))
-			t.Logf("  %-16s -> %s", "[roast] greg is", generate(g, "greg is", PersonaRoast, 18))
+			t.Logf("  %-16s -> %s", "[roast] greg is", generateReply(g, "greg is", PersonaRoast, true))
 		}
 	}
 }
@@ -195,7 +254,7 @@ func TestGoldenOutputIsReproducible(t *testing.T) {
 		g := New(f, p, seeded(5, 6))
 		out := make([]string, 0, 10)
 		for range 10 {
-			out = append(out, generate(g, "the bird", PersonaNeutral, 18))
+			out = append(out, generateReply(g, "the bird", PersonaNeutral, false))
 		}
 		return out
 	}
@@ -221,7 +280,7 @@ func TestGoldenOutputSkewsShort(t *testing.T) {
 	var total int
 	const runs = 60
 	for range runs {
-		total += len(strings.Fields(generate(g, "the bird", PersonaNeutral, 18)))
+		total += len(strings.Fields(generateReply(g, "the bird", PersonaNeutral, false)))
 	}
 	if avg := float64(total) / runs; avg > 14 {
 		t.Errorf("average generated length %.1f words, want well under the 18-word cap. "+
@@ -241,7 +300,7 @@ func TestGoldenOutputNeverLeaksASentinelOrASeparator(t *testing.T) {
 
 	for _, prompt := range []string{"the bird", "greg is", "ratio", "the server is"} {
 		for range 40 {
-			got := generate(g, prompt, PersonaRoast, 18)
+			got := generateReply(g, prompt, PersonaRoast, true)
 			if strings.Contains(got, EndToken) {
 				t.Fatalf("the end sentinel leaked into output: %q", got)
 			}
@@ -266,7 +325,7 @@ func TestGoldenEmoteShortcodesSurvive(t *testing.T) {
 
 	var found bool
 	for range 400 {
-		if strings.Contains(generate(g, ":birdstare:", PersonaNeutral, 18), ":birdstare:") {
+		if strings.Contains(generateReply(g, ":birdstare:", PersonaNeutral, false), ":birdstare:") {
 			found = true
 			break
 		}
@@ -287,7 +346,7 @@ func ExampleGenerator_Next() {
 		KNDiscount: 0.75, KNRawMix: 0.25, MinDistinctAuthors: 2}
 	g := New(f, p, seeded(1, 2))
 
-	next, _ := g.Next(&Step{Prefix: []string{"bird", "is"}, MinWords: 4})
+	next, _ := g.Next(&Step{Prefix: []string{"bird", "is"}, Length: Length{Min: 4, Max: 18, Target: 8}})
 	fmt.Println(next)
 	// Output: loose
 }

@@ -69,7 +69,7 @@ func params() markov.Params {
 }
 
 func step(prefix ...string) *markov.Step {
-	return &markov.Step{Prefix: prefix, Sentence: prefix, MinWords: 4}
+	return &markov.Step{Prefix: prefix, Sentence: prefix, Length: markov.Length{Min: 4, Max: 18, Target: 8}}
 }
 
 // TestGenerationAgainstARealCorpus is the end-to-end proof that the engine reads the
@@ -275,7 +275,7 @@ func TestRealCorpusOnlyEverReturnsACorpusToken(t *testing.T) {
 					got, err := g.Next(&markov.Step{
 						Prefix:   prefix,
 						Sentence: append([]string{}, prefix...),
-						MinWords: 4,
+						Length:   markov.Length{Min: 4, Max: 18, Target: 8},
 					})
 					if err != nil {
 						return err

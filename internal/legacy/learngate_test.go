@@ -71,6 +71,13 @@ func gateFixture(t *testing.T) *storage.Store {
 		KNRawMix:             0.25,
 		MinDistinctAuthors:   0,
 		PromptRelevanceBoost: 0.6,
+		// Length is not optional here: a zero MaxWords makes the length model cap every
+		// sentence at one word, so the generation tests would all pass while proving
+		// nothing. Two of them caught exactly that when these fields were first added.
+		MinWords:           4,
+		MaxWords:           18,
+		CooccurrenceWindow: 5,
+		RoastChance:        0.10,
 	}
 	gate = safety.NewGate(bl, slog.New(slog.NewTextHandler(io.Discard, nil)), false)
 
