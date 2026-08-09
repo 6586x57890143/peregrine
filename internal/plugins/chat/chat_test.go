@@ -1,10 +1,12 @@
 package chat
 
 import (
+	"bytes"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"io"
+	"log"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -100,10 +102,13 @@ func (g *fakeGames) Command(cmd, _, _ string, _ func(string) string) bool {
 	return g.consume
 }
 
-type fakeSpeaker struct{ reply string }
+type fakeSpeaker struct {
+	reply   string
+	outcome generate.Outcome
+}
 
-func (s fakeSpeaker) Sentence(string, bool, *generate.Memory, generate.EmojiResolver) (string, error) {
-	return s.reply, nil
+func (s fakeSpeaker) Sentence(string, bool, *generate.Memory, generate.EmojiResolver) (string, generate.Outcome, error) {
+	return s.reply, s.outcome, nil
 }
 
 // fixture wires a reactor over fakes and a real corpus.
@@ -597,5 +602,55 @@ func TestTheImageStepIsSkippedWhenTheFeatureIsOff(t *testing.T) {
 	if imgs.captured != 0 || imgs.reposts != 0 {
 		t.Errorf("the image feature was used with the flag off: captured=%d reposts=%d",
 			imgs.captured, imgs.reposts)
+	}
+}
+
+// TestADeclinedReplyExplainsItself is the pin for finding 32.
+//
+// The bot was addressed, classified the message correctly (the flags line in the log proved
+// it), decided it had nothing to say, and returned WITHOUT LOGGING ANYTHING. So a freshly
+// deployed bot looked like a broken trigger, and telling the two apart meant reading the
+// source. The autonomous poster logged the identical condition all along, which is what made
+// the omission visible.
+//
+// The bot staying silent is the design. The operator being unable to tell why is the bug.
+func TestADeclinedReplyExplainsItself(t *testing.T) {
+	cases := map[generate.Outcome][]string{
+		// Each reason has to point somewhere DIFFERENT, which is the whole reason the outcome
+		// is typed rather than a bool: "corpus empty" sends an operator to ingestion and
+		// "too short" sends them to the author gate.
+		generate.CorpusEmpty: {"corpus is empty", "ingestion"},
+		generate.TooShort:    {"word floor", "MIN_DISTINCT_AUTHORS"},
+	}
+
+	for outcome, wants := range cases {
+		t.Run(outcome.String(), func(t *testing.T) {
+			s, _, guard, _, _, _ := fixture(t)
+			s.speaker = fakeSpeaker{reply: "", outcome: outcome}
+
+			var buf bytes.Buffer
+			previous := log.Writer()
+			log.SetOutput(&buf)
+			t.Cleanup(func() { log.SetOutput(previous) })
+
+			r := message("hey peregrine")
+			r.flags["TEXT"] = true
+			r.flags["MENTIONED"] = true
+			s.stepReply(r)
+
+			if posts := guard.sent(); len(posts) != 0 {
+				t.Errorf("posted %v for an empty generation, want silence", posts)
+			}
+			got := buf.String()
+			if got == "" {
+				t.Fatal("declined a reply and logged NOTHING; that is the whole finding")
+			}
+			for _, want := range wants {
+				if !strings.Contains(got, want) {
+					t.Errorf("the log does not mention %q, so it does not tell the operator "+
+						"where to look:\n%s", want, got)
+				}
+			}
+		})
 	}
 }

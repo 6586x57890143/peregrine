@@ -89,9 +89,13 @@ type Voice interface {
 	Offer(channelID, messageID, authorID string, attachments []discordgo.MessageAttachment) bool
 }
 
-// Speaker produces a sentence.
+// Speaker produces a sentence, and says why when it does not.
+//
+// The Outcome is not decoration. An empty string used to mean "corpus empty" or "every
+// re-seed dead-ended" or "the author gate refused everything" with no way to tell, so a bot
+// that had learned 27 messages and stayed quiet reported nothing an operator could act on.
 type Speaker interface {
-	Sentence(prompt string, roast bool, mem *generate.Memory, emoji generate.EmojiResolver) (string, error)
+	Sentence(prompt string, roast bool, mem *generate.Memory, emoji generate.EmojiResolver) (string, generate.Outcome, error)
 }
 
 // Options are the dials this package reads.
@@ -516,12 +520,28 @@ func (s *Service) stepReply(r *reaction) bool {
 		}
 	}
 
-	reply, err := s.speaker.Sentence(prompt, roast, s.memories.For(m.ChannelID), s.emoji)
+	reply, outcome, err := s.speaker.Sentence(prompt, roast, s.memories.For(m.ChannelID), s.emoji)
 	if err != nil {
 		log.Printf("[ERR] reply generation failed: %v", err)
 		return false
 	}
 	if reply == "" {
+		// SAID OUT LOUD. This returned silently until finding 32, so the bot was addressed,
+		// classified the message correctly, decided it had nothing to say, and left no trace
+		// of the decision. The bot staying quiet is the design; the operator being unable to
+		// tell why is the bug, and on a fresh deploy it is the first question they have.
+		switch outcome {
+		case generate.CorpusEmpty:
+			log.Printf("[RESP] nothing to say to %s yet: the corpus is empty, so ingestion "+
+				"has not populated anything", m.Author.Username)
+		case generate.TooShort:
+			log.Printf("[RESP] nothing to say to %s: generation stayed under the %d-word floor. "+
+				"On a young corpus this is usually PEREGRINE_MIN_DISTINCT_AUTHORS refusing "+
+				"continuations only one person has said", m.Author.Username, 2)
+		case generate.Produced:
+			// Unreachable: Produced with an empty string would be a bug in generate.
+			log.Printf("[RESP] nothing to say to %s, and no reason was given", m.Author.Username)
+		}
 		return false
 	}
 
