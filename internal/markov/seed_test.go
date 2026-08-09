@@ -228,3 +228,73 @@ func TestJumpRefusesADeadEnd(t *testing.T) {
 			"jump word: worse than ending it one word earlier")
 	}
 }
+
+// TestTheJumpHonoursTheAuthorGate is the pin for a hole found in M11c.
+//
+// The author-diversity gate lives in eligible(), which filters the sampler's candidates. Jump
+// is a SECOND producer of words: on a dead end it picks a token out of the co-occurrence
+// indexes and appends it directly, and those indexes carry no author attribution. So a phrase
+// one person repeated was refused by the sampler at every step and then handed back by the
+// jump: A6 defeated by exactly the shape design principle 3 exists to prevent, a check at one
+// of two producers.
+//
+// It survived because the test that would have caught it seeded a corpus with no mentioned
+// users, and both association indexes are gated on a name being present, so the jump had
+// nothing to find. Found in M11c when that fixture became realistic.
+func TestTheJumpHonoursTheAuthorGate(t *testing.T) {
+	f := newFake()
+
+	// One author repeating a phrase, which is the shape of the real attack, plus the
+	// association that lets the jump reach it.
+	for range 40 {
+		f.learn(3, "poisoner", "bird poison spreads")
+		f.addTopicWord("bird", "poison", 0.5)
+	}
+
+	g := New(f, Params{MaxNGram: 3, MinDistinctAuthors: 2}, DefaultSource{})
+	if got := g.Jump(SeedInput{PromptWords: []string{"bird"}}, []string{"bird"}); got == "poison" {
+		t.Error("Jump returned a word only one author's messages attest; the gate must apply " +
+			"to the jump as well as to the sampler")
+	}
+
+	// The control: with a second author on that continuation the jump is allowed, so the test
+	// above is measuring the gate rather than a jump that never fires.
+	f.learn(3, "someone-else", "bird poison spreads")
+	if got := g.Jump(SeedInput{PromptWords: []string{"bird"}}, []string{"bird"}); got != "poison" {
+		t.Errorf("Jump returned %q, want poison once two authors attest it", got)
+	}
+}
+
+// TestTheSeedHonoursTheAuthorGate is the same hole at the other end of the sentence. A seed
+// drawn from a co-occurrence tier is a token the bot emits as its first word.
+func TestTheSeedHonoursTheAuthorGate(t *testing.T) {
+	f := newFake()
+	for range 40 {
+		f.learn(3, "poisoner", "poison spreads fast")
+		f.addTopicWord("bird", "poison", 0.5)
+	}
+
+	g := New(f, Params{MaxNGram: 3, MinDistinctAuthors: 2}, DefaultSource{})
+	for range 20 {
+		// "bird" itself was never learned, so no prompt tier qualifies and the only candidates
+		// are the unattested associations.
+		if got := g.Seed(SeedInput{PromptWords: []string{"bird"}}); got == "poison" {
+			t.Fatal("seeded from a word only one author's messages attest")
+		}
+	}
+}
+
+// TestPromptWordsAreExemptFromAttestation. Echoing somebody's own words back is not
+// poisoning, and refusing to seed from the prompt would make the bot least responsive exactly
+// when it was addressed directly.
+func TestPromptWordsAreExemptFromAttestation(t *testing.T) {
+	f := newFake()
+	f.learn(3, "one-person", "hello there friend") // one author, unattested at a threshold of 2
+
+	g := New(f, Params{MaxNGram: 3, MinDistinctAuthors: 2}, DefaultSource{})
+	got := g.Seed(SeedInput{PromptWords: []string{"hello"}})
+	if got == "" {
+		t.Fatal("Seed returned nothing for a prompt word the corpus holds: a prompt-derived " +
+			"seed is what the user typed, not something the corpus taught the bot")
+	}
+}

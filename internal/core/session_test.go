@@ -127,3 +127,77 @@ func TestNewSessionRequestsTheIntentsThatMatter(t *testing.T) {
 		}
 	}
 }
+
+// TestCustomEmotesResolveThroughTheStateCache is the other half of the emote story.
+//
+// internal/markov pins that the engine can EMIT a :shortcode:. What was never pinned is that
+// the shortcode then becomes a real emote: SessionEmoji walks s.State.Guilds, and that slice was
+// empty for the entire life of this bot because the session never requested IntentsGuilds, so
+// the resolver had never once succeeded and peregrine had never spoken in the server's own
+// emotes (SPEC.md section 8, finding 7). M3 requested the intent; nothing until M11c checked the
+// code that benefits.
+//
+// In a meme server the server's own emotes are most of the register, which makes this the
+// largest single improvement to how the output READS in the whole restructure, and it had no
+// test at all.
+func TestCustomEmotesResolveThroughTheStateCache(t *testing.T) {
+	s := &discordgo.Session{State: discordgo.NewState()}
+	if err := s.State.GuildAdd(&discordgo.Guild{
+		ID: "g1",
+		Emojis: []*discordgo.Emoji{
+			{ID: "111111111111111111", Name: "peepohappy"},
+			{ID: "222222222222222222", Name: "birdspin", Animated: true},
+		},
+	}); err != nil {
+		t.Fatalf("GuildAdd: %v", err)
+	}
+
+	resolver := SessionEmoji(s)
+
+	got, ok := resolver.ResolveEmoji("peepohappy")
+	if !ok {
+		t.Fatal("a static emote in the state cache did not resolve")
+	}
+	if got != "<:peepohappy:111111111111111111>" {
+		t.Errorf("static emote resolved to %q", got)
+	}
+
+	got, ok = resolver.ResolveEmoji("birdspin")
+	if !ok {
+		t.Fatal("an animated emote in the state cache did not resolve")
+	}
+	if got != "<a:birdspin:222222222222222222>" {
+		t.Errorf("animated emote resolved to %q, want the <a:...> form", got)
+	}
+}
+
+// TestAnUnknownShortcodeIsNotResolved. A word between colons that no guild has an emote for is
+// ordinary text, and the caller leaves it alone: mangling it would be worse than ignoring it,
+// because the corpus is full of things people typed.
+func TestAnUnknownShortcodeIsNotResolved(t *testing.T) {
+	s := &discordgo.Session{State: discordgo.NewState()}
+	if err := s.State.GuildAdd(&discordgo.Guild{ID: "g1"}); err != nil {
+		t.Fatalf("GuildAdd: %v", err)
+	}
+
+	if got, ok := SessionEmoji(s).ResolveEmoji("notanemote"); ok {
+		t.Errorf("resolved an unknown shortcode to %q", got)
+	}
+}
+
+// TestTheEmojiResolverSurvivesAnEmptyState pins the fail-safe direction. A session with no state
+// cache (before READY, or in a test) must report false rather than dereference nil: custom
+// emotes are one optional flourish and losing them must not take a reply down.
+func TestTheEmojiResolverSurvivesAnEmptyState(t *testing.T) {
+	for name, s := range map[string]*discordgo.Session{
+		"nil session": nil,
+		"no state":    {},
+		"empty state": {State: discordgo.NewState()},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, ok := SessionEmoji(s).ResolveEmoji("peepohappy"); ok {
+				t.Error("resolved an emote against a session that cannot know about one")
+			}
+		})
+	}
+}
