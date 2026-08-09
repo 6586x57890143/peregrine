@@ -82,13 +82,24 @@ func goldenCorpus() *fakeCorpus {
 	f.names["greg"] = true
 
 	// A few associations, so the topic terms have something to say.
-	for _, pair := range [][2]string{
-		{"bird", "loose"}, {"bird", "roof"}, {"bird", "moment"}, {"bird", "server"},
-		{"greg", "coping"}, {"greg", "cringe"}, {"server", "doomed"},
+	//
+	// THE POSITIONS ARE REALISTIC RATHER THAN ALL 0.5, and that is load-bearing now. Seed
+	// selection prefers an association that tends to appear EARLY, because it is choosing where
+	// a sentence starts, and a fixture where every word claims to sit dead centre cannot show
+	// whether that works. These mirror where each word actually falls in the lines above:
+	// "greg" opens messages, "loose" and "coping" sit mid-clause, "doomed" ends them.
+	for _, a := range []struct {
+		word, assoc string
+		pos         float64
+	}{
+		{"bird", "loose", 0.65}, {"bird", "roof", 0.85}, {"bird", "moment", 0.5},
+		{"bird", "server", 0.8}, {"bird", "greg", 0.0},
+		{"greg", "coping", 0.7}, {"greg", "cringe", 0.7}, {"greg", "clown", 0.85},
+		{"server", "doomed", 0.9},
 	} {
 		for range 4 {
-			f.addTopicWord(pair[0], pair[1], 0.5)
-			f.addNameTopic(pair[0], pair[1], 0.5)
+			f.addTopicWord(a.word, a.assoc, a.pos)
+			f.addNameTopic(a.word, a.assoc, a.pos)
 		}
 	}
 
@@ -105,7 +116,36 @@ func goldenCorpus() *fakeCorpus {
 func generate(g *Generator, prompt string, persona Persona) []string {
 	promptWords := strings.Fields(prompt)
 
-	seedIn := SeedInput{PromptWords: promptWords}
+	// THE NAMES IN THE PROMPT, which this harness did not resolve at all until now. Names and
+	// NameTokens were both empty, so seed tiers 2, 3 and 5, the NameAssoc logit and the
+	// PromptName logit had never once fired in a printed sample: every name-aware part of the
+	// engine was invisible to the only instrument for judging it. Mirrors what
+	// generate.attempt does, canonical form and surface form both.
+	var names, nameTokens []string
+	promptNames := map[string]struct{}{}
+	nameAssoc := map[string]corpus.TopicAssoc{}
+	for _, word := range promptWords {
+		if !g.corpus.IsName(word) {
+			continue
+		}
+		names = append(names, word)
+		if _, dup := promptNames[word]; !dup {
+			promptNames[word] = struct{}{}
+			nameTokens = append(nameTokens, word)
+		}
+		found, err := g.corpus.NameTopicsFor(word)
+		if err != nil {
+			continue
+		}
+		for w, data := range found {
+			existing := nameAssoc[w]
+			existing.Count += data.Count
+			existing.PosSum += data.PosSum
+			nameAssoc[w] = existing
+		}
+	}
+
+	seedIn := SeedInput{PromptWords: promptWords, Names: names, NameTokens: nameTokens}
 	seed := g.Seed(seedIn)
 	if seed == "" {
 		if len(promptWords) == 0 {
@@ -124,7 +164,8 @@ func generate(g *Generator, prompt string, persona Persona) []string {
 		Used:         map[string]int{},
 		Ngrams:       map[string]struct{}{},
 		CoreTopics:   map[string]float64{},
-		NameAssoc:    map[string]corpus.TopicAssoc{},
+		NameAssoc:    nameAssoc,
+		PromptNames:  promptNames,
 		Length:       length,
 		Persona:      persona,
 		Prefix:       append([]string{}, words...),
@@ -139,6 +180,10 @@ func generate(g *Generator, prompt string, persona Persona) []string {
 		s.Used[w]++
 	}
 
+	// Mirrors the production caller: whether the sentence CHOSE to end decides whether its
+	// trailing function words are trimmed.
+	chose := false
+
 	for !length.Done(len(s.Sentence)) {
 		if len(s.Prefix) == 0 {
 			break
@@ -150,10 +195,11 @@ func generate(g *Generator, prompt string, persona Persona) []string {
 			break
 		}
 		if next == EndToken {
+			chose = true
 			break
 		}
 		if next == "" {
-			jump := g.Jump(seedIn, s.Sentence)
+			jump := g.Jump(seedIn, s)
 			if jump == "" {
 				break
 			}
@@ -175,6 +221,9 @@ func generate(g *Generator, prompt string, persona Persona) []string {
 		}
 	}
 
+	if !chose {
+		s.Sentence = TrimDangling(s.Sentence)
+	}
 	return s.Sentence
 }
 
@@ -215,7 +264,7 @@ func generateReply(g *Generator, prompt string, persona Persona, styled bool) st
 
 func TestGenerateGolden(t *testing.T) {
 	f := goldenCorpus()
-	prompts := []string{"the bird", "greg is", "the server is", "bird moment"}
+	prompts := []string{"the bird", "greg is", "the server is", "bird moment", "greg", "what about greg"}
 
 	for _, temp := range []float64{0.7, 1.0, 1.6, 2.5} {
 		for _, topK := range []int{0, 8, 40} {
