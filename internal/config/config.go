@@ -182,6 +182,17 @@ type Config struct {
 	WordGameMaxLength         int           // PEREGRINE_WORDGAME_MAX_LENGTH
 	WordGameSweepTick         time.Duration // PEREGRINE_WORDGAME_SWEEP_TICK
 
+	// Corpus snapshots. Off by default, because there is no safe guess for a path and
+	// writing megabytes somewhere the operator did not choose is worse than not backing up.
+	//
+	// In a container BackupDir MUST be on the mounted volume: the image runs read_only, so
+	// anywhere else fails on the first write, and a relative path resolves against the
+	// distroless working directory. Each snapshot is a full copy, so the disk cost is
+	// BackupKeep times the corpus size on the same volume as the corpus.
+	BackupDir  string        // PEREGRINE_BACKUP_DIR
+	BackupTick time.Duration // PEREGRINE_BACKUP_TICK
+	BackupKeep int           // PEREGRINE_BACKUP_KEEP
+
 	// Transcription. Off by default, and that default deliberately differs from
 	// the old in-code constant, which was true: transcription shells out to
 	// ffmpeg and whisper-cli and needs a 465 MiB model, none of which exist in a
@@ -224,9 +235,6 @@ var deferredVars = map[string]string{
 	// never exist is worse than a deferred one: the deferred warning at least promises
 	// a milestone. An operator who still has either set gets no warning now, which is
 	// correct, because there is nothing left for them to be waiting for.
-	"PEREGRINE_BACKUP_DIR":  "M13",
-	"PEREGRINE_BACKUP_TICK": "M13",
-	"PEREGRINE_BACKUP_KEEP": "M13",
 	// These three configure a transcription ENGINE, and M12 shipped the seam rather than an
 	// engine: no implementation ships in this repository, because the one peregrine had needed
 	// a 465 MiB model and platform binaries that exist in no deployed environment. They stay
@@ -413,6 +421,10 @@ func Load() (*Config, error) {
 		// trade worth making: a puzzle ending a few seconds late is invisible, whereas the
 		// goroutine per game this replaces outlived shutdown.
 		WordGameSweepTick: l.dur("PEREGRINE_WORDGAME_SWEEP_TICK", 5*time.Second, time.Second, time.Minute),
+
+		BackupDir:  l.str("PEREGRINE_BACKUP_DIR", ""),
+		BackupTick: l.dur("PEREGRINE_BACKUP_TICK", 24*time.Hour, time.Minute, 30*24*time.Hour),
+		BackupKeep: l.intVal("PEREGRINE_BACKUP_KEEP", 7, 1, 1000),
 
 		EnableTranscription: l.boolVal("PEREGRINE_ENABLE_TRANSCRIPTION", false),
 		TranscriptionQueue:  l.intVal("PEREGRINE_TRANSCRIPTION_QUEUE", 32, 1, 10_000),
