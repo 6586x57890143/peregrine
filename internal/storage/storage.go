@@ -46,17 +46,22 @@ const (
 	bucketImage      = "image"       // <msgID be64> NUL <url>         -> author be64
 	bucketStats      = "stats"       // <user id>                      -> JSON corpus.WeeklyStat
 	bucketLeaderfoo  = "leaderboard" // fixed key                      -> JSON
-	bucketCluster    = "cluster"     // <cluster id>                   -> JSON
 	bucketCursor     = "cursor"      // <channel id>                   -> snowflake be64
 	bucketMeta       = "meta"        // schema_version, counters
 )
 
 // allBuckets is the set Open creates. Listed once so adding a bucket cannot forget
 // the creation step, which used to be a hand-maintained slice in main().
+//
+// "cluster" was here until M13, a milestone after clustering was deleted: Open kept creating it
+// and Reader.Status kept counting it, so a structure nothing could write still had a row in the
+// status line. An existing corpus keeps the empty bucket, which costs one page and is not worth a
+// migration; a new one never gets it. That is the shape worth noticing rather than the bucket:
+// deleting a feature is not finished until the layout stops making room for it.
 var allBuckets = []string{
 	bucketNgram, bucketNgramAuth, bucketKNSucc, bucketKNPre, bucketKNPreCount,
 	bucketTopic, bucketTopicWord, bucketNameTopic, bucketName,
-	bucketHistory, bucketImage, bucketStats, bucketLeaderfoo, bucketCluster,
+	bucketHistory, bucketImage, bucketStats, bucketLeaderfoo,
 	bucketCursor, bucketMeta,
 }
 

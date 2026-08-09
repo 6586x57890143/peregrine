@@ -982,36 +982,8 @@ func TestBlobRoundTrip(t *testing.T) {
 	}
 }
 
-func TestReplaceBlobsIsAtomicSwap(t *testing.T) {
-	s := dbtest.Store(t)
-
-	if err := s.Update(func(w *storage.Writer) error {
-		return w.ReplaceBlobs(storage.BlobCluster, map[string][]byte{"a": []byte("1"), "b": []byte("2")})
-	}); err != nil {
-		t.Fatalf("ReplaceBlobs: %v", err)
-	}
-	if err := s.Update(func(w *storage.Writer) error {
-		return w.ReplaceBlobs(storage.BlobCluster, map[string][]byte{"c": []byte("3")})
-	}); err != nil {
-		t.Fatalf("ReplaceBlobs second: %v", err)
-	}
-
-	if err := s.View(func(r *storage.Reader) error {
-		seen := map[string]string{}
-		if err := r.ForEachBlob(storage.BlobCluster, func(k string, v []byte) error {
-			seen[k] = string(v)
-			return nil
-		}); err != nil {
-			return err
-		}
-		if len(seen) != 1 || seen["c"] != "3" {
-			t.Errorf("after a replace the bucket holds %v, want only c=3", seen)
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-}
+// TestReplaceBlobsIsAtomicSwap is gone with the methods it covered. ForEachBlob and ReplaceBlobs
+// existed for the clustering pass and nothing else, and M13 removed them along with the bucket.
 
 func TestNameRoundTrip(t *testing.T) {
 	s := dbtest.Store(t)

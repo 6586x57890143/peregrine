@@ -187,7 +187,7 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 		Dispatcher: dispatcher,
 		Gate:       gate,
 	}, log)
-	if err := registerServices(registry, cfg, session, store, gate, log); err != nil {
+	if err := registerServices(registry, cfg, session, store, gate, dispatcher, log); err != nil {
 		return err
 	}
 
