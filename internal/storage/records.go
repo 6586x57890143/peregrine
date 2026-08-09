@@ -131,8 +131,20 @@ func (w *Writer) IncTopic(word string) error {
 		return nil
 	}
 	b := w.bucket(bucketTopic)
-	return b.Put([]byte(word), encodeUint64(decodeUint64(b.Get([]byte(word)))+1))
+	if err := b.Put([]byte(word), encodeUint64(decodeUint64(b.Get([]byte(word)))+1)); err != nil {
+		return err
+	}
+	return w.addCounter(metaTopicTotal, 1)
 }
+
+// TotalTopicCount returns the sum of every topic count, which is total unigram
+// occurrences and therefore the denominator of raw unigram probability.
+//
+// Kneser-Ney's base case needs it for the raw half of PEREGRINE_KN_RAW_MIX, and it
+// is a counter for the same reason every other total here is: the alternative is a
+// cursor scan over the whole vocabulary, and the base case is evaluated for every
+// candidate at every step of every generated sentence.
+func (r *Reader) TotalTopicCount() uint64 { return r.counter(metaTopicTotal) }
 
 // TopicWord returns a word-to-association co-occurrence record.
 func (r *Reader) TopicWord(word, assoc string) (corpus.TopicAssoc, error) {

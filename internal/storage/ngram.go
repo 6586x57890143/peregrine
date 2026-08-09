@@ -41,6 +41,55 @@ func (r *Reader) Successors(prefix string) ([]corpus.Successor, error) {
 	return out, nil
 }
 
+// PrefixTotal returns the sum of every continuation count for a prefix, which is
+// c(prefix, .) and therefore the normalizer of the discounted term in interpolated
+// Kneser-Ney.
+//
+// It is a cursor scan and it is deliberately NOT a stored counter, which is the one
+// place in this layer where the usual "keep a counter, never walk" rule is
+// consciously inverted. Keeping it as a counter would mean an unconditional read and
+// write of the kn_succ value on every n-gram of every message, where that bucket is
+// currently touched only on a first sighting. That is roughly a twenty percent
+// increase in steady-state write work, paid inside bbolt's single write transaction
+// which serializes all ingestion, in exchange for removing a sequential scan from a
+// read path where the reader is a human waiting for a reply.
+//
+// The scan is cheap because it is sequential over a contiguous key range in a warm
+// mmap and it only sums eight-byte values: it does no allocation and touches no
+// token. The expensive part of a generation step is scoring candidates, not
+// enumerating them. The caller memoizes per generated sentence, which matters
+// because the low-order contexts are both the most expensive to scan and the most
+// likely to repeat.
+//
+// Distinct successors, N1+(prefix .), is a point lookup via KNStats and stays that
+// way: unlike the total it cannot be derived without visiting every key anyway, so
+// it is the half worth storing.
+func (r *Reader) PrefixTotal(prefix string) uint64 {
+	if prefix == "" {
+		// Refused explicitly rather than left to work by accident. It happens to
+		// return zero anyway, because LearnNgram refuses an empty prefix so no key
+		// begins with the separator, but that is a property of another function and
+		// this reads as "sum every n-gram in the corpus" to anyone scanning it.
+		return 0
+	}
+	b := r.bucket(bucketNgram)
+	if b == nil {
+		return 0
+	}
+	seek, limit, err := ngramPrefixRange(prefix)
+	if err != nil {
+		return 0
+	}
+
+	var total uint64
+	c := b.Cursor()
+	for k, v := c.Seek(seek); k != nil && bytes.Compare(k, limit) < 0; k, v = c.Next() {
+		count, _ := decodeNgram(v)
+		total += count
+	}
+	return total
+}
+
 // HasSuccessors reports whether a prefix has any continuation at all.
 //
 // One cursor Seek and one comparison, no allocation of the successor list. It
