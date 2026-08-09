@@ -105,9 +105,16 @@ func (g *fakeGames) Command(cmd, _, _ string, _ func(string) string) bool {
 type fakeSpeaker struct {
 	reply   string
 	outcome generate.Outcome
+
+	// What it was asked for, so the reply step's decisions are observable rather than
+	// inferred from whether something was posted.
+	prompts []string
+	roasts  []bool
 }
 
-func (s fakeSpeaker) Sentence(string, bool, *generate.Memory, generate.EmojiResolver) (string, generate.Outcome, error) {
+func (s *fakeSpeaker) Sentence(prompt string, roast bool, _ *generate.Memory, _ generate.EmojiResolver) (string, generate.Outcome, error) {
+	s.prompts = append(s.prompts, prompt)
+	s.roasts = append(s.roasts, roast)
 	return s.reply, s.outcome, nil
 }
 
@@ -140,7 +147,7 @@ func fixture(t *testing.T) (*Service, *storage.Store, *fakeGuard, *fakeGames, *f
 		Gate:     gate,
 		Guard:    guard,
 		Learner:  learner,
-		Speaker:  fakeSpeaker{reply: "the bird is loose"},
+		Speaker:  &fakeSpeaker{reply: "the bird is loose"},
 		Memories: generate.NewMemories(0),
 		Activity: act,
 		Aggro:    &fakeAggro{},
@@ -154,7 +161,11 @@ func fixture(t *testing.T) (*Service, *storage.Store, *fakeGuard, *fakeGames, *f
 
 func chatOptions() Options {
 	return Options{
-		SelfMention:  regexp.MustCompile(`(?i)\bperegrine\b`),
+		// The PRODUCTION default from internal/config, verbatim, so these tests exercise what
+		// actually ships rather than a narrower pattern invented here. The fixture carried
+		// `\bperegrine\b` until the keyword tests were written, which silently meant nothing
+		// covered the "bird" half of the trigger at all.
+		SelfMention:  regexp.MustCompile(`(?i)\b(peregrine|bird)\b`),
 		RoastChance:  0.1,
 		EnableImages: true,
 		EnableVoice:  false,
@@ -532,7 +543,7 @@ func TestTheReplyStepOnlyFiresWhenAddressed(t *testing.T) {
 // produce it, and silence is what this bot does anyway when it decides not to answer.
 func TestAnEmptyGenerationPostsNothing(t *testing.T) {
 	s, _, guard, _, _, _ := fixture(t)
-	s.speaker = fakeSpeaker{reply: ""}
+	s.speaker = &fakeSpeaker{reply: ""}
 
 	r := message("hey peregrine")
 	r.flags["TEXT"] = true
@@ -626,7 +637,7 @@ func TestADeclinedReplyExplainsItself(t *testing.T) {
 	for outcome, wants := range cases {
 		t.Run(outcome.String(), func(t *testing.T) {
 			s, _, guard, _, _, _ := fixture(t)
-			s.speaker = fakeSpeaker{reply: "", outcome: outcome}
+			s.speaker = &fakeSpeaker{reply: "", outcome: outcome}
 
 			var buf bytes.Buffer
 			previous := log.Writer()
@@ -650,6 +661,81 @@ func TestADeclinedReplyExplainsItself(t *testing.T) {
 					t.Errorf("the log does not mention %q, so it does not tell the operator "+
 						"where to look:\n%s", want, got)
 				}
+			}
+		})
+	}
+}
+
+// TestTheKeywordTriggerRepliesWithoutAMention covers what the operator calls the main way to
+// use the bot: saying "peregrine" or "bird" in ordinary conversation, with no @mention and no
+// reply, and getting an answer.
+//
+// It had NO test until now, which is the gap worth closing rather than the behaviour. The path
+// spans three files (config compiles the pattern, cmd/bot hands it to the reactor, the reactor
+// classifies and then replies) and M11c moved the middle of it between packages. Nothing in the
+// suite would have noticed if the flag had been dropped in that move: the reply step would just
+// have stopped firing, which reads as an empty corpus.
+func TestTheKeywordTriggerRepliesWithoutAMention(t *testing.T) {
+	for _, word := range []string{"peregrine", "bird", "PEREGRINE", "the Bird is loose"} {
+		t.Run(word, func(t *testing.T) {
+			s, _, guard, _, _, _ := fixture(t)
+			speaker := &fakeSpeaker{reply: "the server is doomed"}
+			s.speaker = speaker
+
+			r := message("has anyone seen " + word + " today")
+			s.stepClassify(r)
+
+			if !r.flags["SELF_MENTION_KEYWORD"] {
+				t.Fatalf("%q did not set SELF_MENTION_KEYWORD; the pattern is not reaching the "+
+					"reactor", word)
+			}
+			if r.flags["MENTIONED"] || r.flags["REPLY_TO_BOT"] {
+				t.Fatal("the fixture accidentally mentioned the bot, so this proves nothing " +
+					"about the keyword path on its own")
+			}
+
+			if s.stepReply(r) {
+				t.Error("the reply step consumed the message; only a command may consume")
+			}
+			if posts := guard.sent(); len(posts) != 1 {
+				t.Fatalf("posts = %v, want one reply to a keyword mention", posts)
+			}
+
+			// Overheard rather than addressed, so it ALWAYS roasts. That is a decision, not a
+			// chance: the bot is being talked about and answers self-referentially.
+			if len(speaker.roasts) != 1 || !speaker.roasts[0] {
+				t.Errorf("roast = %v, want true: an overheard self-mention always roasts",
+					speaker.roasts)
+			}
+			// And the prompt is self-referential rather than the user's sentence.
+			if len(speaker.prompts) != 1 || !strings.Contains(speaker.prompts[0], "peregrine") {
+				t.Errorf("prompt = %q, want a self-referential one", speaker.prompts)
+			}
+		})
+	}
+}
+
+// TestOrdinaryChatDoesNotTriggerAReply is the negative control. Without it the test above
+// would pass just as well against a reactor that replied to everything, which would be the
+// opposite bug and a far more annoying one.
+func TestOrdinaryChatDoesNotTriggerAReply(t *testing.T) {
+	for _, content := range []string{
+		"has anyone seen the cat today",
+		"birdsong is nice actually", // no word boundary, so the pattern must not match
+		"rebirth",
+		"",
+	} {
+		t.Run(content, func(t *testing.T) {
+			s, _, guard, _, _, _ := fixture(t)
+
+			r := message(content)
+			s.stepClassify(r)
+			if r.flags["SELF_MENTION_KEYWORD"] {
+				t.Errorf("%q set SELF_MENTION_KEYWORD; the pattern is too loose", content)
+			}
+			s.stepReply(r)
+			if posts := guard.sent(); len(posts) != 0 {
+				t.Errorf("replied to ordinary chat: %v", posts)
 			}
 		})
 	}
