@@ -532,6 +532,18 @@ Verified against the source. Ranked by consequence. Numbers are referenced from 
 
     The consequence is the one that matters: setting `PEREGRINE_ENABLE_AUTONOMOUS_POST=true` produced **nothing** unless word games happened to be enabled too, which they were not by default. That is the third distinct way this feature has been dead, after the compile-time constant and the empty allowlist, and it is the one that would have survived an operator carefully setting both of the variables the documentation named.
 
+**Found on the first production deploy**
+
+32. **The reply path declined silently, so a correctly working bot was indistinguishable from a broken one.** `stepReply` ended with `if reply == "" { return false }` and no log line. On a freshly deployed bot every trigger therefore looked dead: the operator addressed it, nothing happened, and nothing in the log said why.
+
+    Everything upstream was working and the log already proved it. `flags: map[SELF_MENTION_KEYWORD:true TEXT:true]` means the content arrived and the pattern matched; `[LEARNED] ... history=27` means ingestion was running. The bot had simply generated nothing and kept that to itself.
+
+    The cause was the corpus being minutes old against `PEREGRINE_MIN_DISTINCT_AUTHORS` at its default of 2, which is the control working exactly as designed (A6), made stricter by finding 31's widening of the gate to the seed and the jump. So the behaviour was right and the reporting was absent, which is the worse half: an operator cannot distinguish "wait" from "your configuration is wrong".
+
+    **The asymmetry is what makes it a defect rather than a missing nicety.** `autopost.post` logged the identical condition (`Generated message is empty, skipping`) from the day it was written. Two callers of one function, same decision, one explains itself. The path that stayed quiet is the one a user actually exercises.
+
+    `generate.Sentence` returns a typed `Outcome` now, because a bare "generated nothing" would have left the operator where they started: `CorpusEmpty` points at ingestion and `TooShort` points at the author gate, and those are different investigations. The rule worth keeping is narrower than "log more": **the bot staying silent is a feature and the operator staying uninformed is a bug**, and silence-on-purpose needs a reason attached at the point the decision is made.
+
 **Found during M11c, and it is the most serious finding since A1**
 
 31. **The author-diversity gate covered the sampler and not the two other producers of words.** `PEREGRINE_MIN_DISTINCT_AUTHORS` is the strongest single anti-poisoning control in the bot: a continuation must have come from `k` different people before the bot will generate it, which converts the attack from persistence into collusion (A6). It was applied in `eligible()`, which filters the candidates the sampler chooses between.
