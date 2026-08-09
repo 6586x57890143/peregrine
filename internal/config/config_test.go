@@ -1,6 +1,7 @@
 package config
 
 import (
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -369,21 +370,43 @@ func TestDeferredSet(t *testing.T) {
 		t.Fatalf("DeferredSet with nothing set = %v, want empty", got)
 	}
 
-	// Two that are still deferred. This list has had to be rewritten twice now, once
-	// per milestone that promoted its entries: TOP_K and KN_RAW_MIX went live in M7a,
-	// MAX_WORDS in M7b. That churn is the mechanism working, and it is exactly the
-	// transition TestDeferredVarsAreNotAlsoLive below polices.
-	t.Setenv("PEREGRINE_BACKUP_KEEP", "7")
-	t.Setenv("PEREGRINE_IGNORE_CHANNELS", "123")
+	// The variables under test are taken FROM the map rather than named here, and that
+	// is a deliberate change of approach: hardcoded names needed editing three
+	// milestones running, once for each entry that graduated to a live field (TOP_K and
+	// KN_RAW_MIX in M7a, MAX_WORDS in M7b, IGNORE_CHANNELS in M10a). Each edit was
+	// noise, and an edit made under "this test is failing for a boring reason" is
+	// exactly when a real assertion gets weakened by accident.
+	//
+	// It is not tautological. What is being asserted is the behaviour of DeferredSet:
+	// that it reports the variables that are SET rather than all of them, that each
+	// entry carries its milestone, and that the result is sorted so the startup warning
+	// is stable rather than reordering per run on Go's randomized map iteration. None of
+	// that follows from the map's contents.
+	if len(deferredVars) < 2 {
+		t.Skip("fewer than two deferred variables remain, so ordering cannot be checked. " +
+			"When the map empties, delete this test along with the mechanism")
+	}
+
+	names := make([]string, 0, len(deferredVars))
+	for name := range deferredVars {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	first, second := names[0], names[1]
+
+	t.Setenv(first, "x")
+	t.Setenv(second, "x")
 
 	got := DeferredSet()
 	if len(got) != 2 {
-		t.Fatalf("DeferredSet = %v, want 2 entries", got)
+		t.Fatalf("DeferredSet = %v, want exactly the 2 variables that are set out of %d "+
+			"deferred ones", got, len(deferredVars))
 	}
-	// Sorted, so the log line is stable rather than reordering per run on Go's
-	// randomized map iteration.
-	if got[0] != "PEREGRINE_BACKUP_KEEP (M13)" || got[1] != "PEREGRINE_IGNORE_CHANNELS (M10)" {
-		t.Errorf("DeferredSet = %v, want sorted entries carrying their milestone", got)
+	wantFirst := first + " (" + deferredVars[first] + ")"
+	wantSecond := second + " (" + deferredVars[second] + ")"
+	if got[0] != wantFirst || got[1] != wantSecond {
+		t.Errorf("DeferredSet = %v, want [%q %q]: sorted, each carrying its milestone",
+			got, wantFirst, wantSecond)
 	}
 }
 
