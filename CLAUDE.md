@@ -203,7 +203,21 @@ Every runtime path used to be resolved against the working directory, so startin
 
 ### Failures in one feature must not take down the bot
 
-The dictionary load used to be `log.Fatalf`, so a missing 64 KB word list killed learning, generation, replies and everything else along with word games. It now logs a warning and sets `wordGamesAvailable = false`. Treat this as the general rule: peregrine is a bag of loosely related engagement behaviors, and exactly one of them failing should disable that one. `log.Fatal` is for "the token is missing" and "the corpus will not open", nothing else.
+The dictionary load used to be `log.Fatalf`, so a missing 64 KB word list killed learning, generation, replies and everything else along with word games. It now logs a warning and the `Manager` is left with a nil dictionary, so `Available()` reports false and every entry point declines. Treat this as the general rule: peregrine is a bag of loosely related engagement behaviors, and exactly one of them failing should disable that one. `log.Fatal` is for "the token is missing" and "the corpus will not open", nothing else.
+
+### Word games: `internal/wordgame` owns the game, legacy does the talking
+
+**The Manager takes no session and performs no I/O.** It returns what should be said or deleted and the caller sends it through the guard, so a word-game announcement cannot skip mention suppression or the emit gate. That is also what makes the whole game testable without a gateway connection.
+
+**One sweep, not a goroutine per game.** Every started game used to spawn up to three: one to expire it after 60 seconds and one per announcement to delete it 30 seconds later. None took a context, so after shutdown they woke against a closed session, and the count was bounded only by how often people played. `Manager.Expired` and `Manager.DueDeletions` are swept by one `core.RunLoop`, which makes the loop panic-isolated and context-bound for free. The cost is that a game can outlive its deadline by up to one tick, which is invisible.
+
+**The scramble cannot recurse to death, and there are two independent reasons.** It recursed whenever a shuffle reproduced the original word, with no depth limit, so a word whose letters are all identical recursed until the stack died. `LoadDictionary` now rejects words with fewer than two distinct letters, and `scramble` bounds its attempts and falls back to a rotation. Both, because the first depends on the operator's word list and the second does not. It was unreachable with the embedded dictionary and reachable with a custom one, which is the worst combination: it could only ever have fired in production.
+
+**The leaderboard's mutex is unexported and its marshalling happens under it.** The old struct exported the mutex on a type that gets JSON-marshalled to be persisted, and the marshalling ran outside the lock while `AddWin` held it: concurrent map read and write, which in Go is a **fatal** runtime error, not a recoverable panic. `MarshalJSON` and `UnmarshalJSON` are the only way in.
+
+**The weekly reset compares week boundaries and catches up.** It asked `pool.ntp.org` what day it was, hourly, and reset only during one hour on Monday, so a failed query or downtime across Monday morning skipped a whole week (finding 17). A bot that was off all Monday now resets on its first tick back. The display derives the next reset from the same boundary, where it used to compute it from the host clock while the reset consulted NTP.
+
+**The pre-M11 leaderboard format is still read**, and that asymmetry with the corpus is deliberate: `storage.Open` refuses an old corpus outright because a corpus is re-derivable from Discord history, whereas a week of wins is not re-derivable from anything.
 
 ### Ingestion asks "what is new", not "what have I forgotten"
 
