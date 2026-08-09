@@ -214,6 +214,20 @@ func encodeSnowflake(id string) ([]byte, error) {
 	return buf, nil
 }
 
+// decodeSnowflake reverses encodeSnowflake.
+//
+// It only exists because ingest cursors are the first thing to READ a snowflake back
+// out: history keys are only ever tested for existence, so nothing needed the reverse
+// direction until now. A short or empty value returns "" rather than a bogus ID, since
+// the caller's next move is to treat "" as "never read", which is the safe answer for a
+// value that cannot be understood.
+func decodeSnowflake(v []byte) string {
+	if len(v) < snowflakeLen {
+		return ""
+	}
+	return strconv.FormatUint(binary.BigEndian.Uint64(v), 10)
+}
+
 // encodeTime and decodeTime store an instant as unix nanoseconds.
 //
 // The history bucket stores one of these as its VALUE and nothing else. It used to

@@ -205,6 +205,24 @@ Every runtime path used to be resolved against the working directory, so startin
 
 The dictionary load used to be `log.Fatalf`, so a missing 64 KB word list killed learning, generation, replies and everything else along with word games. It now logs a warning and sets `wordGamesAvailable = false`. Treat this as the general rule: peregrine is a bag of loosely related engagement behaviors, and exactly one of them failing should disable that one. `log.Fatal` is for "the token is missing" and "the corpus will not open", nothing else.
 
+### Ingestion asks "what is new", not "what have I forgotten"
+
+`internal/ingest` walks guilds and channels; `internal/legacy` still learns. That split is deliberate: reading the wrong messages wastes API budget and corrupts counts, whereas learning them wrongly is a safety question with a gate in front of it.
+
+**The old loop re-read the trailing `PEREGRINE_INGEST_LOOKBACK` on every tick**, which at the shipped defaults is roughly 144 passes over every message, and relied on the history bucket for dedup. That bucket is capped at `PEREGRINE_MAX_HISTORY`, so on a busy guild the older half of each window had already been evicted and was **learned again, counting its n-grams twice** (finding 13). Raising the cap would only move the corpus size at which it starts.
+
+**`PEREGRINE_INGEST_LOOKBACK` is now a bootstrap bound, not a re-read window.** It applies to the first pass over a channel and never again, because later passes resume from a stored cursor. If you change what it means, you are reintroducing finding 13.
+
+**`ingest.SnowflakeAt` synthesizes an `afterID` from a timestamp**, which is how the bootstrap gets an anchor for an instant that has no message. It clamps below the Discord epoch rather than wrapping, and that guard is not decorative: an unclamped subtraction produces a *future* snowflake, so the pass would ask for messages after the year 4000 and silently ingest nothing, forever.
+
+**Cursors are monotonic in the writer, not just in the caller.** `Writer.SetCursor` refuses to move backwards. Two things can hand it an older ID: a batch processed out of order, and two passes overlapping on one channel. Either would rewind the mark and re-learn everything between, which is finding 13 by a different route.
+
+**The cursor advances past bot messages too.** A page of nothing but bot messages is still progress; leaving the mark behind means re-requesting them every pass forever.
+
+**The count-then-fetch double scan was deleted, not replaced.** Its job was deciding which channels were worth reading, and a cursor answers that as a side effect: an idle channel returns one empty page. A test measures requests per channel and asserts exactly one.
+
+**A channel worker swallows its error on purpose.** `errgroup` cancels its context on the first error returned, so a guild the bot cannot read would abandon the ones it can. Failing to list guilds *is* fatal, because there is nothing to walk and a cheerful log line would hide a revoked token.
+
 ### The reactor, and the consume contract
 
 `handleMessage` is a table of named steps in `internal/legacy/reactor.go`, each returning whether it **consumed** the message. The runner stops at the first one that does.

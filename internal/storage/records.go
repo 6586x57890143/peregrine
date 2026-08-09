@@ -601,3 +601,81 @@ func createFile(path string) (*os.File, error) {
 	}
 	return f, nil
 }
+
+// ---------------------------------------------------------------- ingest cursors
+
+// Cursor returns the ID of the newest message ingested from a channel, or "" if the
+// channel has never been read.
+//
+// This is the high-water mark that replaces re-reading a time window. The old ingest
+// loop always re-scanned the trailing PEREGRINE_INGEST_LOOKBACK, relying on the history
+// bucket to recognise what it had already learned, and the history bucket is capped at
+// PEREGRINE_MAX_HISTORY entries. On a busy guild the older half of that window had
+// already been evicted from history by the time the next pass came round, so those
+// messages were learned AGAIN and their n-grams counted twice (SPEC.md section 8,
+// finding 13). A cursor makes the question "what is new" instead of "what have I
+// forgotten", and the answer does not depend on how much the bot remembers.
+//
+// Stored as a fixed-width big-endian snowflake for the same reason history keys are:
+// Discord IDs are integers whose high bits are a timestamp, so byte order is
+// chronological order, and comparing them as decimal strings makes a 17-digit ID sort
+// before an 18-digit one.
+func (r *Reader) Cursor(channelID string) string {
+	b := r.bucket(bucketCursor)
+	if b == nil {
+		return ""
+	}
+	v := b.Get([]byte(channelID))
+	if len(v) == 0 {
+		return ""
+	}
+	return decodeSnowflake(v)
+}
+
+// SetCursor advances a channel's high-water mark.
+//
+// It refuses to move BACKWARDS, and that is the property worth having rather than a
+// courtesy. Two things can hand this an older ID: a paging loop that processes a batch
+// out of order, and two ingest passes overlapping on the same channel. Either would
+// rewind the mark and cause the next pass to re-read and re-learn everything between,
+// which is finding 13 arriving by a different route. A monotonic cursor cannot do that
+// however confused its caller is.
+func (w *Writer) SetCursor(channelID, messageID string) error {
+	if channelID == "" {
+		return fmt.Errorf("refusing to store a cursor for an empty channel ID")
+	}
+	next, err := encodeSnowflake(messageID)
+	if err != nil {
+		return fmt.Errorf("cursor for channel %s: %w", channelID, err)
+	}
+
+	b := w.bucket(bucketCursor)
+	if current := b.Get([]byte(channelID)); len(current) > 0 && bytes.Compare(next, current) <= 0 {
+		return nil
+	}
+	return b.Put([]byte(channelID), next)
+}
+
+// ForgetCursor drops a channel's mark, so the next pass treats it as never read.
+//
+// For an operator who needs one channel re-ingested without discarding the corpus, and
+// for tests. Deliberately per channel rather than a wholesale reset: "re-read
+// everything" is a decision with a cost, since re-learning a message the history bucket
+// has since evicted double-counts it.
+func (w *Writer) ForgetCursor(channelID string) error {
+	return w.bucket(bucketCursor).Delete([]byte(channelID))
+}
+
+// ForEachCursor visits every stored cursor, for the status line and for maintenance.
+func (r *Reader) ForEachCursor(fn func(channelID, messageID string) error) error {
+	b := r.bucket(bucketCursor)
+	if b == nil {
+		return nil
+	}
+	return b.ForEach(func(k, v []byte) error {
+		if len(v) == 0 {
+			return nil
+		}
+		return fn(string(k), decodeSnowflake(v))
+	})
+}

@@ -87,9 +87,17 @@ type Config struct {
 	SelfMention          *regexp.Regexp
 
 	// Ingestion.
-	IngestTick       time.Duration // PEREGRINE_INGEST_TICK
-	IngestLookback   time.Duration // PEREGRINE_INGEST_LOOKBACK
-	IngestBatchDelay time.Duration // PEREGRINE_INGEST_BATCH_DELAY
+	//
+	// IngestLookback stopped being a re-read window in M9 and is now a BOOTSTRAP bound:
+	// it applies to the first pass over a channel and never again, because subsequent
+	// passes resume from a stored per-channel cursor. The old meaning was the mechanism
+	// behind finding 13, since re-reading a window whose dedup record had been evicted
+	// counted the same n-grams twice.
+	IngestTick               time.Duration // PEREGRINE_INGEST_TICK
+	IngestLookback           time.Duration // PEREGRINE_INGEST_LOOKBACK
+	IngestBatchDelay         time.Duration // PEREGRINE_INGEST_BATCH_DELAY
+	IngestGuildConcurrency   int           // PEREGRINE_INGEST_GUILD_CONCURRENCY
+	IngestChannelConcurrency int           // PEREGRINE_INGEST_CHANNEL_CONCURRENCY
 
 	// Runtime. The worker pool that every incoming message goes through, replacing
 	// an unbounded goroutine per message that shared a WaitGroup with the shutdown
@@ -163,15 +171,13 @@ var deferredVars = map[string]string{
 	// never exist is worse than a deferred one: the deferred warning at least promises
 	// a milestone. An operator who still has either set gets no warning now, which is
 	// correct, because there is nothing left for them to be waiting for.
-	"PEREGRINE_BACKUP_DIR":                 "M13",
-	"PEREGRINE_BACKUP_TICK":                "M13",
-	"PEREGRINE_BACKUP_KEEP":                "M13",
-	"PEREGRINE_IMAGE_MAX_PER_AUTHOR":       "M11",
-	"PEREGRINE_INGEST_GUILD_CONCURRENCY":   "M9",
-	"PEREGRINE_INGEST_CHANNEL_CONCURRENCY": "M9",
-	"PEREGRINE_WHISPER_MODEL":              "M12",
-	"PEREGRINE_VOICENOTES_DIR":             "M12",
-	"PEREGRINE_TRANSCRIPTION_TIMEOUT":      "M12",
+	"PEREGRINE_BACKUP_DIR":            "M13",
+	"PEREGRINE_BACKUP_TICK":           "M13",
+	"PEREGRINE_BACKUP_KEEP":           "M13",
+	"PEREGRINE_IMAGE_MAX_PER_AUTHOR":  "M11",
+	"PEREGRINE_WHISPER_MODEL":         "M12",
+	"PEREGRINE_VOICENOTES_DIR":        "M12",
+	"PEREGRINE_TRANSCRIPTION_TIMEOUT": "M12",
 }
 
 // Load reads and validates the environment. The returned error, if any, names
@@ -266,6 +272,14 @@ func Load() (*Config, error) {
 		IngestTick:       l.dur("PEREGRINE_INGEST_TICK", 10*time.Minute, time.Minute, 24*time.Hour),
 		IngestLookback:   l.dur("PEREGRINE_INGEST_LOOKBACK", 24*time.Hour, time.Minute, 30*24*time.Hour),
 		IngestBatchDelay: l.dur("PEREGRINE_INGEST_BATCH_DELAY", 500*time.Millisecond, 0, time.Minute),
+
+		// Both capped low, and the cap is the point rather than caution. The fan-out was
+		// unbounded (finding 14): one goroutine per channel per guild, each paging
+		// Discord, which earns rate limits whose retries then make it worse. bbolt also
+		// serializes every write process-wide, so past a handful of workers the extra
+		// concurrency buys contention rather than throughput.
+		IngestGuildConcurrency:   l.intVal("PEREGRINE_INGEST_GUILD_CONCURRENCY", 4, 1, 64),
+		IngestChannelConcurrency: l.intVal("PEREGRINE_INGEST_CHANNEL_CONCURRENCY", 4, 1, 64),
 
 		MessageWorkers: l.intVal("PEREGRINE_MESSAGE_WORKERS", 4, 1, 64),
 		MessageQueue:   l.intVal("PEREGRINE_MESSAGE_QUEUE", 256, 1, 100_000),
