@@ -65,6 +65,7 @@ const (
 	metaHistoryCount    = "count:history"
 	metaImageCount      = "count:image"
 	metaMessagesLearned = "count:messages_learned"
+	metaTopicTotal      = "count:topic_total"
 )
 
 // SchemaVersion is the on-disk layout this binary understands.
@@ -127,16 +128,57 @@ func (s *Store) initialize() error {
 					"remove the corpus file (or `docker volume rm peregrine_corpus`), and let it "+
 					"relearn from Discord history", ErrSchemaMismatch)
 			}
-			return meta.Put([]byte(metaSchemaVersion), encodeUint64(SchemaVersion))
+			if err := meta.Put([]byte(metaSchemaVersion), encodeUint64(SchemaVersion)); err != nil {
+				return err
+			}
 
 		case decodeUint64(stored) == SchemaVersion:
-			return nil
 
 		default:
 			return fmt.Errorf("%w: corpus is version %d, this binary speaks version %d",
 				ErrSchemaMismatch, decodeUint64(stored), SchemaVersion)
 		}
+
+		return backfillTopicTotal(tx)
 	})
+}
+
+// backfillTopicTotal derives count:topic_total once for a corpus written before that
+// counter existed, which is every schema-1 corpus created before M7a.
+//
+// The counter is the denominator of the raw-count half of the Kneser-Ney base case
+// (PEREGRINE_KN_RAW_MIX), so a zero here does not fail loudly: it silently turns the
+// raw mix off and makes generation behave as though mu were 0, which is a change in
+// output register with nothing in the log to explain it. Deriving it costs one cursor
+// scan over the topic bucket, one key per distinct word, on the startup after an
+// upgrade and never again.
+//
+// The condition is "counter absent, bucket populated" rather than "counter is zero",
+// because a genuinely empty corpus must not be walked on every single startup.
+func backfillTopicTotal(tx *bbolt.Tx) error {
+	meta := tx.Bucket([]byte(bucketMeta))
+	if meta.Get([]byte(metaTopicTotal)) != nil {
+		return nil
+	}
+
+	topics := tx.Bucket([]byte(bucketTopic))
+	if topics == nil {
+		return nil
+	}
+
+	c := topics.Cursor()
+	k, v := c.First()
+	if k == nil {
+		// A new corpus. Leave the key absent so the next startup does not walk an
+		// empty bucket either; the first IncTopic creates it.
+		return nil
+	}
+
+	var total uint64
+	for ; k != nil; k, v = c.Next() {
+		total += decodeUint64(v)
+	}
+	return meta.Put([]byte(metaTopicTotal), encodeUint64(total))
 }
 
 // populated reports whether any bucket holds a key, which is how a new file is told

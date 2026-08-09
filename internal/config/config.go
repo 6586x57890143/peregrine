@@ -57,9 +57,20 @@ type Config struct {
 	// saying something awful and waiting for a deploy is not acceptable.
 	PauseAllWrites bool // PEREGRINE_PAUSE_ALL_WRITES
 
-	// Generation.
+	// Generation. Everything here is read by internal/markov as of M7a.
+	//
+	// Creativity is deliberately absent and there is no PEREGRINE_CREATIVITY. It was
+	// the one tuning constant M2 refused to promote, because its arithmetic
+	// contradicted its name, and M7a replaces it with Temperature in the same change
+	// that normalizes the scoring so the dial actually moves (SPEC.md section 5.3).
 	MaxNGram             int     // PEREGRINE_MAX_NGRAM
 	PromptRelevanceBoost float64 // PEREGRINE_PROMPT_RELEVANCE_BOOST
+	Temperature          float64 // PEREGRINE_TEMPERATURE
+	TopK                 int     // PEREGRINE_TOP_K
+	TopP                 float64 // PEREGRINE_TOP_P
+	KNDiscount           float64 // PEREGRINE_KN_DISCOUNT
+	KNRawMix             float64 // PEREGRINE_KN_RAW_MIX
+	MinDistinctAuthors   int     // PEREGRINE_MIN_DISTINCT_AUTHORS
 	SelfMention          *regexp.Regexp
 
 	// Ingestion.
@@ -139,21 +150,18 @@ var deferredVars = map[string]string{
 	// map is not supposed to move. It is honest here: the loop these two drove is
 	// gone, so leaving them as live fields would mean an operator could set them and
 	// watch nothing happen, which is precisely what this map exists to prevent.
-	"PEREGRINE_ENABLE_CLUSTERING":          "M8",
-	"PEREGRINE_CLUSTERING_TICK":            "M8",
-	"PEREGRINE_BACKUP_DIR":                 "M13",
-	"PEREGRINE_BACKUP_TICK":                "M13",
-	"PEREGRINE_BACKUP_KEEP":                "M13",
-	"PEREGRINE_MIN_DISTINCT_AUTHORS":       "M7",
-	"PEREGRINE_TEMPERATURE":                "M7",
-	"PEREGRINE_TOP_K":                      "M7",
-	"PEREGRINE_TOP_P":                      "M7",
-	"PEREGRINE_KN_DISCOUNT":                "M7",
-	"PEREGRINE_KN_RAW_MIX":                 "M7",
-	"PEREGRINE_MIN_WORDS":                  "M7",
-	"PEREGRINE_MAX_WORDS":                  "M7",
-	"PEREGRINE_COOCCURRENCE_WINDOW":        "M7",
-	"PEREGRINE_ROAST_CHANCE":               "M7",
+	"PEREGRINE_ENABLE_CLUSTERING": "M8",
+	"PEREGRINE_CLUSTERING_TICK":   "M8",
+	"PEREGRINE_BACKUP_DIR":        "M13",
+	"PEREGRINE_BACKUP_TICK":       "M13",
+	"PEREGRINE_BACKUP_KEEP":       "M13",
+	// The six dials M7a made live are gone from here, which is the direction this map
+	// is supposed to move. What is left belongs to M7b: the length model, the
+	// co-occurrence window and the persona layer.
+	"PEREGRINE_MIN_WORDS":                  "M7b",
+	"PEREGRINE_MAX_WORDS":                  "M7b",
+	"PEREGRINE_COOCCURRENCE_WINDOW":        "M7b",
+	"PEREGRINE_ROAST_CHANCE":               "M7b",
 	"PEREGRINE_IMAGE_MAX_PER_AUTHOR":       "M11",
 	"PEREGRINE_IGNORE_CHANNELS":            "M10",
 	"PEREGRINE_INGEST_GUILD_CONCURRENCY":   "M9",
@@ -196,9 +204,46 @@ func Load() (*Config, error) {
 		// This bound is now one of three things stopping that. M6b's ingestion loop
 		// descends to 2 rather than 1, and storage.Writer.LearnNgram refuses an empty
 		// prefix outright, so a new caller cannot reintroduce it either.
-		MaxNGram:             l.intVal("PEREGRINE_MAX_NGRAM", 5, 2, 8),
-		PromptRelevanceBoost: l.float("PEREGRINE_PROMPT_RELEVANCE_BOOST", 15.0, 0, 1000),
-		SelfMention:          l.regex("PEREGRINE_SELF_MENTION_PATTERN", `(?i)\b(peregrine|bird)\b`),
+		MaxNGram: l.intVal("PEREGRINE_MAX_NGRAM", 5, 2, 8),
+
+		// The units of this one CHANGED in M7a, and the narrowed range is the point
+		// rather than a side effect.
+		//
+		// It used to be added to an unnormalized score whose scale was raw n-gram
+		// counts, so 15.0 was a sensible default. The score is now a log-probability,
+		// where an additive 15.0 multiplies a candidate's odds by three million and
+		// makes echoing the prompt the only thing the bot ever does. Keeping the
+		// variable's NAME and refusing the old value is deliberate: an operator with
+		// 15.0 still in their .env gets a startup error naming the new range, whereas
+		// renaming it would have let the stale value quietly stop being read, which is
+		// the exact failure this package exists to prevent.
+		PromptRelevanceBoost: l.float("PEREGRINE_PROMPT_RELEVANCE_BOOST", 0.6, 0, 5),
+
+		// Generation dials, live as of M7a (SPEC.md section 5.3).
+		//
+		// Temperature replaces the Creativity constant, which was applied as an
+		// exponent of 1/(Creativity+0.01) and therefore sharpened at its own default
+		// and could never pass an exponent of 1.0. There is deliberately no
+		// PEREGRINE_CREATIVITY. The upper bound of 10 is generous rather than
+		// meaningful: past about 3 the output is word salad even with top-k on, and the
+		// point of allowing more is that the operator can see that for themselves.
+		Temperature: l.float("PEREGRINE_TEMPERATURE", 1.0, 0, 10),
+		TopK:        l.intVal("PEREGRINE_TOP_K", 40, 0, 10_000),
+		TopP:        l.float("PEREGRINE_TOP_P", 0.95, 0, 1),
+
+		// D below 1 is required: absolute discounting subtracts D from each observed
+		// count, so a D at or above 1 erases every count-1 continuation, and in a
+		// corpus this sparse that is nearly all of them.
+		KNDiscount: l.float("PEREGRINE_KN_DISCOUNT", 0.75, 0, 0.99),
+		KNRawMix:   l.float("PEREGRINE_KN_RAW_MIX", 0.25, 0, 1),
+
+		// Author diversity, the anti-poisoning control (SPEC.md section 4, A6). 0
+		// disables it, which is the right value on a scratch corpus and the wrong one
+		// on a live server: the default is 2 so that the safe direction is what an
+		// operator gets by doing nothing.
+		MinDistinctAuthors: l.intVal("PEREGRINE_MIN_DISTINCT_AUTHORS", 2, 0, 100),
+
+		SelfMention: l.regex("PEREGRINE_SELF_MENTION_PATTERN", `(?i)\b(peregrine|bird)\b`),
 
 		IngestTick:       l.dur("PEREGRINE_INGEST_TICK", 10*time.Minute, time.Minute, 24*time.Hour),
 		IngestLookback:   l.dur("PEREGRINE_INGEST_LOOKBACK", 24*time.Hour, time.Minute, 30*24*time.Hour),

@@ -58,7 +58,19 @@ func TestLoadDefaults(t *testing.T) {
 		{"DBPath", cfg.DBPath, "markov.db"},
 		{"MaxHistory", cfg.MaxHistory, 10000},
 		{"MaxNGram", cfg.MaxNGram, 5},
-		{"PromptRelevanceBoost", cfg.PromptRelevanceBoost, 15.0},
+		// 0.6, not the old 15.0. The units changed in M7a: this is a logit added to a
+		// log-probability now, not an addend on a raw n-gram count. See the field
+		// comment for why the variable kept its name while narrowing its range.
+		{"PromptRelevanceBoost", cfg.PromptRelevanceBoost, 0.6},
+		{"Temperature", cfg.Temperature, 1.0},
+		{"TopK", cfg.TopK, 40},
+		{"TopP", cfg.TopP, 0.95},
+		{"KNDiscount", cfg.KNDiscount, 0.75},
+		{"KNRawMix", cfg.KNRawMix, 0.25},
+		// 2, so the safe direction is what an operator gets by doing nothing. On a
+		// scratch corpus this makes the bot nearly silent, which is the control
+		// working rather than a defect.
+		{"MinDistinctAuthors", cfg.MinDistinctAuthors, 2},
 		{"IngestTick", cfg.IngestTick, 10 * time.Minute},
 		{"IngestLookback", cfg.IngestLookback, 24 * time.Hour},
 		{"IngestBatchDelay", cfg.IngestBatchDelay, 500 * time.Millisecond},
@@ -150,6 +162,77 @@ func TestBadBoolIsAnErrorNotFalse(t *testing.T) {
 				t.Errorf("PEREGRINE_ENABLE_IMAGE_REPOST=%q must be an error, not a silent default", v)
 			}
 		})
+	}
+}
+
+// TestStalePromptRelevanceBoostIsRefused is the whole reason that variable kept its
+// name instead of being renamed when its units changed in M7a.
+//
+// It used to be an addend on a raw n-gram count, defaulting to 15.0; it is now a logit
+// added to a log-probability, where 15.0 multiplies a candidate's odds by three million
+// and makes prompt echo the only thing the bot does. An operator upgrading with the old
+// value still in their .env must get a startup error naming the new range. Renaming the
+// variable would instead have let the stale value silently stop being read, which is
+// indistinguishable from the bot ignoring its configuration.
+func TestStalePromptRelevanceBoostIsRefused(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("PEREGRINE_PROMPT_RELEVANCE_BOOST", "15.0")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("the pre-M7a default of 15.0 must be refused: it is out of range in the new " +
+			"logit units, and accepting it would make the bot echo the prompt forever")
+	}
+	if !strings.Contains(err.Error(), "PEREGRINE_PROMPT_RELEVANCE_BOOST") {
+		t.Errorf("error must name the variable, got: %v", err)
+	}
+}
+
+// TestGenerationDialsAreValidated covers the ranges on the six dials M7a promoted. A
+// value that does not parse or falls outside its range is a startup error rather than a
+// fallback to the default, because a temperature silently reverting to 1.0 is
+// indistinguishable from the dial not working.
+func TestGenerationDialsAreValidated(t *testing.T) {
+	cases := []struct{ key, value string }{
+		{"PEREGRINE_TEMPERATURE", "-1"},
+		{"PEREGRINE_TEMPERATURE", "hot"},
+		{"PEREGRINE_TEMPERATURE", "11"},
+		{"PEREGRINE_TOP_K", "-1"},
+		{"PEREGRINE_TOP_P", "1.5"},
+		{"PEREGRINE_TOP_P", "-0.1"},
+		// D at or above 1 erases every count-1 continuation, and in a corpus this
+		// sparse that is nearly all of them.
+		{"PEREGRINE_KN_DISCOUNT", "1.0"},
+		{"PEREGRINE_KN_DISCOUNT", "-0.5"},
+		{"PEREGRINE_KN_RAW_MIX", "1.5"},
+		{"PEREGRINE_MIN_DISTINCT_AUTHORS", "-1"},
+		{"PEREGRINE_MIN_DISTINCT_AUTHORS", "two"},
+	}
+	for _, c := range cases {
+		t.Run(c.key+"="+c.value, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv(c.key, c.value)
+			if _, err := Load(); err == nil {
+				t.Errorf("%s=%q must be a startup error, not a silent fallback", c.key, c.value)
+			}
+		})
+	}
+}
+
+// TestZeroMinDistinctAuthorsIsAllowed. Zero disables the author-diversity gate, which
+// is the right value on a scratch corpus and a deliberate choice on a live one, so it
+// must be expressible. The default is 2 precisely so that the safe direction is what
+// doing nothing gets you.
+func TestZeroMinDistinctAuthorsIsAllowed(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("PEREGRINE_MIN_DISTINCT_AUTHORS", "0")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("0 must be accepted: %v", err)
+	}
+	if cfg.MinDistinctAuthors != 0 {
+		t.Errorf("MinDistinctAuthors = %d, want 0", cfg.MinDistinctAuthors)
 	}
 }
 
@@ -281,8 +364,11 @@ func TestDeferredSet(t *testing.T) {
 		t.Fatalf("DeferredSet with nothing set = %v, want empty", got)
 	}
 
-	t.Setenv("PEREGRINE_TOP_K", "40")
-	t.Setenv("PEREGRINE_KN_RAW_MIX", "0.25")
+	// Two that are still deferred. TOP_K and KN_RAW_MIX used to stand here and no
+	// longer can, because M7a made them live: that is exactly the transition
+	// TestDeferredVarsAreNotAlsoLive below polices.
+	t.Setenv("PEREGRINE_MAX_WORDS", "18")
+	t.Setenv("PEREGRINE_BACKUP_KEEP", "7")
 
 	got := DeferredSet()
 	if len(got) != 2 {
@@ -290,7 +376,7 @@ func TestDeferredSet(t *testing.T) {
 	}
 	// Sorted, so the log line is stable rather than reordering per run on Go's
 	// randomized map iteration.
-	if got[0] != "PEREGRINE_KN_RAW_MIX (M7)" || got[1] != "PEREGRINE_TOP_K (M7)" {
+	if got[0] != "PEREGRINE_BACKUP_KEEP (M13)" || got[1] != "PEREGRINE_MAX_WORDS (M7b)" {
 		t.Errorf("DeferredSet = %v, want sorted entries carrying their milestone", got)
 	}
 }
