@@ -148,10 +148,12 @@ func (o Outcome) String() string {
 // answer. What the caller must NOT do is stay silent in the log as well: the bot's silence
 // is a feature and the operator's is a bug.
 func (g *Generator) Sentence(prompt string, roast bool, mem *Memory, emoji EmojiResolver) (string, Outcome, error) {
+	// No <START> sentinel here any more, and it was never a fallback in the first place. The
+	// learn path only ever appends <end> and never prepends a start token, so nothing in the
+	// corpus follows "<START>": tiers 1 and 5 could not match it, and seed selection already
+	// fell through to FirstPrefix exactly as it does for an empty prompt. It was a token that
+	// looked like it did something.
 	promptWords := text.Tokenize(prompt)
-	if len(promptWords) == 0 {
-		promptWords = []string{"<START>"}
-	}
 
 	var recentWords []string
 	if mem != nil {

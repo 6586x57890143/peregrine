@@ -23,6 +23,8 @@ package names
 
 import (
 	"log"
+	"regexp"
+	"strings"
 
 	"github.com/bwmarrin/discordgo"
 
@@ -39,6 +41,112 @@ type User struct {
 	Name     string
 	UserID   string
 	Username string
+}
+
+// mentionMarkup matches a user mention, in both the plain and the legacy nickname form.
+//
+// Deliberately not a role mention: <@&123> has an ampersand where a digit would be, so it does
+// not match, and a role is not a person this package can name.
+var mentionMarkup = regexp.MustCompile(`<@!?(\d+)>`)
+
+// Spellings returns every name one person is addressed by, display form first.
+//
+// A Discord user has up to three names and people type whichever one they see: a per-guild
+// nickname, a global display name, and the username underneath. Every entry carries the same
+// UserID and Username, so Record canonicalizes them all to the username and writes the rest as
+// aliases pointing at it.
+//
+// This exists because three separate sites hand-built this and each got a different answer,
+// which is finding 28's shape: two or more copies of one question, differing only in what each
+// throws away. All three threw away GlobalName, and since usernames became lowercase handles
+// that is the name most people are actually addressed by, so typing somebody's display name
+// recognized nobody.
+//
+// Order is display-first because Substitute and Primary want the spelling a human would have
+// typed, not the handle underneath it.
+func Spellings(u *discordgo.User, member *discordgo.Member) []User {
+	if u == nil {
+		return nil
+	}
+
+	out := make([]User, 0, 3)
+	seen := make(map[string]struct{}, 3)
+	add := func(name string) {
+		if name == "" {
+			return
+		}
+		lower := strings.ToLower(name)
+		if _, dup := seen[lower]; dup {
+			return
+		}
+		seen[lower] = struct{}{}
+		out = append(out, User{Name: name, UserID: u.ID, Username: u.Username})
+	}
+
+	if member != nil {
+		add(member.Nick)
+	}
+	add(u.GlobalName)
+	add(u.Username)
+	return out
+}
+
+// Primary returns just the display spelling, for a caller that wants one User rather than all
+// of them.
+//
+// It cannot panic on a nil user, which is why callers use this instead of indexing Spellings.
+// A nil Author has turned up in a test fixture here before, and production always having one is
+// not a reason to write the version that would crash if it did not.
+//
+// KNOWN LIMITATION, stated because it is narrow rather than because it is acceptable in
+// general: a caller that keeps only this loses the other spellings, so an author who has BOTH a
+// guild nickname and a different global name gets the nickname recorded and the global name
+// not. Record always writes the username as the canonical form, and the moment anybody
+// @mentions that person Resolve records all three, so the gap closes on its own.
+func Primary(u *discordgo.User, member *discordgo.Member) User {
+	all := Spellings(u, member)
+	if len(all) == 0 {
+		return User{}
+	}
+	return all[0]
+}
+
+// Substitute replaces user-mention markup with the display spelling of the person it refers to.
+//
+// The tokenizer keeps <@123> as ONE whole token on purpose, so without this a mention is an
+// opaque blob that Canonical cannot resolve: the most explicit way to name somebody was
+// invisible to every name-aware part of generation, and the corpus filled with ID tokens where
+// a name belonged.
+//
+// An ID that is not in users is left exactly as it was. That is today's behaviour for every
+// mention, and stripping it would drop a word out of the middle of a sentence, which costs the
+// structure around it for no gain.
+//
+// No network access: the caller already resolved these, so this is a map lookup per mention.
+func Substitute(content string, users []User) string {
+	if content == "" || len(users) == 0 {
+		return content
+	}
+
+	// First spelling wins, which after Spellings is the display form. Later entries for the
+	// same person are the same person under a handle nobody types.
+	byID := make(map[string]string, len(users))
+	for _, u := range users {
+		if u.UserID == "" || u.Name == "" {
+			continue
+		}
+		if _, have := byID[u.UserID]; !have {
+			byID[u.UserID] = u.Name
+		}
+	}
+
+	return mentionMarkup.ReplaceAllStringFunc(content, func(match string) string {
+		id := mentionMarkup.FindStringSubmatch(match)[1]
+		if name, ok := byID[id]; ok {
+			return name
+		}
+		return match
+	})
 }
 
 // Session is the part of discordgo the resolver needs. Declared here so a test needs one
@@ -65,15 +173,16 @@ func Resolve(s Session, mentions []*discordgo.User, guildID string) ([]User, map
 		}
 		seen[u.ID] = struct{}{}
 
-		users = append(users, User{Name: u.Username, UserID: u.ID, Username: u.Username})
-
-		// The server nickname, when there is one, as a second spelling of the same
-		// person. This is the only REST call on this path.
+		// The server nickname, when there is one. This is the only REST call on this path, and
+		// it is the only spelling the gateway payload does not already carry.
+		var member *discordgo.Member
 		if guildID != "" && s != nil {
-			if member, err := s.GuildMember(guildID, u.ID); err == nil && member != nil && member.Nick != "" {
-				users = append(users, User{Name: member.Nick, UserID: u.ID, Username: u.Username})
+			if got, err := s.GuildMember(guildID, u.ID); err == nil {
+				member = got
 			}
 		}
+
+		users = append(users, Spellings(u, member)...)
 	}
 	return users, seen
 }
