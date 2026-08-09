@@ -17,14 +17,13 @@ markov.db.lock
 *.db.tmp
 backups/
 
-# Whisper model and the ffmpeg/whisper binaries. ggml-small.bin is 465 MiB,
-# well over GitHub's hard 100 MiB per-file limit, so a commit containing it
-# cannot be pushed at all and the only remedy is rewriting history. ffmpeg.exe
-# is another 96 MiB. Transcription is a Windows-local development feature and
-# these assets are fetched by hand; see README's transcription section.
-voicenotes/models/
-voicenotes/bin/
-voicenotes/audio/
+# The transcription assets. Nothing in the repository reads these as of M12, which
+# shipped the plugin as an Engine seam with no implementation behind it, but the
+# entries stay: the reason they were needed has not changed and whoever writes an
+# engine will put the files back. ggml-small.bin is 465 MiB, well over GitHub's
+# hard 100 MiB per-file limit, so a commit containing it cannot be pushed at all
+# and the only remedy is rewriting history. ffmpeg.exe is another 96 MiB.
+voicenotes/
 
 # Build output
 /bin/

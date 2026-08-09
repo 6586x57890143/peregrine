@@ -121,12 +121,19 @@ docker compose run --rm bot -clean-db
 
 ## Voice-note transcription
 
-Off by default and Windows-only. It shells out to `ffmpeg` and `whisper-cli` and needs a 465 MiB whisper model, none of which exist in the distroless production image (which has no shell at all). The binaries and the model are gitignored and fetched by hand:
+**There is no transcription engine in this repository.** `internal/plugins/voicenote` is a complete plugin over an `Engine` interface, and the only implementation that ships reports itself unavailable, so voice notes are ignored.
 
-- `voicenotes/bin/windows/` needs `ffmpeg.exe`, `whisper-cli.exe` and the accompanying `ggml*.dll` and `whisper.dll`.
-- `voicenotes/models/ggml-small.bin` from whisper.cpp's model releases.
+That is deliberate rather than unfinished. The implementation it replaced shelled out to `ffmpeg` and `whisper-cli` and needed a 465 MiB whisper model; none of that exists in the distroless production image, which has no shell at all, and all three assets are gitignored because the model alone is over GitHub's hard 100 MiB per-file limit. The feature had never run anywhere but one Windows machine, and every path in it was resolved against the working directory, so it silently found nothing when started from anywhere but the repository root.
 
-Then set `PEREGRINE_ENABLE_TRANSCRIPTION=true`. Only the Windows binary directory exists; on Linux the lookup fails and every voice note produces a failure reply, which is the other reason the flag defaults off.
+What the repository can honestly own is the plugin: a bounded queue, a worker the shutdown path waits for, a placeholder posted before work is queued, and every message through the send chokepoint. What it cannot is the model.
+
+Setting `PEREGRINE_ENABLE_TRANSCRIPTION=true` with no engine **warns at startup** and ignores voice notes. It does not fail quietly:
+
+```
+level=WARN msg="transcription is enabled but no engine is available, so voice notes will be ignored..."
+```
+
+Writing an engine means implementing two methods. The package comment lists what the old one got wrong so the next one does not: a bare `http.Get` with no timeout, status check or size cap; `exec.Command` with no context, which shutdown could not kill; and paths resolved against the working directory.
 
 ## Deployment
 
