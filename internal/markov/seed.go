@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/6586x57890143/peregrine/internal/corpus"
+	"github.com/6586x57890143/peregrine/internal/text"
 )
 
 // Seed selection: choosing where a sentence starts.
@@ -33,29 +34,89 @@ import (
 
 // Seed tier weights.
 //
-// These are the legacy tier weights preserved deliberately: this milestone changes
-// WHERE the answers come from, not how strongly each tier is trusted, so that a change
-// in output can be attributed to the two-hop tier rather than to a simultaneous
-// retuning. The one exception is that the cluster tier's 50.0 has no successor; the
-// two-hop tier deliberately enters LOW, below every direct-association tier, because a
-// second-hop association is a weaker claim than a first-hop one.
+// These were the legacy weights, preserved through M7a so that a change in output could be
+// attributed to the two-hop tier rather than to a simultaneous retuning. That reason has
+// expired, and reading them against each other turned up two real problems, so the ladder is
+// respaced here.
+//
+// FIRST, THE BONUSES WERE UNBOUNDED. Each association tier added a bare
+// math.Sqrt(count) to its base weight, so a tier could climb straight out of its own band:
+// at 50 recorded co-occurrences the name-topic tier reached 32, above the 30 a word the user
+// actually typed gets. That is finding G2's shape in the seed selector rather than the
+// scorer, and the scorer's own rule is the fix: every term that sums over evidence is
+// squashed so it cannot exceed its own weight. assocSpread is that cap here, so each tier
+// occupies a band it cannot leave and the ordering below is the ordering that happens.
+//
+// SECOND, ONE TIER WAS DEAD. weightPromptWord added single prompt words at 15.0, but tier 1
+// runs n down to 1 and had already added exactly those keys at 30.0, and add() keeps the
+// maximum. It could never win. Deleted rather than fixed: the question it asked was already
+// answered one tier up, which is finding 28's shape.
 const (
 	// weightPromptNgram is scaled by n, so a longer prompt n-gram outranks a shorter
-	// one. This is the strongest tier and should be: it is the only one that knows
-	// what the user actually said.
+	// one, and a single prompt word enters here at 30.0. This is the tier that knows what
+	// the user actually said.
 	weightPromptNgram = 30.0
 
-	weightNameTopic      = 25.0
-	weightTopicWord      = 18.0
-	weightNamePositional = 10.0
-	weightPromptWord     = 15.0
+	// weightNameSeed starts the sentence AT the person rather than near them.
+	//
+	// ABOVE a single prompt word (30.0) and below a two-word prompt phrase (60.0), which is
+	// the whole of the reasoning: who a message is about is more specific than any one word
+	// in it, but a phrase somebody actually typed carries what they said AND who they meant.
+	//
+	// It has to clear 30.0 to do anything at all, because a recognized name is usually also a
+	// prompt word and would otherwise be dominated by tier 1 for the same token, exactly as
+	// weightPromptWord was. A weight below the tier that already covers your keys is not a
+	// weak preference, it is no preference.
+	weightNameSeed = 40.0
 
-	// weightTwoHop replaces the cluster tier. Low on purpose, per the note above.
-	weightTwoHop = 6.0
+	// The association tiers, strongest claim first. What a name is about beats what a word
+	// co-occurs with, which beats where a name's topics tend to sit, which beats a
+	// second-hop association. Each spans [base, base+assocSpread).
+	weightNameTopic      = 18.0
+	weightTopicWord      = 12.0
+	weightNamePositional = 8.0
+
+	// weightTwoHop replaces the cluster tier. Lowest of the association tiers on purpose: a
+	// transitive claim is weaker than a direct one even before the decay applies.
+	weightTwoHop = 4.0
 
 	// weightRecent is the fallback floor, scaled by n like the prompt tier.
 	weightRecent = 1.0
+
+	// assocSpread is how far evidence and position may move a candidate WITHIN its tier.
+	// Small enough that the bands do not touch, which is what makes the ladder above true
+	// rather than nominal.
+	assocSpread = 3.0
+
+	// assocEvidenceShare splits assocSpread between how well attested an association is and
+	// how well the word works as an OPENING. The remainder goes to position.
+	assocEvidenceShare = 0.6
 )
+
+// assocWeight bounds a tier's within-tier bonus so it cannot escape the tier, and splits it
+// between evidence and position.
+//
+// EVIDENCE is tanh of sqrt(count) rather than bare sqrt(count). The shape still rewards the
+// first few co-occurrences steeply and flattens after, which is the right curve, but it
+// converges instead of growing without limit. The divisor puts the knee around a dozen
+// co-occurrences.
+//
+// POSITION prefers a word that tends to appear EARLY in a message, because this is choosing
+// where a sentence starts. Seeding on a word that normally sits mid-clause is what produced
+// replies like "loose in the server is doomed" and "is peak bird behaviour honestly" in the
+// golden samples: grammatical, chain-coherent, and reading as though the first half went
+// missing.
+//
+// Note the deliberate contrast with bestPivot, which prefers MID-sentence words by the same
+// data. That is not an inconsistency: a jump is choosing where to continue from, and a word
+// that normally opens sentences reads as a restart there, while a word that normally closes
+// them ends the sentence abruptly. Opening and continuing want opposite ends of the same
+// number.
+func assocWeight(base float64, d corpus.TopicAssoc) float64 {
+	evidence := math.Tanh(math.Sqrt(float64(d.Count)) / 4.0)
+	early := 1.0 - d.MeanPosition()
+	return base + assocSpread*(assocEvidenceShare*evidence+(1.0-assocEvidenceShare)*early)
+}
 
 // Two-hop bounds. Constants rather than knobs for the same reason as the enumeration
 // caps: they trade latency for reach in a way an operator has no instrument to judge.
@@ -77,6 +138,9 @@ const (
 	twoHopDecay = 0.5
 )
 
+// maxJumpsPerSentence bounds how many seams one sentence may contain. See Jump.
+const maxJumpsPerSentence = 1
+
 // SeedInput is everything seed selection needs from the caller.
 type SeedInput struct {
 	// PromptWords are the tokenized prompt, in order, already normalized.
@@ -87,6 +151,15 @@ type SeedInput struct {
 
 	// Names are the canonical recognized names in the prompt.
 	Names []string
+
+	// NameTokens is every SPELLING of a recognized name that appeared in the prompt, surface
+	// form and canonical form both.
+	//
+	// Separate from Names rather than folded into it, because the two are read differently:
+	// Names is looked up in name_topic, where only canonical forms are keys, so putting an
+	// alias there would buy a guaranteed miss per lookup. This is looked up in the n-gram
+	// index, where whichever spelling people actually type is what got learned.
+	NameTokens []string
 }
 
 // Seed picks a starting prefix, or returns "" when the corpus offers nothing.
@@ -115,10 +188,23 @@ func (g *Generator) Seed(in SeedInput) string {
 
 	maxN := max(g.params.MaxNGram-1, 1)
 
-	// Tier 1: multi-word n-grams from the prompt, longest first.
+	// Tier 1: n-grams from the prompt, longest first, and single prompt words at n == 1.
 	for n := maxN; n >= 1; n-- {
 		for i := 0; i+n <= len(in.PromptWords); i++ {
 			key := strings.Join(in.PromptWords[i:i+n], " ")
+
+			// A LONE FUNCTION WORD IS NOT A SEED. Starting a reply on "is" or "of" or "the"
+			// can only produce something that reads as though its first half went missing:
+			// the golden samples had "is peak bird behaviour honestly" and "what it did".
+			//
+			// Only this tier can do it, because the association indexes exclude stop words on
+			// the write side, so this is the one place the check belongs. Multi-word keys are
+			// exempt deliberately: "the bird" and "the server is" open perfectly well, and it
+			// is the word standing alone that is the problem.
+			if n == 1 && text.IsStopWord(key) {
+				continue
+			}
+
 			if g.corpus.HasSuccessors(key) {
 				add(key, float64(n)*weightPromptNgram)
 				fromPrompt[key] = struct{}{}
@@ -126,18 +212,34 @@ func (g *Generator) Seed(in SeedInput) string {
 		}
 	}
 
-	// Tier 2: topics associated with a recognized name.
+	// Tier 2: the recognized name ITSELF, so a reply can start at the person rather than only
+	// somewhere near them.
+	//
+	// Exempt from the author-diversity gate, like the other prompt-derived tiers, and for a
+	// reason that is worth stating because a safety exemption should never be inherited by
+	// analogy alone: this contributes ONE token, and every step after it is still filtered by
+	// eligible(). Repeating a username teaches the bot no sentence, so there is no poisoning
+	// vector to close here. Without the exemption the tier would be dead on exactly the young
+	// corpus that needs it most, since almost nothing has two distinct authors yet.
+	for _, token := range in.NameTokens {
+		if g.corpus.HasSuccessors(token) {
+			add(token, weightNameSeed)
+			fromPrompt[token] = struct{}{}
+		}
+	}
+
+	// Tier 3: topics associated with a recognized name.
 	for _, name := range in.Names {
 		assoc, err := g.corpus.NameTopicsFor(name)
 		if err != nil {
 			continue
 		}
 		for topic, d := range assoc {
-			add(topic, weightNameTopic+math.Sqrt(float64(d.Count)))
+			add(topic, assocWeight(weightNameTopic, d))
 		}
 	}
 
-	// Tier 3: words that co-occur with a prompt word.
+	// Tier 4: words that co-occur with a prompt word.
 	for _, word := range in.PromptWords {
 		assoc, err := g.corpus.TopicWordsFor(word)
 		if err != nil {
@@ -145,29 +247,21 @@ func (g *Generator) Seed(in SeedInput) string {
 		}
 		for other, d := range assoc {
 			if other != word && d.Count > 1 {
-				add(other, weightTopicWord+math.Sqrt(float64(d.Count)))
+				add(other, assocWeight(weightTopicWord, d))
 			}
 		}
 	}
 
-	// Tier 4: topics of the most recent name, restricted to ones the chain can continue
+	// Tier 5: topics of the most recent name, restricted to ones the chain can continue
 	// from. Narrower than tier 2 and weighted lower, which is why both exist.
 	if len(in.Names) > 0 {
 		last := in.Names[len(in.Names)-1]
 		if assoc, err := g.corpus.NameTopicsFor(last); err == nil {
 			for topic, d := range assoc {
 				if g.corpus.HasSuccessors(topic) {
-					add(topic, weightNamePositional+math.Sqrt(float64(d.Count)))
+					add(topic, assocWeight(weightNamePositional, d))
 				}
 			}
-		}
-	}
-
-	// Tier 5: single prompt words.
-	for _, word := range in.PromptWords {
-		if g.corpus.HasSuccessors(word) {
-			add(word, weightPromptWord)
-			fromPrompt[word] = struct{}{}
 		}
 	}
 
@@ -222,7 +316,7 @@ func (g *Generator) twoHop(in SeedInput) map[string]float64 {
 				if !g.corpus.HasSuccessors(second.word) {
 					continue
 				}
-				w := weightTwoHop + twoHopDecay*math.Sqrt(float64(second.count))
+				w := assocWeight(weightTwoHop, second.assoc) * twoHopDecay
 				if existing, ok := out[second.word]; !ok || w > existing {
 					out[second.word] = w
 				}
@@ -233,9 +327,13 @@ func (g *Generator) twoHop(in SeedInput) map[string]float64 {
 }
 
 // assocEntry is one co-occurrence, flattened for sorting.
+//
+// It carries the whole TopicAssoc rather than just the count, so the two-hop tier weighs
+// position the same way the direct tiers do. Carrying only the count here was what made the
+// weakest tier the one exception to that rule, for no reason beyond it being written first.
 type assocEntry struct {
 	word  string
-	count uint64
+	assoc corpus.TopicAssoc
 }
 
 // topAssoc returns a word's strongest associations, highest count first.
@@ -245,19 +343,19 @@ type assocEntry struct {
 // with a token tie-break so the walk is deterministic: an unstable order here would
 // make the golden samples irreproducible, which is the whole reason they are useful.
 func (g *Generator) topAssoc(word string, limit int) []assocEntry {
-	merged := map[string]uint64{}
+	merged := map[string]corpus.TopicAssoc{}
 
 	if assoc, err := g.corpus.TopicWordsFor(word); err == nil {
 		for other, d := range assoc {
 			if d.Count >= twoHopMinCount {
-				merged[other] = d.Count
+				merged[other] = d
 			}
 		}
 	}
 	if assoc, err := g.corpus.NameTopicsFor(word); err == nil {
 		for other, d := range assoc {
-			if d.Count >= twoHopMinCount && d.Count > merged[other] {
-				merged[other] = d.Count
+			if d.Count >= twoHopMinCount && d.Count > merged[other].Count {
+				merged[other] = d
 			}
 		}
 	}
@@ -266,12 +364,12 @@ func (g *Generator) topAssoc(word string, limit int) []assocEntry {
 	}
 
 	out := make([]assocEntry, 0, len(merged))
-	for w, c := range merged {
-		out = append(out, assocEntry{word: w, count: c})
+	for w, d := range merged {
+		out = append(out, assocEntry{word: w, assoc: d})
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if out[i].count != out[j].count {
-			return out[i].count > out[j].count
+		if out[i].assoc.Count != out[j].assoc.Count {
+			return out[i].assoc.Count > out[j].assoc.Count
 		}
 		return out[i].word < out[j].word
 	})
@@ -367,7 +465,8 @@ func (g *Generator) drawAttestedSeed(cands map[string]float64, prompt map[string
 	return ""
 }
 
-// Jump finds a related word when generation dead-ends mid-sentence.
+// Jump finds a related word when generation dead-ends mid-sentence, or returns "" when
+// jumping would cost more than it buys.
 //
 // Same machinery as the two-hop expansion rather than a second implementation, which
 // is the other half of deleting the cluster path: legacy had a cluster-based pivot and
@@ -379,7 +478,58 @@ func (g *Generator) drawAttestedSeed(cands map[string]float64, prompt map[string
 // whose usual position is near the middle of a sentence, because jumping to a word that
 // normally ends sentences produces an abrupt stop and one that normally starts them
 // reads as a restart.
-func (g *Generator) Jump(in SeedInput, sentence []string) string {
+//
+// # Why this is bounded, and why the bounds live here
+//
+// A jump appends a word with NO n-gram relationship to the word before it: it comes out
+// of the co-occurrence indexes, not out of the chain. So the join is not occasionally
+// rough, it is guaranteed rough, and in live output it was the signature of every
+// unreadable line while the purely chain-generated ones landed fine:
+//
+//	what's the point of even a | know i do that
+//	back to the | go
+//	u just what if you dont have | get the raped
+//
+// On a young corpus this is not a rare fallback either. The author-diversity gate empties
+// the candidate set constantly, so dead ends are frequent and the jump was a major
+// producer of words. It also worked against length.go's own stated principle, that short
+// and punchy reads as a joke and long reads as a malfunction: it bought length with
+// coherence, which is the wrong trade for a chat bot.
+//
+// The bounds are here rather than at the caller because there are two callers, production
+// and the golden harness, and a harness that prints output the bot cannot produce is worse
+// than no harness. One decision, one place.
+//
+// It takes the Step rather than a bare sentence so that all three bounds can be answered
+// from what the engine already knows, and so the per-sentence count cannot drift out of
+// sync with the sentence it counts.
+func (g *Generator) Jump(in SeedInput, s *Step) string {
+	sentence := s.Sentence
+
+	// PAST THE LENGTH FLOOR, END INSTEAD. The jump exists to save a reply from being too
+	// short to post, and Length.Min is the definition of too short, so that is the
+	// threshold. Beyond it the length model already decided the sentence could stop, and
+	// overriding that decision to add a guaranteed seam is a bad trade.
+	if len(sentence) >= s.Length.Min {
+		return ""
+	}
+
+	// ONE SEAM PER SENTENCE. One reads as a change of subject; two read as broken. This was
+	// unbounded, so a sentence under the floor could jump at every single word.
+	if s.Jumps >= maxJumpsPerSentence {
+		return ""
+	}
+
+	// NOT AFTER A FUNCTION WORD. A determiner or a preposition demands a specific kind of
+	// continuation, so a jump there cannot read as anything but a fault: "back to the" + "go".
+	// After a content word the same jump reads as changing the subject.
+	//
+	// The jump TARGET is already never a stop word, because the association writers exclude
+	// them, so this is about the word being jumped FROM, which nothing checked.
+	if len(sentence) > 0 && text.IsStopWord(sentence[len(sentence)-1]) {
+		return ""
+	}
+
 	used := make(map[string]struct{}, len(sentence))
 	for _, w := range sentence {
 		used[w] = struct{}{}
@@ -399,12 +549,14 @@ func (g *Generator) Jump(in SeedInput, sentence []string) string {
 	// can be about.
 	for i := len(in.Names) - 1; i >= 0; i-- {
 		if best := g.bestPivot(in.Names[i], used, true); best != "" {
+			s.Jumps++
 			return best
 		}
 	}
 
 	for i := len(context) - 1; i >= 0; i-- {
 		if best := g.bestPivot(context[i], used, false); best != "" {
+			s.Jumps++
 			return best
 		}
 	}
@@ -524,4 +676,27 @@ func (g *Generator) attested(word string) bool {
 		}
 	}
 	return false
+}
+
+// TrimDangling removes trailing function words from a sentence that stopped because it ran
+// out of chain rather than because it chose to end.
+//
+// The two endings are not the same claim, which is why this takes the caller's word for
+// which one happened rather than guessing. An end sentinel means somebody really did finish
+// a message at that word, and in this register that is worth keeping even when it looks
+// abrupt. A dead end means the chain simply had nowhere to go, and stopping on "back to
+// the" or "what's the point of even a" reads as the bot being cut off mid-thought, which is
+// the same class of damage as the seam Jump was making.
+//
+// Same asymmetry attested() already makes about EndToken: what the corpus witnessed somebody
+// do is evidence, and what generation merely ran into is not.
+//
+// It will trim a sentence down to nothing if that is all it was, and that is fine: the
+// caller has a floor below which it posts nothing at all.
+func TrimDangling(sentence []string) []string {
+	end := len(sentence)
+	for end > 0 && text.IsStopWord(sentence[end-1]) {
+		end--
+	}
+	return sentence[:end]
 }

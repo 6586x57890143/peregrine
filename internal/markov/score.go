@@ -74,6 +74,14 @@ type Step struct {
 	// NameAssoc aggregates the topic associations of every recognized name in the
 	// prompt.
 	NameAssoc map[string]corpus.TopicAssoc
+
+	// PromptNames is every spelling of a name the PROMPT named, so the scorer can tell
+	// the person under discussion apart from any other person the corpus knows.
+	PromptNames map[string]struct{}
+
+	// Jumps counts the dead-end jumps this sentence has already taken. Jump reads it and
+	// increments it, so the count cannot drift away from the sentence it describes.
+	Jumps int
 }
 
 // Next picks the continuation, or returns "" when there is nothing eligible.
@@ -254,6 +262,19 @@ func (g *Generator) heuristics(s *Step, c candidate, assoc assocCache) float64 {
 	// A learned display name.
 	if g.corpus.IsName(tok) {
 		logit += w.IsName
+	}
+
+	// THE PERSON THE MESSAGE WAS ABOUT, which is a different claim from the one above.
+	// IsName rewards every learned name equally, so a reply to "what is up with lachy"
+	// was as likely to name a bystander as to name lachy, and answering by naming
+	// somebody else entirely is the failure this closes.
+	//
+	// Flat rather than summed over evidence, so no tanh: it is one token being either
+	// the subject or not. It also cannot make the bot chant the name, because
+	// ImmediateRepeat at -2.50 fires on anything seen in the last five words and swamps
+	// this after the first emission.
+	if _, ok := s.PromptNames[tok]; ok {
+		logit += w.PromptName
 	}
 
 	// Persona vocabulary. One call, shared with the post-pass in persona.go, rather

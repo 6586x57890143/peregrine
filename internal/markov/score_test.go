@@ -151,6 +151,12 @@ func TestHeuristicsAreBoundedEvenUnderPiledUpEvidence(t *testing.T) {
 	}
 	s.Position = 0.5
 
+	// The candidate is also the person under discussion and a learned name, so BOTH name
+	// terms fire. Without this the test would pass just as well against an unbounded
+	// PromptName, since the term simply would not be reached.
+	s.PromptNames = map[string]struct{}{"loose": {}}
+	f.names["loose"] = true
+
 	g := New(f, testParams(), seeded(1, 2))
 	assoc := g.loadAssoc(s)
 	got := g.heuristics(s, candidate{token: "loose"}, assoc)
@@ -159,7 +165,7 @@ func TestHeuristicsAreBoundedEvenUnderPiledUpEvidence(t *testing.T) {
 	// is unbounded again.
 	w := DefaultWeights()
 	ceiling := w.TopicGravity + w.NameAssoc + w.CurrentTopic + w.Significance +
-		w.IsName + w.Persona + w.RecentContext + w.PromptGravity +
+		w.IsName + w.PromptName + w.Persona + w.RecentContext + w.PromptGravity +
 		g.params.PromptRelevance + w.Connective
 
 	if got > ceiling {
@@ -242,5 +248,38 @@ func TestRepetitionPenaltyIsCappedSoMemesSurvive(t *testing.T) {
 				"reached its cap", uses, last, got)
 		}
 		last = got
+	}
+}
+
+// TestThePromptNameOutscoresABystander is the pin for the distinction IsName cannot make.
+//
+// IsName rewards every learned name equally, so a reply to "what is up with lachy" was as
+// likely to name somebody else in the server as to name lachy. Answering a question about one
+// person by naming a different one is the specific failure this closes, and it is invisible to
+// any test that only checks a name gets some edge.
+//
+// Verified by reverting: drop the PromptNames term from heuristics and this fails.
+func TestThePromptNameOutscoresABystander(t *testing.T) {
+	f := newFake()
+	f.learn(5, "alice", "the bird is loose")
+	f.learn(5, "bob", "the bird is loose")
+
+	// Two learned names. Only one of them is who the message was about.
+	f.names["lachy"] = true
+	f.names["someoneelse"] = true
+
+	s := newStep([]string{"the", "bird"})
+	s.PromptNames = map[string]struct{}{"lachy": {}}
+
+	g := New(f, testParams(), seeded(1, 2))
+	assoc := g.loadAssoc(s)
+
+	subject := g.heuristics(s, candidate{token: "lachy"}, assoc)
+	bystander := g.heuristics(s, candidate{token: "someoneelse"}, assoc)
+
+	if subject <= bystander {
+		t.Errorf("the person under discussion scored %.4f against a bystander's %.4f. Both are "+
+			"learned names, so IsName cannot separate them and only PromptName can",
+			subject, bystander)
 	}
 }

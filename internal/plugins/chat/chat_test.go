@@ -702,14 +702,29 @@ func TestTheKeywordTriggerRepliesWithoutAMention(t *testing.T) {
 			}
 
 			// Overheard rather than addressed, so it ALWAYS roasts. That is a decision, not a
-			// chance: the bot is being talked about and answers self-referentially.
+			// chance: the bot is being talked about.
 			if len(speaker.roasts) != 1 || !speaker.roasts[0] {
 				t.Errorf("roast = %v, want true: an overheard self-mention always roasts",
 					speaker.roasts)
 			}
-			// And the prompt is self-referential rather than the user's sentence.
-			if len(speaker.prompts) != 1 || !strings.Contains(speaker.prompts[0], "peregrine") {
-				t.Errorf("prompt = %q, want a self-referential one", speaker.prompts)
+
+			// THE WHOLE MESSAGE REACHES THE GENERATOR. This branch used to replace the prompt
+			// with the fixed string "<START> peregrine", which discarded every other word in
+			// it, so "peregrine what is up with lachy" lost "lachy" and no name tier or topic
+			// tier ever saw the thing the message was actually about. On the path the operator
+			// calls the main way to use the bot.
+			//
+			// It is still self-referential, and by construction rather than by a substitution:
+			// this branch only runs when the self-mention pattern matched, so the keyword is
+			// already in the prompt. Asserted below so that a future change cannot satisfy this
+			// test by passing something that has lost the keyword.
+			content := "has anyone seen " + word + " today"
+			if len(speaker.prompts) != 1 || speaker.prompts[0] != content {
+				t.Errorf("prompt = %q, want the message itself, %q", speaker.prompts, content)
+			}
+			if len(speaker.prompts) == 1 && !s.opts.SelfMention.MatchString(speaker.prompts[0]) {
+				t.Errorf("prompt %q no longer contains the self-mention keyword, so the reply "+
+					"has stopped being self-referential", speaker.prompts[0])
 			}
 		})
 	}

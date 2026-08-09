@@ -111,6 +111,21 @@ func (l *Learner) mentionPattern() *regexp.Regexp {
 // Every path into the corpus goes through here. Do not add a second one.
 func (l *Learner) Message(w *storage.Writer, msg, msgID string, author names.User, mentioned []names.User) error {
 	msg = strings.TrimSpace(l.mentionPattern().ReplaceAllString(msg, ""))
+
+	// Mentions of OTHER people become their names, immediately after the bot's own mention has
+	// been removed. The bot's is stripped rather than substituted, so that stays as it was.
+	//
+	// The tokenizer keeps <@123> as one whole token, so without this the corpus stores an
+	// opaque ID where a name belongs and the chain can never walk into or out of a person's
+	// name. It goes BEFORE the gate on purpose: the gate has to see the text that will
+	// actually be learned, and a substituted name is text the corpus will hold. The
+	// consequence is that a member whose name matches a blocklist pattern costs the message,
+	// which is the correct direction for a gate that fails closed.
+	//
+	// This is not the laundering the package comment forbids. That rule is about rewriting
+	// flagged content so it passes; this is normalizing a display encoding before anything is
+	// judged, and safety.Verdict still has no field for rewritten text.
+	msg = names.Substitute(msg, mentioned)
 	if msg == "" {
 		return nil
 	}
@@ -147,7 +162,8 @@ func (l *Learner) Message(w *storage.Writer, msg, msgID string, author names.Use
 		return nil
 	}
 
-	if err := l.recordAuthor(w, author); err != nil {
+	authorName, err := l.recordAuthor(w, author)
+	if err != nil {
 		return err
 	}
 
@@ -169,6 +185,24 @@ func (l *Learner) Message(w *storage.Writer, msg, msgID string, author names.Use
 	if err != nil {
 		return err
 	}
+
+	// THE AUTHOR COUNTS AS A NAME THIS MESSAGE IS ABOUT, and adding them here rather than at
+	// the callers is the whole point of this line.
+	//
+	// associate returns early when this set is empty, so a caller that passed no names taught
+	// the corpus no associations AT ALL: not the name-to-word index every name-aware seed tier
+	// reads, and not the word-to-word index tiers 3 and 6 and all of Jump read. The live chat
+	// handler appended the author to its mentioned slice and the backfill did not, and the
+	// backfill is where most of a corpus comes from, so both indexes stayed nearly empty on a
+	// bot that looked like it was learning fine.
+	//
+	// That is A1's shape exactly: one entry point, two callers, one of them doing an extra
+	// step. Every test in this package passed the author in, which is how the divergence
+	// stayed invisible. Put it here and a third caller cannot get it wrong.
+	if authorName != "" {
+		canonicalNames[authorName] = struct{}{}
+	}
+
 	if err := l.associate(w, words, canonicalNames); err != nil {
 		return err
 	}
@@ -192,21 +226,28 @@ func (l *Learner) Message(w *storage.Writer, msg, msgID string, author names.Use
 	return nil
 }
 
-// recordAuthor updates the author's name record and their weekly message count.
-func (l *Learner) recordAuthor(w *storage.Writer, author names.User) error {
+// recordAuthor updates the author's name record and their weekly message count, and returns
+// the canonical form of their name.
+//
+// The canonical name is returned rather than discarded because Message needs it for the
+// association set: an author is a name this message is about, and the caller is not the right
+// place to decide that. An empty return means there was nothing to record, which is the same
+// answer for a message with no author ID and for a name that would not write.
+func (l *Learner) recordAuthor(w *storage.Writer, author names.User) (string, error) {
 	if author.UserID == "" {
-		return nil
+		return "", nil
 	}
-	if _, err := names.Record(w, author.Name, author.UserID, author.Username); err != nil {
+	canonical, err := names.Record(w, author.Name, author.UserID, author.Username)
+	if err != nil {
 		// Not fatal to the message. A name that would not write is a lost association,
 		// whereas abandoning here would lose the n-grams too.
 		log.Printf("[WARN] Failed to record author name %q: %v", author.Name, err)
-		return nil
+		return "", nil
 	}
 
 	stat, _, err := w.UserStat(author.UserID)
 	if err != nil {
-		return fmt.Errorf("read stats for %s: %w", author.UserID, err)
+		return "", fmt.Errorf("read stats for %s: %w", author.UserID, err)
 	}
 	now := time.Now().UTC()
 	if stat.LastTimestamp.Before(corpus.StartOfWeekUTC(now)) {
@@ -216,9 +257,9 @@ func (l *Learner) recordAuthor(w *storage.Writer, author names.User) error {
 	}
 	stat.LastTimestamp = now
 	if err := w.PutUserStat(author.UserID, stat); err != nil {
-		return fmt.Errorf("write stats for %s: %w", author.UserID, err)
+		return "", fmt.Errorf("write stats for %s: %w", author.UserID, err)
 	}
-	return nil
+	return canonical, nil
 }
 
 // recordNames writes every mentioned person and returns the set of canonical names.
@@ -238,7 +279,11 @@ func (l *Learner) recordNames(w *storage.Writer, mentioned []names.User) (map[st
 // associate writes the name-to-word and word-to-word indexes.
 //
 // Both are gated on a name being present, which is the original design: associations are
-// built from user-provided context rather than from every message.
+// built from user-provided context rather than from every message. Message now always puts
+// the author in that set, so in practice the guard only catches a message with no author ID
+// at all, such as a webhook. It stays because the early return is what made the missing
+// author cost the whole message its associations, and a guard that describes its own
+// precondition is worth more than one fewer branch.
 //
 // The word-to-word loop is WINDOWED, which closes the rest of finding 12. It was all-pairs
 // and therefore quadratic in message length, running inside the single write transaction
