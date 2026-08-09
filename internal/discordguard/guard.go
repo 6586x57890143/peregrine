@@ -1,0 +1,294 @@
+// Package discordguard is the single chokepoint every outbound Discord call passes
+// through.
+//
+// It exists for one reason above all others: NOTHING PEREGRINE POSTS MAY PING.
+//
+// That matters more here than in most bots, and the reason is structural rather than
+// cautious. Peregrine's output is Markov text assembled from arbitrary user messages, so
+// every send is untrusted-input-shaped BY CONSTRUCTION. A user mention that got learned
+// is now a token in the corpus like any other, and the generator will emit it again
+// whenever the chain walks through it, which means it pings that person forever. Nobody
+// chose that and nobody can predict when it fires.
+//
+// discordgo will not stop it. Every send helper there builds its request with a nil
+// AllowedMentions, and the field carries `omitempty`, so it is dropped from the JSON
+// entirely and Discord reads a missing field as "parse every mention in the content".
+// Supplying a non-nil AllowedMentions whose Parse is an explicit empty slice sends
+// "parse":[] , which is Discord's documented "allow nothing" (SPEC.md section 8,
+// finding 8).
+//
+// The fix is one pointer and one slice, and the second half is easy to leave out: see
+// allowedMentions for why the slice is set explicitly rather than left zero, which is
+// something the test in this package established by trying it.
+//
+// # Why a chokepoint and not thirteen call sites
+//
+// This is the same argument as safety.CheckLearn living inside learnMessage. There were
+// thirteen places that send something, and a rule applied at twelve of them is not a
+// rule: the thirteenth is where the incident comes from, and the fourteenth has not been
+// written yet. Suppression here means a future send is covered without its author having
+// to know this package exists.
+//
+// The same goes for CheckEmit. Until M10 it sat at the single exit from generation,
+// which covered the reply path and nothing else: the autonomous poster, the word-game
+// announcements and the transcription results all reached Discord without passing it.
+// Generation is not the only thing that produces text.
+//
+// # What this deliberately does NOT port from merlin
+//
+// Merlin's discordguard carries a per-guild pause, a dry-run mode, a write governor and
+// an audit journal, because its dangerous operations are irreversible from Discord's
+// side: a deleted archive channel, a member stripped of every role. Peregrine deletes
+// nothing and edits no permissions. Its dangerous operation is SPEAKING, and the
+// controls that fit that are one process-wide pause and one content gate, both of which
+// already exist in internal/safety. Porting the rest would be structure with no failure
+// mode behind it.
+package discordguard
+
+import (
+	"log/slog"
+
+	"github.com/bwmarrin/discordgo"
+)
+
+// Session is the narrow slice of discordgo the guard calls.
+//
+// *discordgo.Session satisfies it structurally, which is the convention the rest of
+// this repo uses: the consumer declares what it needs and the concrete type happens to
+// fit. It is also what lets the tests here assert on the exact request that would have
+// gone to Discord, which is the only way to check a field that only matters once it has
+// been marshalled.
+//
+// Note that every send goes through ChannelMessageSendComplex, including the ones a
+// caller expresses as plain content. That is not indirection for its own sake: the
+// simple helpers in discordgo are precisely the ones that cannot express
+// AllowedMentions, so routing through Complex is what makes suppression possible at all.
+type Session interface {
+	ChannelMessageSendComplex(channelID string, data *discordgo.MessageSend, options ...discordgo.RequestOption) (*discordgo.Message, error)
+	ChannelMessageEditComplex(m *discordgo.MessageEdit, options ...discordgo.RequestOption) (*discordgo.Message, error)
+	ChannelMessageDelete(channelID, messageID string, options ...discordgo.RequestOption) error
+	MessageReactionAdd(channelID, messageID, emojiID string, options ...discordgo.RequestOption) error
+}
+
+// EmitGate is the outbound half of internal/safety. *safety.Gate satisfies it.
+//
+// Declared as an interface rather than taking the concrete type so this package does not
+// import safety, which keeps the dependency pointing one way and lets a test drive the
+// guard with a gate that refuses everything.
+type EmitGate interface {
+	// CheckEmit reports whether text may be sent. The guard only needs the boolean;
+	// the gate itself owns the logging, the counters and the operator alert, because
+	// the reason a send was refused belongs to whoever decided to refuse it.
+	CheckEmit(text string) bool
+}
+
+// Guard owns every outbound call.
+//
+// Safe for concurrent use: it holds no mutable state of its own, and the gate's pause
+// flag is an atomic. One instance serves every goroutine.
+type Guard struct {
+	session Session
+	gate    EmitGate
+	log     *slog.Logger
+
+	// ignoreChannels are channel IDs the bot must never post in, from
+	// PEREGRINE_IGNORE_CHANNELS.
+	//
+	// Enforced here rather than in the reply logic because it has to hold for the
+	// autonomous poster and the word games too. An operator setting this is saying
+	// "not in there", not "not in reply to a message in there", and a check in the
+	// reply path only would have been the weaker of the two readings.
+	ignoreChannels map[string]struct{}
+}
+
+// New builds a Guard. A nil logger discards.
+func New(s Session, gate EmitGate, log *slog.Logger, ignoreChannels []string) *Guard {
+	ignore := make(map[string]struct{}, len(ignoreChannels))
+	for _, id := range ignoreChannels {
+		if id != "" {
+			ignore[id] = struct{}{}
+		}
+	}
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
+	return &Guard{session: s, gate: gate, log: log, ignoreChannels: ignore}
+}
+
+// allowedMentions is the suppression, in one place.
+//
+// A non-nil pointer to a zero value, and every part of that matters:
+//
+//   - Non-nil, because a nil pointer is dropped by omitempty and Discord treats the
+//     absent field as "parse everything".
+//
+//   - Parse set to an EXPLICIT empty slice, which marshals as "parse":[] , the form
+//     Discord's documentation gives for "allow nothing".
+//
+//     This is deliberately more explicit than it strictly has to be, and the reason is
+//     worth recording because it looks redundant. discordgo leaves Parse without
+//     omitempty and its comment says a zero-value struct therefore allows no mentions,
+//     which is true of the FIELD being present but not of its value: a nil slice
+//     marshals as "parse":null, not "parse":[]. That works only if Discord treats a
+//     present allowed_mentions object with a null parse the same as an empty one, which
+//     is a reasonable reading of the API and is not something the documentation says.
+//     Setting the slice costs nothing and removes the dependency on that reading. The
+//     test asserts the wire form, so if a future discordgo changes the tags it fails
+//     here rather than in a channel.
+//
+//   - Roles and Users likewise empty rather than nil, for the same reason.
+//
+//   - RepliedUser false, which is the field a reply needs and a plain send does not.
+//     discordgo's ChannelMessageSendReply sets no AllowedMentions at all, so Discord's
+//     default applied and the author of the replied-to message was pinged on EVERY
+//     interaction. In a bot that answers whenever it hears its own name, that is a
+//     notification per conversation, forever.
+func allowedMentions() *discordgo.MessageAllowedMentions {
+	return &discordgo.MessageAllowedMentions{
+		Parse:       []discordgo.AllowedMentionType{},
+		Roles:       []string{},
+		Users:       []string{},
+		RepliedUser: false,
+	}
+}
+
+// Send posts content to a channel with every mention suppressed and the emit gate
+// applied. It reports whether the message was sent.
+//
+// A refusal is not an error and the bot stays SILENT: no fallback string, no apology
+// message. Silence is always safe, whereas a fallback is a new output that has to be
+// reasoned about, and in a bot that already replies selectively an unexplained silence
+// is indistinguishable from it choosing not to answer.
+func (g *Guard) Send(channelID, content string) (*discordgo.Message, bool) {
+	return g.SendReply(channelID, content, nil)
+}
+
+// SendReply posts content as a reply to ref, or as a plain message when ref is nil.
+//
+// One method for both, because the reply case is the one that pings and splitting them
+// is how a future caller ends up on a path that forgot RepliedUser.
+func (g *Guard) SendReply(channelID, content string, ref *discordgo.MessageReference) (*discordgo.Message, bool) {
+	if !g.permit(channelID, content, "send") {
+		return nil, false
+	}
+
+	msg, err := g.session.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
+		Content:         content,
+		Reference:       ref,
+		AllowedMentions: allowedMentions(),
+	})
+	if err != nil {
+		// Logged, never discarded. Every one of these calls used to throw its error
+		// away, so a send Discord refused (missing permission, rate limit, channel
+		// deleted mid-flight) was indistinguishable from one that worked: the bot
+		// appeared to ignore people at random with nothing in the log to say why.
+		g.log.Error("discord send failed", "channel", channelID, "err", err)
+		return nil, false
+	}
+	return msg, true
+}
+
+// Edit replaces the content of a message the bot already sent.
+//
+// Gated and suppressed like a send, and for the same reason rather than for symmetry:
+// an edit can introduce a mention that the original did not have, so an unsuppressed
+// edit is a send with extra steps. This is the path the transcription worker takes to
+// fill in its placeholder, which means the text arriving here is a Whisper transcript
+// of arbitrary audio.
+func (g *Guard) Edit(channelID, messageID, content string) bool {
+	if !g.permit(channelID, content, "edit") {
+		return false
+	}
+
+	if _, err := g.session.ChannelMessageEditComplex(&discordgo.MessageEdit{
+		Channel:         channelID,
+		ID:              messageID,
+		Content:         &content,
+		AllowedMentions: allowedMentions(),
+	}); err != nil {
+		g.log.Error("discord edit failed", "channel", channelID, "message", messageID, "err", err)
+		return false
+	}
+	return true
+}
+
+// Delete removes a message.
+//
+// NOT gated on content, because there is no content: deleting says nothing and cannot
+// ping. It is still routed through here so that every Discord call has one place that
+// logs it, and so an ignored channel stays untouched.
+//
+// It logs at a lower urgency than the others on purpose. Failing to delete is routinely
+// benign: somebody removed the message first, or the bot has no Manage Messages in that
+// channel, and neither is worth alarming an operator about.
+func (g *Guard) Delete(channelID, messageID string) bool {
+	if g.ignored(channelID, "delete") {
+		return false
+	}
+	if err := g.session.ChannelMessageDelete(channelID, messageID); err != nil {
+		g.log.Info("discord delete failed, often benign", "channel", channelID, "message", messageID, "err", err)
+		return false
+	}
+	return true
+}
+
+// React adds a reaction.
+//
+// Gated on the pause switch but not on content, because an emoji the operator
+// configured is not untrusted text. It is here so that PEREGRINE_PAUSE_ALL_WRITES means
+// what it says: during an incident the bot should stop reacting too, since a reaction is
+// still the bot visibly participating.
+func (g *Guard) React(channelID, messageID, emoji string) bool {
+	if g.ignored(channelID, "react") {
+		return false
+	}
+	if !g.gate.CheckEmit("") {
+		// An empty string cannot trip a content rule, so the only thing this can
+		// refuse is the pause switch, which is exactly what is wanted.
+		g.log.Info("reaction suppressed", "channel", channelID)
+		return false
+	}
+	if err := g.session.MessageReactionAdd(channelID, messageID, emoji); err != nil {
+		g.log.Info("discord reaction failed", "channel", channelID, "message", messageID, "err", err)
+		return false
+	}
+	return true
+}
+
+// permit runs the two checks every text-bearing call shares.
+func (g *Guard) permit(channelID, content, op string) bool {
+	if g.ignored(channelID, op) {
+		return false
+	}
+	if content == "" {
+		// Discord refuses an empty message anyway, and reaching here with one means a
+		// caller decided to stay silent and then called us regardless. Refusing keeps
+		// that from becoming an API error in the log that looks like a real failure.
+		return false
+	}
+	if !g.gate.CheckEmit(content) {
+		// The gate has already logged the reason, the category and the rule, and it
+		// deliberately does not log the content. Nothing to add here.
+		return false
+	}
+	return true
+}
+
+func (g *Guard) ignored(channelID, op string) bool {
+	if _, ok := g.ignoreChannels[channelID]; ok {
+		g.log.Debug("channel is on the ignore list", "channel", channelID, "op", op)
+		return true
+	}
+	return false
+}
+
+// Ignored reports whether a channel is on the ignore list, for callers that want to
+// skip work rather than do it and have the result refused.
+//
+// Generating a reply costs a corpus walk, so the reply path checks this before
+// generating. That is an optimization and not the enforcement: the enforcement is in
+// permit, where a caller cannot forget it.
+func (g *Guard) Ignored(channelID string) bool {
+	_, ok := g.ignoreChannels[channelID]
+	return ok
+}

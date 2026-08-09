@@ -8,7 +8,7 @@ Sibling project to [merlin](../merlin), whose deployment conventions this repo f
 
 Mid-restructure. The bot works and runs, but it is being taken from a single 3,200-line `main.go` to a proper package layout one subsystem at a time, with a catalogue of known defects being closed along the way. See `SPEC.md` §8 for the defect list and §9 for the milestone order.
 
-**Milestones 0 through 7b are complete:** repo hygiene and CI/CD, the `cmd/bot` entrypoint, `internal/config`, the `internal/core` lifecycle, `internal/text` plus `internal/filter`, `internal/safety`, the storage layer (`internal/corpus`, `internal/storage`, `internal/dbtest`, `internal/maintenance`), and the generation engine `internal/markov`.
+**Milestones 0 through 7b and 10a are complete:** repo hygiene and CI/CD, the `cmd/bot` entrypoint, `internal/config`, the `internal/core` lifecycle, `internal/text` plus `internal/filter`, `internal/safety`, the storage layer (`internal/corpus`, `internal/storage`, `internal/dbtest`, `internal/maintenance`), the generation engine `internal/markov`, and the send chokepoint `internal/discordguard`. M8 is dropped; M9 and M10b are outstanding.
 
 M6b is what put the bot on the seam, and it is the commit that closes the worst bug in the review rather than designing around it. `internal/legacy` no longer imports bbolt at all, so nothing in it can hold a database handle, name a bucket, or start a transaction: generation used to run inside a read transaction and call two helpers that each opened their own, which is a hang with no timeout and no recovery that got likelier as the corpus grew. A test pins the import, because the import is the whole invariant.
 
@@ -31,7 +31,11 @@ Two things worth knowing before running it anywhere real:
 - **The safety gate is in as of M5**, and it is the reason the bot is closer to deployable than it was. `CheckLearn` sits inside `learnMessage`, so the backfill path that used to re-learn blocked messages minutes later is covered by construction; `CheckEmit` sits at the generation exit. Matching happens against a normalized form, so spacing, leet, homoglyphs, combining marks and zero-width characters no longer walk through. **Set `PEREGRINE_BLOCKLIST_PATH` before pointing it at a hostile channel:** without it the bot runs on the built-in baseline only and warns loudly at startup, and the operator list is where the threat and illegal-content patterns live.
 - **The corpus format changed in M6 and there is no migration.** `storage.Open` refuses a corpus written before it, with an error saying what to do, rather than opening it and silently ignoring every key in it. Deploying this needs `docker volume rm peregrine_corpus` once; see "Start the corpus over" below and `SPEC.md` §3.4.
 
-Still open before this is genuinely safe to leave running: mentions are not suppressed (finding 8, M10), and `CheckEmit` covers the generation exit rather than all thirteen send sites (M10). Author diversity is no longer on that list as of M7a.
+**M10a closed the last safety blocker.** `internal/discordguard` is the single chokepoint every outbound Discord call goes through, and it suppresses mentions on all of them. That matters here more than in most bots: peregrine's output is Markov text built from what users typed, so a mention that got learned is a corpus token like any other and the generator will emit it again whenever the chain walks through it. Replies were pinging their author on every single interaction, because discordgo's reply helper sets no allowed-mentions field at all and Discord reads the absent field as "parse everything".
+
+`CheckEmit` moved into the guard at the same time, which closed real holes rather than tidying: it had been sitting at the generation exit, so the autonomous poster, the word-game announcements and the transcription results all reached Discord ungated. A structural test parses the package and fails if any new send site skips the guard, because a rule applied at thirteen of fourteen call sites is not a rule.
+
+Nothing is outstanding on the safety list now. What remains before a deploy is the operator's call, not a missing control.
 
 ## Quick start
 

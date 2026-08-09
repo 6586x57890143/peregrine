@@ -430,3 +430,121 @@ func containsCall(body *ast.BlockStmt, recv, method string) bool {
 func writeFile(path, content string) error {
 	return os.WriteFile(path, []byte(content), 0o600)
 }
+
+// TestNothingBypassesTheGuard is the structural pin for finding 8 and A3, and it is a
+// source check for the same reason TestThisPackageCannotReachBbolt is an import check:
+// the invariant is "no code here can reach the unsuppressed path", and the cheapest exact
+// way to state that is to look for the calls.
+//
+// A behavioural test cannot cover this. Mention suppression only matters once a request
+// has been marshalled and sent to Discord, so a test that exercises a handler proves
+// nothing about a call site it happens not to reach, and the whole problem was that
+// thirteen sites existed and a rule at twelve of them is not a rule. The discordguard
+// package has the behavioural tests, on the wire form; this one's job is to prove that
+// every send in legacy actually goes there.
+//
+// The three adapters are the permitted exceptions and they are named individually rather
+// than allowed by pattern, so adding a fourth is a deliberate edit to this list with a
+// reviewer looking at it.
+func TestNothingBypassesTheGuard(t *testing.T) {
+	// Methods that send, edit, delete or react. Reads such as ChannelMessages and
+	// ChannelMessage are deliberately absent: they cannot ping and gating them would
+	// stop the bot from learning, which is the asymmetry PAUSE_ALL_WRITES already has.
+	forbidden := []string{
+		"ChannelMessageSend",
+		"ChannelMessageSendComplex",
+		"ChannelMessageSendReply",
+		"ChannelMessageSendEmbed",
+		"ChannelMessageEdit",
+		"ChannelMessageEditComplex",
+		"ChannelMessageDelete",
+		"MessageReactionAdd",
+	}
+
+	// The adapters in legacy.go that are allowed to name the raw session, by the
+	// function they sit in.
+	allowed := map[string]bool{
+		"sendMessage":   true,
+		"editMessage":   true,
+		"deleteMessage": true,
+	}
+
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+
+	fset := token.NewFileSet()
+	for _, name := range files {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+
+		// Walk function by function, so the enclosing function name is known and the
+		// allow list can be scoped to it rather than to the file.
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			if allowed[fn.Name.Name] {
+				continue
+			}
+			ast.Inspect(fn, func(n ast.Node) bool {
+				sel, ok := n.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				for _, bad := range forbidden {
+					if sel.Sel.Name != bad {
+						continue
+					}
+					// A call on the guard is the point of the exercise; only a call on
+					// something else (the session) is a bypass. The guard's own methods
+					// are named differently (Send, Edit, Delete, React) so any match
+					// here is a raw session call.
+					t.Errorf("%s: %s calls %s directly. Every outbound Discord call must go "+
+						"through internal/discordguard, or it sends without mention "+
+						"suppression and without CheckEmit (SPEC.md section 8, finding 8, "+
+						"and section 4, A3). If a new adapter is genuinely needed, add it to "+
+						"the allow list in this test deliberately.",
+						fset.Position(sel.Pos()), fn.Name.Name, bad)
+				}
+				return true
+			})
+		}
+	}
+}
+
+// TestTheGuardAdaptersAreTheOnlyOnes keeps the allow list above honest. If one of the
+// three adapters is renamed or removed, the entry left behind would silently permit a
+// bypass in a function that happens to take its name later.
+func TestTheGuardAdaptersAreTheOnlyOnes(t *testing.T) {
+	for _, name := range []string{"sendMessage", "editMessage", "deleteMessage"} {
+		found := false
+		files, _ := filepath.Glob("*.go")
+		fset := token.NewFileSet()
+		for _, f := range files {
+			if strings.HasSuffix(f, "_test.go") {
+				continue
+			}
+			file, err := parser.ParseFile(fset, f, nil, parser.SkipObjectResolution)
+			if err != nil {
+				t.Fatalf("parse %s: %v", f, err)
+			}
+			for _, decl := range file.Decls {
+				if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == name {
+					found = true
+				}
+			}
+		}
+		if !found {
+			t.Errorf("%q is on the guard-bypass allow list but no longer exists; a stale "+
+				"entry would permit a bypass in whatever function takes that name next", name)
+		}
+	}
+}

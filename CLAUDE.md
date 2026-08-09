@@ -205,13 +205,31 @@ Every runtime path used to be resolved against the working directory, so startin
 
 The dictionary load used to be `log.Fatalf`, so a missing 64 KB word list killed learning, generation, replies and everything else along with word games. It now logs a warning and sets `wordGamesAvailable = false`. Treat this as the general rule: peregrine is a bag of loosely related engagement behaviors, and exactly one of them failing should disable that one. `log.Fatal` is for "the token is missing" and "the corpus will not open", nothing else.
 
+### Every outbound Discord call goes through `internal/discordguard`
+
+**Nothing peregrine posts may ping, and this is where that is enforced.** Peregrine's output is Markov text assembled from arbitrary user messages, so every send is untrusted-input-shaped *by construction*: a user mention that got learned is a corpus token like any other, and the generator emits it again whenever the chain walks through it. Nobody chose that and nobody can predict when it fires.
+
+discordgo will not stop it. Its send helpers build a request with a nil `AllowedMentions`, the field carries `omitempty`, so it is dropped from the JSON and Discord reads a missing field as "parse every mention". `ChannelMessageSendReply` additionally sets nothing, so the replied-to author was pinged on **every single interaction** (finding 8).
+
+**Set the slices explicitly, do not rely on the zero value.** `&discordgo.MessageAllowedMentions{}` marshals as `"parse":null`, not `"parse":[]`. discordgo's own comment says a zero value allows no mentions, and that is true of the field being *present* but not of its value being the documented empty array; whether Discord treats a null parse like an empty one is a fair reading that is not written down. `allowedMentions()` sets `Parse`, `Roles` and `Users` to empty slices and `RepliedUser` false. The test asserts the **marshalled JSON**, because that is the only place the difference exists.
+
+**The guard is a chokepoint for the same reason `CheckLearn` lives inside `learnMessage`.** Fourteen call sites send something; a rule applied at thirteen of them is not a rule. `TestNothingBypassesTheGuard` parses the package and fails if any function outside the three named adapters calls `ChannelMessageSend*`, `ChannelMessageEdit*`, `ChannelMessageDelete` or `MessageReactionAdd` on a session. A behavioural test cannot cover this: suppression only matters once a request is marshalled, so a handler test proves nothing about a site it does not reach.
+
+**`CheckEmit` moved here from the generation exit, and that closed real holes.** It used to cover the reply path only, so the autonomous poster, the word-game announcements and the transcription results all reached Discord ungated. Generation is not the only thing that produces text: the worst case was the transcript path, where someone could have had the bot say anything by saying it out loud.
+
+**Deletes are not content-gated and reactions are.** A delete says nothing and cannot ping, so gating it would stop the bot cleaning up during exactly the incident it needs to. A reaction is the bot visibly participating, so `PAUSE_ALL_WRITES` has to stop it.
+
+**`PEREGRINE_IGNORE_CHANNELS` is enforced in the guard, not the reply path.** An operator setting it means "not in there", not "not in reply to a message in there", so the autonomous poster and word games have to respect it. It does not stop *learning* from those channels, which is the same asymmetry `PAUSE_ALL_WRITES` has.
+
 ### Discord calls are logged, never discarded
 
-`sendMessage`, `editMessage` and `deleteMessage` in `internal/legacy/legacy.go` wrap the `discordgo` calls. Every one of these used to discard its error, so a send Discord refused (missing permission, rate limit, channel deleted mid-flight) was indistinguishable from one that succeeded: the bot appeared to ignore people at random with nothing in the log. They are deliberately thin because M10 replaces them with `internal/discordguard`, which owns the same logging plus mention suppression and the outbound safety gate at a single chokepoint. Add new sends through these helpers, not through `s.ChannelMessage*` directly.
+Every one of them used to discard its error, so a send Discord refused (missing permission, rate limit, channel deleted mid-flight) was indistinguishable from one that succeeded: the bot appeared to ignore people at random with nothing in the log. The guard logs all four operations, at deliberately different levels: a failed send or edit is an error, whereas a failed delete or reaction is Info, because failing to delete is routinely benign (somebody removed the message first, or the bot has no Manage Messages there) and alarming about it trains an operator to ignore the log.
 
-### Nothing the bot posts may ping
+`sendMessage`, `editMessage` and `deleteMessage` in `internal/legacy/legacy.go` are now three-line adapters onto the guard. They still take a `*discordgo.Session` that they ignore, so the call sites do not change shape twice: once here and again when M10b gives the plugins a guard instead of a session. They are the only functions `TestNothingBypassesTheGuard` permits to name a raw session method, and the list is explicit so adding a fourth is a deliberate edit with a reviewer looking at it.
 
-Not yet enforced, and it is finding 8 in `SPEC.md`. `discordgo.ChannelMessageSendReply` sets no `AllowedMentions`, so Discord's default applies and the replied-to author is pinged on every single interaction. This matters more here than in merlin: peregrine's output is Markov text assembled from arbitrary user messages, so **every send is untrusted-input-shaped by construction** and a user mention that got learned will ping that person forever. M10 ports merlin's guard, which overwrites `AllowedMentions` with a non-nil empty `Parse` on every send. Use a non-nil empty slice, not the zero value: a nil `Parse` marshals as `"parse":null` and only `"parse":[]` is Discord's documented "allow nothing".
+### What peregrine deliberately did NOT port from merlin's guard
+
+Merlin's `discordguard` carries a per-guild pause, a dry-run mode, a write governor and an audit journal, because its dangerous operations are irreversible from Discord's side: a deleted archive channel, a member stripped of every role. Peregrine deletes nothing and edits no permissions. Its dangerous operation is **speaking**, and the controls that fit that are one process-wide pause and one content gate, both already in `internal/safety`. Porting the rest would be structure with no failure mode behind it.
 
 ## The generation pipeline
 

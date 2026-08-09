@@ -57,6 +57,15 @@ type Config struct {
 	// saying something awful and waiting for a deploy is not acceptable.
 	PauseAllWrites bool // PEREGRINE_PAUSE_ALL_WRITES
 
+	// IgnoreChannels are channel IDs the bot must never post in.
+	//
+	// Enforced inside internal/discordguard rather than in the reply logic, because an
+	// operator setting this means "not in there" and not "not in reply to a message in
+	// there": the autonomous poster and the word games have to respect it too. It does
+	// NOT stop learning from those channels, which is the same asymmetry
+	// PauseAllWrites has and for the same reason: the output is what causes trouble.
+	IgnoreChannels []string // PEREGRINE_IGNORE_CHANNELS
+
 	// Generation. Everything here is read by internal/markov as of M7a.
 	//
 	// Creativity is deliberately absent and there is no PEREGRINE_CREATIVITY. It was
@@ -158,7 +167,6 @@ var deferredVars = map[string]string{
 	"PEREGRINE_BACKUP_TICK":                "M13",
 	"PEREGRINE_BACKUP_KEEP":                "M13",
 	"PEREGRINE_IMAGE_MAX_PER_AUTHOR":       "M11",
-	"PEREGRINE_IGNORE_CHANNELS":            "M10",
 	"PEREGRINE_INGEST_GUILD_CONCURRENCY":   "M9",
 	"PEREGRINE_INGEST_CHANNEL_CONCURRENCY": "M9",
 	"PEREGRINE_WHISPER_MODEL":              "M12",
@@ -190,6 +198,7 @@ func Load() (*Config, error) {
 
 		BlocklistPath:  l.str("PEREGRINE_BLOCKLIST_PATH", ""),
 		PauseAllWrites: l.boolVal("PEREGRINE_PAUSE_ALL_WRITES", false),
+		IgnoreChannels: l.csv("PEREGRINE_IGNORE_CHANNELS"),
 
 		// Minimum 2. Order 1 makes the prefix empty, and under the old layout an
 		// empty prefix was one bbolt key holding a map of the entire vocabulary,
