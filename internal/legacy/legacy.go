@@ -27,9 +27,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
 	"math"
 	"math/rand/v2"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +40,7 @@ import (
 	"github.com/6586x57890143/peregrine/internal/core"
 	"github.com/6586x57890143/peregrine/internal/corpus"
 	"github.com/6586x57890143/peregrine/internal/discordguard"
+	"github.com/6586x57890143/peregrine/internal/ingest"
 	"github.com/6586x57890143/peregrine/internal/markov"
 	"github.com/6586x57890143/peregrine/internal/safety"
 	"github.com/6586x57890143/peregrine/internal/storage"
@@ -46,6 +49,7 @@ import (
 	"github.com/6586x57890143/peregrine/wordgames"
 	"github.com/beevik/ntp"
 	"github.com/bwmarrin/discordgo"
+	"golang.org/x/sync/errgroup"
 )
 
 // The twelve bucket-name constants that used to live here are gone, and with them
@@ -468,7 +472,7 @@ func (s *Service) Start(ctx context.Context) error {
 			Immediate: true, // the original code ran one backfill before the loop
 			Fn: func(ctx context.Context) {
 				log.Println("[AUTO] Starting autonomous ingestion...")
-				ingestRecentMessagesIncremental(ctx, dg)
+				runIngest(ctx, dg)
 				log.Println("[AUTO] Autonomous ingestion finished.")
 			},
 		},
@@ -700,41 +704,56 @@ func getActiveChannels(ctx context.Context, s *discordgo.Session, guildID string
 
 	log.Printf("[INFO] Checking %d channels for activity in guild %s...", len(channels), guildID)
 
-	var wg sync.WaitGroup
-	activeCh := make(chan ActiveChannelInfo, len(channels))
+	// BOUNDED as of M9, and this is the other half of finding 14. The fan-out here was
+	// one goroutine per channel with no limit at all: on a bot in several large guilds
+	// that is hundreds of concurrent REST calls, which Discord answers with rate limits
+	// whose retries then make it worse.
+	//
+	// Ingestion no longer calls this at all, because a cursor answers "is this channel
+	// worth reading" as a side effect. What survives are the two callers that genuinely
+	// want to know where people are TALKING rather than what is unread: the autonomous
+	// poster picking somewhere to speak, and findRandomActiveUser picking a target. Both
+	// belong to M11, which is where the paging should become a state-cache lookup.
+	var (
+		mu     sync.Mutex
+		active []ActiveChannelInfo
+	)
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(cfg.IngestChannelConcurrency)
 
 	for _, c := range channels {
-		select {
-		case <-ctx.Done():
-			log.Printf("[INFO] Channel scanning stopped by shutdown signal.")
-			return nil // Return early if shutdown signal received
-		default:
-		}
-		if c.Type != discordgo.ChannelTypeGuildText {
+		if c == nil || c.Type != discordgo.ChannelTypeGuildText {
 			continue
 		}
-
-		wg.Add(1)
-		go func(ch *discordgo.Channel) {
-			defer wg.Done()
-			count := countRecentMessages(s, ch, cutoff)
-			if count > 0 {
-				log.Printf("[INFO] Channel #%s has %d recent messages, adding to active list.", ch.Name, count)
-				activeCh <- ActiveChannelInfo{Channel: ch, MessageCount: count}
+		ch := c
+		g.Go(func() error {
+			if gctx.Err() != nil {
+				return nil
 			}
-		}(c)
+			count := countRecentMessages(s, ch, cutoff)
+			if count == 0 {
+				return nil
+			}
+			log.Printf("[INFO] Channel #%s has %d recent messages, adding to active list.", ch.Name, count)
+			mu.Lock()
+			active = append(active, ActiveChannelInfo{Channel: ch, MessageCount: count})
+			mu.Unlock()
+			return nil
+		})
 	}
+	// Workers never return an error: one unreadable channel must not abandon the rest,
+	// and errgroup cancels its context on the first error it sees.
+	_ = g.Wait()
 
-	// Close channel when all goroutines finish
-	go func() {
-		wg.Wait()
-		close(activeCh)
-	}()
-
-	var active []ActiveChannelInfo
-	for chInfo := range activeCh {
-		active = append(active, chInfo)
-	}
+	// Sorted, because the map-free accumulation above is still nondeterministic in
+	// completion order and one caller picks by index. An arbitrary order there means the
+	// bot's choice of channel depends on which REST call returned first.
+	sort.Slice(active, func(i, j int) bool {
+		if active[i].MessageCount != active[j].MessageCount {
+			return active[i].MessageCount > active[j].MessageCount
+		}
+		return active[i].Channel.ID < active[j].Channel.ID
+	})
 
 	if len(active) == 0 {
 		log.Printf("[INFO] No active channels found in guild %s", guildID)
@@ -1347,155 +1366,78 @@ func namesFromContent(r *storage.Reader, content string, seenIDs map[string]stru
 	return users
 }
 
-// ingestRecentMessagesIncremental walks guilds and ingests recent messages in parallel.
-func ingestRecentMessagesIncremental(ctx context.Context, s *discordgo.Session) {
-	start := time.Now().UTC() // Use UTC for consistency
-	// ALWAYS look back the full PEREGRINE_INGEST_LOOKBACK window.
-	ingestionCutoff := time.Now().UTC().Add(-cfg.IngestLookback)
+// The guild and channel walk is internal/ingest as of M9.
+//
+// What was here was three functions and about 150 lines: an unbounded goroutine per
+// channel per guild, a pre-scan that paged every channel to COUNT recent messages and
+// then threw them away so the real pass could page the same channels again, and a
+// re-read of the trailing lookback window on every tick. That last one is finding 13, and
+// it was corrupting the corpus rather than merely wasting calls: the history bucket it
+// relied on for dedup is capped, so on a busy guild the older half of each window had
+// already been evicted and was learned again, counting its n-grams twice.
+//
+// What stayed here is learning, which is the part with a safety gate in front of it.
+// ingest asks what is new; legacy decides what to do with it.
 
-	guilds, err := s.UserGuilds(100, "", "", false)
-	if err != nil {
-		log.Println("[ERR] failed to fetch guilds:", err)
-		return
+// ingestLearner adapts learnMessage to ingest.Learner.
+//
+// The historical path and the live path therefore go through the same function, which is
+// the whole point of A1's fix: CheckLearn is inside learnMessage, so a backfilled message
+// cannot bypass a filter the live handler applies. This was the exact path that used to,
+// and it was the worst finding in the review.
+type ingestLearner struct{ s *discordgo.Session }
+
+func (l ingestLearner) Learn(m *discordgo.Message, guildID string) error {
+	names := extractNamesFromMessage(l.s, &discordgo.MessageCreate{Message: m}, guildID)
+
+	author := MentionedUser{
+		Name:     m.Author.Username,
+		UserID:   m.Author.ID,
+		Username: m.Author.Username,
+	}
+	if m.Member != nil && m.Member.Nick != "" {
+		author.Name = m.Member.Nick
 	}
 
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 5) // limit concurrent guild workers
-
-	for _, gptr := range guilds {
-		if gptr == nil {
-			continue
-		}
-		wg.Add(1)
-		sem <- struct{}{} // acquire slot
-
-		// copy value for closure
-		g := *gptr
-		go func(guild discordgo.UserGuild) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			processGuildIncremental(ctx, s, guild, ingestionCutoff)
-		}(g)
-	}
-
-	wg.Wait()
-	log.Printf("[DONE] autonomous ingestion complete in %s", time.Since(start))
+	return store.Update(func(w *storage.Writer) error {
+		return learnMessage(w, m.Content, m.ID, botID, author, names)
+	})
 }
 
-// processGuildIncremental processes active channels for a guild.
-func processGuildIncremental(ctx context.Context, s *discordgo.Session, g discordgo.UserGuild, ingestionCutoff time.Time) {
-	var guildWg sync.WaitGroup // WaitGroup for channels within this guild
+// storeCursors adapts the corpus to ingest.Cursors.
+//
+// One transaction per call rather than one per pass, and that is the right trade here:
+// the alternative is holding a write transaction open across every REST round trip of an
+// ingest pass, and bbolt has a single writer process-wide, so it would block all live
+// learning for the length of the walk. A read to fetch a cursor and a write to advance it
+// are both a handful of bytes.
+type storeCursors struct{}
 
-	// Use a wider window to find channels that are generally active.
-	activeChannelCutoff := time.Now().UTC().Add(-cfg.IngestLookback)
-	for _, chInfo := range getActiveChannels(ctx, s, g.ID, activeChannelCutoff) {
-		select {
-		case <-ctx.Done():
-			log.Printf("[INFO] Guild %s ingestion stopped by shutdown signal.", g.Name)
-			guildWg.Wait() // Wait for any already launched channel goroutines
-			return
-		default:
-		}
-		guildWg.Add(1)
-		go func(ch *discordgo.Channel) {
-			defer guildWg.Done()
-			// Pass the more precise ingestionCutoff for fetching messages.
-			processChannelIncremental(ctx, s, ch, ingestionCutoff)
-		}(chInfo.Channel)
-	}
-	guildWg.Wait() // Wait for all channels in this guild to finish
+func (storeCursors) Cursor(channelID string) (string, error) {
+	var id string
+	err := store.View(func(r *storage.Reader) error {
+		id = r.Cursor(channelID)
+		return nil
+	})
+	return id, err
 }
 
-// processChannelIncremental fetches messages incrementally and learns them.
-func processChannelIncremental(ctx context.Context, s *discordgo.Session, ch *discordgo.Channel, cutoff time.Time) {
-	start := time.Now()
-	total, errors, skipped := 0, 0, 0
-	var allMessages []*discordgo.Message
-	beforeID := ""
+func (storeCursors) SetCursor(channelID, messageID string) error {
+	return store.Update(func(w *storage.Writer) error {
+		return w.SetCursor(channelID, messageID)
+	})
+}
 
-	// Loop to fetch all messages *before* the last oldest one we've seen.
-	for {
-		select {
-		case <-ctx.Done():
-			log.Printf("[INFO] Channel #%s processing stopped by shutdown signal.", ch.Name)
-			return
-		default:
-		}
-		batch, err := s.ChannelMessages(ch.ID, 100, beforeID, "", "")
-		if err != nil {
-			if restErr, ok := err.(*discordgo.RESTError); ok && restErr.Response != nil && restErr.Response.StatusCode == 403 {
-				// Permissions error, stop processing this channel.
-			} else {
-				log.Printf("[ERR] fetch #%s: %v", ch.Name, err)
-			}
-			break
-		}
-		if len(batch) == 0 {
-			break // No more new messages.
-		}
-
-		allMessages = append(allMessages, batch...)
-
-		// Check the oldest message in this batch. If it's older than cutoff, we can stop.
-		oldest := batch[len(batch)-1]
-		if oldest.Timestamp.Before(cutoff) {
-			break
-		}
-
-		// If we received less than 100 messages, we've reached the oldest messages available.
-		if len(batch) < 100 {
-			break
-		}
-
-		// Prepare for next page: fetch messages older than the current oldest.
-		beforeID = batch[len(batch)-1].ID
-		time.Sleep(cfg.IngestBatchDelay) // Pacing to avoid rate limits
-	}
-
-	// If no messages were pulled, nothing to do.
-	if len(allMessages) == 0 {
-		return
-	}
-
-	// Reverse in-place to chronological order (oldest -> newest) before processing.
-	for i, j := 0, len(allMessages)-1; i < j; i, j = i+1, j-1 {
-		allMessages[i], allMessages[j] = allMessages[j], allMessages[i]
-	}
-
-	// Process messages in chronological order.
-	for _, m := range allMessages {
-		if m.Timestamp.Before(cutoff) {
-			skipped++
-			continue
-		}
-		if m.Author.Bot || m.Timestamp.IsZero() {
-			skipped++
-			continue
-		}
-
-		names := extractNamesFromMessage(s, &discordgo.MessageCreate{Message: m}, ch.GuildID)
-		authorInfo := MentionedUser{
-			Name:     m.Author.Username,
-			UserID:   m.Author.ID,
-			Username: m.Author.Username,
-		}
-		if m.Member != nil && m.Member.Nick != "" {
-			authorInfo.Name = m.Member.Nick
-		}
-
-		err := store.Update(func(w *storage.Writer) error {
-			return learnMessage(w, m.Content, m.ID, botID, authorInfo, names)
-		})
-
-		if err != nil {
-			errors++
-		} else {
-			total++
-		}
-	}
-
-	if total > 0 || errors > 0 || skipped > 0 {
-		log.Printf("[DONE] #%s: %d new, %d skipped, %d errors, duration: %s", ch.Name, total, skipped, errors, time.Since(start))
+// runIngest performs one pass. Called from the ingest loop in Start.
+func runIngest(ctx context.Context, s *discordgo.Session) {
+	in := ingest.New(s, storeCursors{}, ingestLearner{s: s}, slog.Default(), ingest.Options{
+		Lookback:           cfg.IngestLookback,
+		GuildConcurrency:   cfg.IngestGuildConcurrency,
+		ChannelConcurrency: cfg.IngestChannelConcurrency,
+		BatchDelay:         cfg.IngestBatchDelay,
+	})
+	if _, err := in.Run(ctx); err != nil {
+		log.Printf("[ERR] ingest pass failed to start: %v", err)
 	}
 }
 
