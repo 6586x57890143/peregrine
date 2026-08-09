@@ -108,6 +108,7 @@ type step struct {
 // changes what CAN happen rather than the sequence of what does.
 var steps = []step{
 	{"learn-gate", stepLearnGate},
+	{"activity", stepActivity},
 	{"memory", stepMemory},
 	{"word-game", stepWordGame},
 	{"commands", stepCommands},
@@ -161,6 +162,20 @@ func stepLearnGate(r *reaction) bool {
 			r.m.Author.Username, v.Reason)
 		return true
 	}
+	return false
+}
+
+// stepActivity records that this channel and this author are alive.
+//
+// AFTER the learn gate, deliberately. A spam flood would otherwise make a channel look
+// busy and pull the bot toward exactly the place it should be ignoring: this number
+// decides where the bot speaks unprompted, whether a channel has earned a word game, and
+// who gets aggro. Counting only messages the corpus was willing to see is the cheaper
+// half of that decision made in the right place.
+//
+// Never consumes: noticing is not answering.
+func stepActivity(r *reaction) bool {
+	channelActivity.Note(r.m.ChannelID, r.m.Author.ID)
 	return false
 }
 
@@ -232,8 +247,11 @@ func stepWordGame(r *reaction) bool {
 
 	won, solved := games.Guess(m.ChannelID, m.Content)
 	if !solved {
-		// No win. Note the activity, and start a game if the channel has earned one.
-		if games.Note(m.ChannelID) {
+		// No win. Start a game if the channel has earned one. The Manager no longer
+		// counts the messages itself: stepActivity recorded this one, and the Manager
+		// asks the shared tracker how busy the channel has been, because three features
+		// wanted that number and only one of them had it.
+		if games.MaybeStart(m.ChannelID) {
 			startWordGame(m.ChannelID)
 		}
 		return false
@@ -300,7 +318,7 @@ func startIntervalWordGame(ctx context.Context, s *discordgo.Session) {
 		return
 	}
 
-	channelID := busiestChannel(ctx, s, cfg.AutonomousPostChannels)
+	channelID := busiestChannel(s, cfg.AutonomousPostChannels)
 	if channelID == "" {
 		log.Println("[WORDGAME] No active channel found for an interval game.")
 		return
@@ -426,15 +444,31 @@ func displayNameFor(s *discordgo.Session, guildID, userID string) string {
 	return userID
 }
 
-// cmdWordGame starts a game on demand.
+// authorized reports whether a user may run an operator command. It is the only
+// authorization check in the codebase and the only place that may compare a user ID
+// against the admin variable.
 //
-// The authorization check here is the only one in the codebase, and until M2 it was a
-// user ID hardcoded in the source. It fails CLOSED: an unset
-// PEREGRINE_BOOTSTRAP_ADMIN_USER_ID refuses this command for everyone, never allows it
-// for everyone. Getting that direction wrong on an empty string is how a missing variable
-// turns an operator-only command into a public one.
+// That exclusivity is the point rather than tidiness, and it is what closes finding 19.
+// Until M2 the check was a Discord user ID hardcoded in the source; M2 made it a
+// configurable variable but left it as an inline comparison in one command body, so the
+// second command to need it would reimplement it, and the way it gets reimplemented wrong
+// is the empty case. TestAuthorizationIsAChokepoint parses the package and fails if
+// anything else names cfg.AdminUserID.
+//
+// It fails CLOSED. An unset PEREGRINE_BOOTSTRAP_ADMIN_USER_ID refuses everyone, never
+// allows everyone: getting that direction wrong on an empty string turns a missing
+// variable into a public operator command, which is the difference between a bot nobody
+// can administer and a bot anybody can.
+func authorized(userID string) bool {
+	if cfg.AdminUserID == "" {
+		return false
+	}
+	return userID == cfg.AdminUserID
+}
+
+// cmdWordGame starts a game on demand, for the operator only.
 func cmdWordGame(r *reaction) {
-	if cfg.AdminUserID == "" || r.m.Author.ID != cfg.AdminUserID {
+	if !authorized(r.m.Author.ID) {
 		return
 	}
 
@@ -721,6 +755,19 @@ func stepImages(r *reaction) bool {
 		repostChance = cfg.ImageRepostChance
 	}
 	if rand.Float64() >= repostChance {
+		return false
+	}
+
+	// The DESTINATION gets the same NSFW check the origin gets, which SPEC.md section 4.2
+	// asks for and M11a did not do. Capture already refuses to remember media from an
+	// NSFW channel; without this, a repost could carry an image out of a general channel
+	// into one where the bot has no business posting at all, and the direction that
+	// matters most is that a channel the bot cannot identify is not a channel it should
+	// republish into. Fails closed on a cache miss, like capture.
+	if ch, err := s.State.Channel(m.ChannelID); err != nil || ch == nil {
+		log.Printf("[REPOST] channel %s is not in the state cache, not reposting there", m.ChannelID)
+		return false
+	} else if ch.NSFW || strings.Contains(strings.ToLower(ch.Name), "nsfw") {
 		return false
 	}
 

@@ -31,11 +31,11 @@ import (
 	"math"
 	"math/rand/v2"
 	"regexp"
-	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/6586x57890143/peregrine/internal/activity"
 	"github.com/6586x57890143/peregrine/internal/config"
 	"github.com/6586x57890143/peregrine/internal/core"
 	"github.com/6586x57890143/peregrine/internal/corpus"
@@ -48,7 +48,6 @@ import (
 	"github.com/6586x57890143/peregrine/internal/wordgame"
 	"github.com/6586x57890143/peregrine/voicenotes"
 	"github.com/bwmarrin/discordgo"
-	"golang.org/x/sync/errgroup"
 )
 
 // The twelve bucket-name constants that used to live here are gone, and with them
@@ -235,6 +234,16 @@ var games *wordgame.Manager
 // it, and a concurrent map read and write is a FATAL runtime error in Go.
 var leaderboard *wordgame.Leaderboard
 
+// channelActivity is where people are talking and who is around, counted from the
+// messages the gateway already delivers.
+//
+// One tracker for three features that each used to answer the question their own way.
+// The two that asked Discord (autonomous posting choosing a channel, aggro choosing a
+// target) paged every text channel in every guild and then a hundred messages per active
+// channel, which was hundreds of REST calls for information that arrived free on the
+// websocket and was thrown away (SPEC.md section 8, finding 14).
+var channelActivity *activity.Tracker
+
 // ----- BIRD AGGRO -----
 var birdAggroTargetID string
 var birdAggroEndTime time.Time
@@ -391,7 +400,14 @@ func (s *Service) Init(deps core.Deps) error {
 	} else {
 		log.Printf("[INFO] Word game dictionary loaded, %d usable words.", dict.Len())
 	}
-	games = wordgame.NewManager(dict, nil, wordgame.Options{
+	// One activity tracker, shared. Word games ask it whether a channel is busy enough
+	// for a puzzle, autonomous posting and interval-mode word games ask it where people
+	// are talking, and aggro asks it who is around. All three used to answer their own
+	// version of that question: the Manager kept a per-channel activity map of its own,
+	// and the other two paged Discord's REST API for it (SPEC.md section 8, finding 14).
+	channelActivity = activity.New(activity.Options{})
+
+	games = wordgame.NewManager(dict, nil, channelActivity, wordgame.Options{
 		Timeout:           cfg.WordGameTimeout,
 		AnnounceTTL:       cfg.WordGameAnnounceTTL,
 		ActivityWindow:    cfg.WordGameActivityWindow,
@@ -452,6 +468,14 @@ func (s *Service) Init(deps core.Deps) error {
 	// window.
 	dg.AddHandler(messageCreate)
 
+	// The deletion handlers, registered here for the same reason and gated on the feature
+	// that reads their result. Reposting off means nothing is cached, so there is nothing
+	// to revoke and no reason to take a write transaction on every deletion the bot sees.
+	if cfg.EnableImageRepost {
+		dg.AddHandler(messageDelete)
+		dg.AddHandler(messageDeleteBulk)
+	}
+
 	// Buffered so a burst of voice notes does not block the handler that queues
 	// them. M12 gives this a real bound and a context.
 	transcriptionQueue = make(chan TranscriptionJob, 100)
@@ -498,7 +522,7 @@ func (s *Service) Start(ctx context.Context) error {
 		{
 			Name:  "aggro",
 			Every: cfg.AggroTick,
-			Fn:    func(ctx context.Context) { maybeTriggerAggro(ctx, dg) },
+			Fn:    func(context.Context) { maybeTriggerAggro() },
 		},
 		{
 			Name:  "leaderboard-reset",
@@ -622,29 +646,44 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// maybeTriggerAggro is the body of what was an inline ticker goroutine. Extracted
-// unchanged so the loop table above reads as a list of behaviors.
-func maybeTriggerAggro(ctx context.Context, dg *discordgo.Session) {
+// maybeTriggerAggro is the body of what was an inline ticker goroutine, extracted so the
+// loop table above reads as a list of behaviors.
+func maybeTriggerAggro() {
 	birdAggroMutex.Lock()
-	defer birdAggroMutex.Unlock()
-
-	// Only trigger if there's no current aggro
-	if birdAggroTargetID != "" && !time.Now().After(birdAggroEndTime) {
+	busy := birdAggroTargetID != "" && !time.Now().After(birdAggroEndTime)
+	birdAggroMutex.Unlock()
+	if busy {
 		return
 	}
 	if rand.Float64() >= cfg.AggroChance {
 		return
 	}
-	target := findRandomActiveUser(ctx, dg)
+
+	// Chosen outside the aggro lock. Picking a target takes the activity tracker's mutex,
+	// and holding one package's lock while acquiring another's is how a lock-ordering
+	// deadlock gets built; the old version did it while ALSO making hundreds of REST
+	// calls, so the aggro state was locked for the length of a Discord page walk.
+	target := findRandomActiveUser()
 	if target == "" {
+		return
+	}
+
+	birdAggroMutex.Lock()
+	// Re-checked, because the state could have changed while the lock was released. There
+	// is only one aggro loop so this cannot happen today, and that is exactly why it is
+	// worth two lines: the next caller will not know.
+	if birdAggroTargetID != "" && !time.Now().After(birdAggroEndTime) {
+		birdAggroMutex.Unlock()
 		return
 	}
 	birdAggroTargetID = target
 	birdAggroEndTime = time.Now().Add(cfg.AggroDuration)
+	state := AggroState{TargetID: birdAggroTargetID, EndTime: birdAggroEndTime}
+	birdAggroMutex.Unlock()
+
 	log.Printf("[AGGRO] Bird aggro triggered on user %s for %v.", target, cfg.AggroDuration)
-	// Persist the new aggro state
 	if err := store.Update(func(w *storage.Writer) error {
-		return saveAggroState(w, AggroState{TargetID: birdAggroTargetID, EndTime: birdAggroEndTime})
+		return saveAggroState(w, state)
 	}); err != nil {
 		log.Printf("[ERR] Failed to persist aggro state: %v", err)
 	}
@@ -741,120 +780,6 @@ func isRecognizedName(r *storage.Reader, token string) (canonicalName string, ex
 		return data.Canonical, true // It's an alias, return the canonical name.
 	}
 	return lower, true // It's a canonical name itself.
-}
-
-// getActiveChannels returns all text channels in a guild that have recent activity.
-func getActiveChannels(ctx context.Context, s *discordgo.Session, guildID string, cutoff time.Time) []ActiveChannelInfo {
-	channels, err := s.GuildChannels(guildID)
-	if err != nil {
-		if restErr, ok := err.(*discordgo.RESTError); ok && restErr.Response != nil && restErr.Response.StatusCode == 403 {
-			return nil // Can't view channels in this guild, just return silently.
-		}
-		log.Printf("[ERR] Failed to fetch channels for guild %s: %v", guildID, err)
-		return nil
-	}
-
-	log.Printf("[INFO] Checking %d channels for activity in guild %s...", len(channels), guildID)
-
-	// BOUNDED as of M9, and this is the other half of finding 14. The fan-out here was
-	// one goroutine per channel with no limit at all: on a bot in several large guilds
-	// that is hundreds of concurrent REST calls, which Discord answers with rate limits
-	// whose retries then make it worse.
-	//
-	// Ingestion no longer calls this at all, because a cursor answers "is this channel
-	// worth reading" as a side effect. What survives are the two callers that genuinely
-	// want to know where people are TALKING rather than what is unread: the autonomous
-	// poster picking somewhere to speak, and findRandomActiveUser picking a target. Both
-	// belong to M11, which is where the paging should become a state-cache lookup.
-	var (
-		mu     sync.Mutex
-		active []ActiveChannelInfo
-	)
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(cfg.IngestChannelConcurrency)
-
-	for _, c := range channels {
-		if c == nil || c.Type != discordgo.ChannelTypeGuildText {
-			continue
-		}
-		ch := c
-		g.Go(func() error {
-			if gctx.Err() != nil {
-				return nil
-			}
-			count := countRecentMessages(s, ch, cutoff)
-			if count == 0 {
-				return nil
-			}
-			log.Printf("[INFO] Channel #%s has %d recent messages, adding to active list.", ch.Name, count)
-			mu.Lock()
-			active = append(active, ActiveChannelInfo{Channel: ch, MessageCount: count})
-			mu.Unlock()
-			return nil
-		})
-	}
-	// Workers never return an error: one unreadable channel must not abandon the rest,
-	// and errgroup cancels its context on the first error it sees.
-	_ = g.Wait()
-
-	// Sorted, because the map-free accumulation above is still nondeterministic in
-	// completion order and one caller picks by index. An arbitrary order there means the
-	// bot's choice of channel depends on which REST call returned first.
-	sort.Slice(active, func(i, j int) bool {
-		if active[i].MessageCount != active[j].MessageCount {
-			return active[i].MessageCount > active[j].MessageCount
-		}
-		return active[i].Channel.ID < active[j].Channel.ID
-	})
-
-	if len(active) == 0 {
-		log.Printf("[INFO] No active channels found in guild %s", guildID)
-	} else {
-		log.Printf("[INFO] Found %d active channels in guild %s", len(active), guildID)
-	}
-
-	return active
-}
-
-// countRecentMessages counts non-bot messages newer than cutoff in a channel.
-func countRecentMessages(s *discordgo.Session, ch *discordgo.Channel, cutoff time.Time) int {
-	count := 0
-	beforeID := ""
-	batchSize := 50 // Discord API page size
-
-	for {
-		batch, err := s.ChannelMessages(ch.ID, batchSize, beforeID, "", "")
-		if err != nil {
-			if restErr, ok := err.(*discordgo.RESTError); ok && restErr.Response != nil && restErr.Response.StatusCode == 403 {
-				return 0 // It's a permissions error, just skip this channel silently.
-			}
-			log.Printf("[ERR] Fetch messages from #%s failed: %v", ch.Name, err)
-			return 0 // Return 0 on error to prevent further processing of this channel
-		}
-		if len(batch) == 0 {
-			break
-		}
-
-		for _, m := range batch {
-			if m.Author.Bot || m.Timestamp.IsZero() {
-				continue
-			}
-			if m.Timestamp.After(cutoff) {
-				count++
-			}
-		}
-
-		// Stop if we've reached messages older than cutoff
-		oldestTs := batch[len(batch)-1].Timestamp
-		if len(batch) < batchSize || oldestTs.Before(cutoff) {
-			break
-		}
-
-		beforeID = batch[len(batch)-1].ID
-		time.Sleep(50 * time.Millisecond) // mild pacing to avoid rate limits
-	}
-
-	return count
 }
 
 // ----------------------------
@@ -1921,6 +1846,41 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 	}
 }
 
+// messageDelete revokes anything the deleted message contributed to the repost cache.
+//
+// Through the dispatcher rather than inline, like every other gateway event. A mass
+// deletion (a moderator clearing a spam raid) arrives as a burst, and each one of these
+// opens a write transaction: doing that on discordgo's own goroutine would put an
+// unbounded number of them in line for bbolt's single writer.
+//
+// Unlike messageCreate this does NOT skip bots, and the difference is deliberate. It
+// skips them because a bot's message must not be learned; here the question is whether a
+// cached URL's source still exists, and the answer does not depend on who posted it. The
+// bot's own reposts are in nobody's cache, so they simply match nothing.
+func messageDelete(_ *discordgo.Session, m *discordgo.MessageDelete) {
+	if m.ID == "" {
+		return
+	}
+	if !dispatcher.Submit(func(context.Context) { forgetImagesFromMessage(m.ID) }) {
+		log.Printf("[QUEUE] dropped a message deletion in %s: work queue full (%d dropped so far)",
+			m.ChannelID, dispatcher.Dropped())
+	}
+}
+
+// messageDeleteBulk is the same for Discord's bulk deletion event, which is what a
+// moderator purging a channel produces. Handled as one unit of work rather than one per
+// ID, so a hundred-message purge is one write transaction instead of a hundred.
+func messageDeleteBulk(_ *discordgo.Session, m *discordgo.MessageDeleteBulk) {
+	if len(m.Messages) == 0 {
+		return
+	}
+	ids := append([]string(nil), m.Messages...)
+	if !dispatcher.Submit(func(context.Context) { forgetImagesFromMessage(ids...) }) {
+		log.Printf("[QUEUE] dropped a bulk deletion of %d messages in %s: work queue full (%d dropped so far)",
+			len(ids), m.ChannelID, dispatcher.Dropped())
+	}
+}
+
 // captureImageURLs caches one image or Tenor URL from a message so a later
 // repost has something to post. Extracted from messageCreate only so the
 // EnableImageRepost gate could wrap it as one statement; the body is unchanged.
@@ -1943,115 +1903,148 @@ func captureImageURLs(s *discordgo.Session, m *discordgo.MessageCreate) {
 	ch, err := s.State.Channel(m.ChannelID)
 	if err != nil {
 		log.Printf("[WARN] channel %s is not in the state cache, not caching this URL: %v", m.ChannelID, err)
-	} else if !ch.NSFW && !strings.Contains(strings.ToLower(ch.Name), "nsfw") {
-		imageURLMutex.Lock()
-
-		var candidateURLs []string
-
-		// 1. Check attachments first.
-		for _, att := range m.Attachments {
-			if strings.HasPrefix(att.ContentType, "image/") && discordCDNRegex.MatchString(att.URL) {
-				candidateURLs = append(candidateURLs, att.URL)
-			}
-		}
-
-		// 2. Scan message content for any URLs.
-		contentWords := tokenize(m.Content)
-		for _, word := range contentWords {
-			if discordCDNRegex.MatchString(word) || tenorRegex.MatchString(word) {
-				candidateURLs = append(candidateURLs, word)
-			}
-		}
-
-		var urlToCache string
-		if len(candidateURLs) > 0 {
-			// Randomly select one URL from the candidates to cache
-			urlToCache = candidateURLs[rand.IntN(len(candidateURLs))]
-		}
-
-		// 3. If a URL was found (either from attachment or content), save it.
-		if urlToCache != "" {
-			var newUrlList []string
-			// Persist and then reload the cache to ensure consistency. The reload
-			// happens through the Writer, which embeds Reader, so it sees its own
-			// write without opening a second transaction: that is the reason the
-			// Writer embeds the Reader rather than being a separate type.
-			//
-			// Trimming is part of AddImageURL now, and evicts the OLDEST entry by
-			// timestamp. The old trim deleted the lexicographically first URL, which
-			// has nothing to do with age, so which cached image got dropped was a
-			// function of how the URL happened to be spelled.
-			err := store.Update(func(w *storage.Writer) error {
-				if err := w.AddImageURL(urlToCache, time.Now(), cfg.ImageCacheSize); err != nil {
-					return fmt.Errorf("failed to save image URL: %w", err)
-				}
-				var err error
-				newUrlList, err = w.ImageURLs()
-				return err
-			})
-
-			if err != nil {
-				log.Printf("[WARN] DB operation for image cache failed: %v", err)
-			} else {
-				// Update in-memory cache ONLY if DB operation was successful
-				recentImageURLs = newUrlList
-				log.Printf("[IMG] Captured URL: %s, cache size: %d", urlToCache, len(recentImageURLs))
-			}
-		}
-		imageURLMutex.Unlock()
-	} else if ch != nil {
-		log.Printf("[INFO] Skipping image cache for NSFW-flagged or named channel #%s", ch.Name)
+		return
 	}
+	if ch.NSFW || strings.Contains(strings.ToLower(ch.Name), "nsfw") {
+		log.Printf("[INFO] Skipping image cache for NSFW-flagged or named channel #%s", ch.Name)
+		return
+	}
+
+	var candidateURLs []string
+
+	// 1. Check attachments first.
+	for _, att := range m.Attachments {
+		if strings.HasPrefix(att.ContentType, "image/") && discordCDNRegex.MatchString(att.URL) {
+			candidateURLs = append(candidateURLs, att.URL)
+		}
+	}
+
+	// 2. Scan message content for any URLs.
+	for _, word := range tokenize(m.Content) {
+		if discordCDNRegex.MatchString(word) || tenorRegex.MatchString(word) {
+			candidateURLs = append(candidateURLs, word)
+		}
+	}
+	if len(candidateURLs) == 0 {
+		return
+	}
+	urlToCache := candidateURLs[rand.IntN(len(candidateURLs))]
+
+	// Persist and then reload the cache. The reload happens through the Writer, which
+	// embeds Reader, so it sees its own write without opening a second transaction: that
+	// is the reason the Writer embeds the Reader rather than being a separate type.
+	//
+	// The URL is attributed to its message and its author, which is what lets
+	// AddImageURL cap one author's share of the cache and lets a later deletion of the
+	// message revoke it (SPEC.md section 4, A7). Trimming and both caps are the store's,
+	// so a second caller cannot skip them.
+	//
+	// NOT holding imageURLMutex across this. It used to wrap the whole function including
+	// the store.Update, so one goroutine's bbolt write transaction (which serializes
+	// against every other write in the process) also blocked every other capture from
+	// even looking at the cache. The lock protects the slice; the store protects itself.
+	var newURLList []string
+	if err := store.Update(func(w *storage.Writer) error {
+		if err := w.AddImageURL(urlToCache, m.ID, m.Author.ID, cfg.ImageCacheSize, cfg.ImageMaxPerAuthor); err != nil {
+			return fmt.Errorf("failed to save image URL: %w", err)
+		}
+		var err error
+		newURLList, err = w.ImageURLs()
+		return err
+	}); err != nil {
+		log.Printf("[WARN] DB operation for image cache failed: %v", err)
+		return
+	}
+
+	// In-memory cache updated ONLY after the write succeeded, so the two cannot disagree
+	// about what is repostable.
+	imageURLMutex.Lock()
+	recentImageURLs = newURLList
+	size := len(recentImageURLs)
+	imageURLMutex.Unlock()
+	log.Printf("[IMG] Captured URL: %s, cache size: %d", urlToCache, size)
+}
+
+// forgetImagesFromMessage drops every cached URL a deleted message contributed.
+//
+// This is the deleted-message half of SPEC.md section 4, A7. A deletion is a strong
+// signal that the content should not be republished, and the bot reposting something a
+// moderator or its own author has just removed is the failure that finding describes.
+// The rule was written into the spec a milestone ago and could not be implemented,
+// because the image cache was keyed by URL and there was no way to ask which entries a
+// message had contributed.
+//
+// It is deliberately silent about IDs it does not hold, which is almost all of them:
+// every message deletion in every channel the bot can see arrives here.
+func forgetImagesFromMessage(messageIDs ...string) {
+	removed := 0
+	var newURLList []string
+	if err := store.Update(func(w *storage.Writer) error {
+		for _, id := range messageIDs {
+			n, err := w.DeleteImagesByMessage(id)
+			if err != nil {
+				return err
+			}
+			removed += n
+		}
+		if removed == 0 {
+			return nil
+		}
+		var err error
+		newURLList, err = w.ImageURLs()
+		return err
+	}); err != nil {
+		log.Printf("[WARN] could not revoke cached images for deleted messages: %v", err)
+		return
+	}
+	if removed == 0 {
+		return
+	}
+
+	// Outside the transaction, for the same reason capture is: the lock guards the slice
+	// and taking it inside a bbolt write transaction couples it to the process-wide
+	// writer.
+	imageURLMutex.Lock()
+	recentImageURLs = newURLList
+	imageURLMutex.Unlock()
+	log.Printf("[IMG] Dropped %d cached URL(s) whose source message was deleted.", removed)
 }
 
 // -----------------------------------------------------------------------------
 //  Bird Aggro
 // -----------------------------------------------------------------------------
 
-// findRandomActiveUser finds a random user who has posted in the most active channel recently.
-func findRandomActiveUser(ctx context.Context, s *discordgo.Session) string {
-	guilds, err := s.UserGuilds(100, "", "", false)
-	if err != nil || len(guilds) == 0 {
-		log.Println("[AGGRO] No guilds available to find active user:", err)
-		return ""
-	}
+// findRandomActiveUser picks someone who has spoken recently, or "".
+//
+// It reads the in-process activity tracker. It used to call s.UserGuilds, then
+// getActiveChannels for each guild (which paged every text channel fifty messages at a
+// time with a 50ms sleep between pages), then another hundred messages per active channel
+// to collect authors. Hundreds of REST calls per aggro tick, on an hourly ticker, to
+// answer a question the gateway had already answered for free (SPEC.md section 8, finding
+// 14).
+//
+// One consequence is worth knowing before it looks like a bug: the candidates are people
+// the bot has SEEN, so for the first minutes after a restart there is no target at all.
+// The old version could reach six hours into history and pick someone who had since left
+// the conversation, which is the worse answer for a feature whose whole point is poking
+// somebody who is present.
+func findRandomActiveUser() string {
+	candidates := channelActivity.RecentAuthors(cfg.AggroActivityWindow)
 
-	var activeUsers []string
-	userSet := make(map[string]struct{})
-
-	// Find all active users across all guilds in the last 6 hours
-	activityCutoff := time.Now().Add(-6 * time.Hour)
-	for _, gptr := range guilds {
-		if gptr == nil {
-			continue
-		}
-		channels := getActiveChannels(ctx, s, gptr.ID, activityCutoff)
-		for _, chInfo := range channels {
-			batch, err := s.ChannelMessages(chInfo.Channel.ID, 100, "", "", "")
-			if err != nil {
-				continue
-			}
-			for _, msg := range batch {
-				if msg.Author.Bot {
-					continue
-				}
-				if msg.Timestamp.After(activityCutoff) {
-					if _, exists := userSet[msg.Author.ID]; !exists {
-						userSet[msg.Author.ID] = struct{}{}
-						activeUsers = append(activeUsers, msg.Author.ID)
-					}
-				}
-			}
+	// Never the bot itself. It cannot reach here (messageCreate rejects bots before
+	// anything is recorded), but aggro on our own messages would be a loop of the bot
+	// reacting to itself, so the check costs nothing and closes it structurally.
+	filtered := candidates[:0]
+	for _, id := range candidates {
+		if id != botID {
+			filtered = append(filtered, id)
 		}
 	}
-
-	if len(activeUsers) == 0 {
-		log.Println("[AGGRO] No active users found to select a target.")
+	if len(filtered) == 0 {
+		log.Println("[AGGRO] No recently active users to pick a target from.")
 		return ""
 	}
-
-	// Select a random user from the pool of active users
-	return activeUsers[rand.IntN(len(activeUsers))]
+	return filtered[rand.IntN(len(filtered))]
 }
 
 // -----------------------------------------------------------------------------
@@ -2060,9 +2053,14 @@ func findRandomActiveUser(ctx context.Context, s *discordgo.Session) string {
 
 // busiestChannel returns the ID of the most active channel the bot can see, or "".
 //
-// Extracted in M11 because two callers want it: autonomous posting and interval-mode word
-// games. It had been inline in the first, so the second would have had to copy it, and a
-// copy is how the two would eventually disagree about what "busiest" means.
+// Two callers want it: autonomous posting and interval-mode word games. It was inline in
+// the first, so the second would have had to copy it, and a copy is how the two would
+// eventually disagree about what "busiest" means.
+//
+// It reads the activity tracker for volume and the STATE CACHE for everything else, which
+// is the division the two sources force: the gateway tells us how much traffic a channel
+// has had, and State tells us what the channel is. Neither costs a REST call. The version
+// this replaces paged every channel in every guild to count messages.
 //
 // allow, when non-empty, restricts the choice. Filtering while CHOOSING rather than after
 // is the fix for a real bug: the old code scored every channel, picked the winner, and then
@@ -2072,13 +2070,7 @@ func findRandomActiveUser(ctx context.Context, s *discordgo.Session) string {
 //
 // The "general" bonus is preserved and is a judgement about where a bot is welcome to speak
 // unprompted rather than a measurement.
-func busiestChannel(ctx context.Context, s *discordgo.Session, allow []string) string {
-	guilds, err := s.UserGuilds(100, "", "", false)
-	if err != nil || len(guilds) == 0 {
-		log.Println("[ACTIVE] No guilds available or error:", err)
-		return ""
-	}
-
+func busiestChannel(s *discordgo.Session, allow []string) string {
 	allowed := make(map[string]struct{}, len(allow))
 	for _, id := range allow {
 		if id != "" {
@@ -2088,27 +2080,43 @@ func busiestChannel(ctx context.Context, s *discordgo.Session, allow []string) s
 
 	best := ""
 	bestScore := 0.0
-	for _, g := range guilds {
-		if g == nil {
+	for _, c := range channelActivity.Busiest(cfg.ActiveChannelWindow) {
+		if len(allowed) > 0 {
+			if _, ok := allowed[c.ID]; !ok {
+				continue
+			}
+		}
+		ch, err := s.State.Channel(c.ID)
+		if err != nil || ch == nil {
+			// Not in the cache, so we cannot check what it is. Skipped rather than used,
+			// for the same reason the image capture fails closed on a cache miss: this
+			// decides where the bot speaks unprompted, and "we could not tell" has to
+			// mean "not here".
 			continue
 		}
-		for _, info := range getActiveChannels(ctx, s, g.ID, time.Now().Add(-cfg.IngestLookback)) {
-			if len(allowed) > 0 {
-				if _, ok := allowed[info.Channel.ID]; !ok {
-					continue
-				}
-			}
-			score := float64(info.MessageCount)
-			if strings.Contains(strings.ToLower(info.Channel.Name), "general") {
-				score *= 1.5
-			}
-			// Ties break on channel ID, so the choice does not depend on which REST call
-			// returned first. getActiveChannels sorts its result for the same reason.
-			if score > bestScore || (score == bestScore && info.Channel.ID < best) {
-				bestScore = score
-				best = info.Channel.ID
-			}
+		if ch.Type != discordgo.ChannelTypeGuildText {
+			continue
 		}
+
+		score := float64(c.Count)
+		if strings.Contains(strings.ToLower(ch.Name), "general") {
+			score *= 1.5
+		}
+		// Ties break on channel ID, so the choice does not depend on map iteration order.
+		// Tracker.Busiest sorts its result for the same reason.
+		if score > bestScore || (score == bestScore && ch.ID < best) {
+			bestScore = score
+			best = ch.ID
+		}
+	}
+
+	if best == "" {
+		// The cold-start case, and the one an operator will see first: the tracker is
+		// empty for the first window after a restart, so there is nowhere to speak yet.
+		// Falling back to the state cache's LastMessageID would give recency without
+		// volume, and a channel whose last message was three hours ago is not somewhere
+		// to start talking unprompted.
+		log.Printf("[ACTIVE] No channel has had traffic in the last %s.", cfg.ActiveChannelWindow)
 	}
 	return best
 }
@@ -2118,7 +2126,7 @@ func autonomousPost(ctx context.Context, dg *discordgo.Session) {
 	start := time.Now()
 	log.Println("[AUTONOMOUS] Starting autonomous post cycle...")
 
-	channelID := busiestChannel(ctx, dg, cfg.AutonomousPostChannels)
+	channelID := busiestChannel(dg, cfg.AutonomousPostChannels)
 	if channelID == "" {
 		log.Println("[AUTONOMOUS] No active channel found, skipping post")
 		return
