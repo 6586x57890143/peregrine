@@ -126,11 +126,36 @@ type Config struct {
 	AggroDuration time.Duration // PEREGRINE_AGGRO_DURATION
 	AggroEmoji    string        // PEREGRINE_AGGRO_EMOJI
 
+	// AggroActivityWindow is how far back a user counts as "around" when a target is
+	// picked. It was a hardcoded six hours inside findRandomActiveUser, which reached
+	// that far back by paging Discord; it now reads the in-process activity tracker, so
+	// the practical bound is also how long the process has been up.
+	AggroActivityWindow time.Duration // PEREGRINE_AGGRO_ACTIVITY_WINDOW
+
+	// ActiveChannelWindow is how recent traffic must be for a channel to count as
+	// somewhere worth speaking unprompted. Read by autonomous posting and by
+	// interval-mode word games, which are the two features that choose a channel for
+	// themselves.
+	//
+	// It replaces PEREGRINE_INGEST_LOOKBACK in that role, which was a misuse: the
+	// lookback is a bootstrap bound for the history walk and has nothing to say about
+	// where people are talking now.
+	ActiveChannelWindow time.Duration // PEREGRINE_ACTIVE_CHANNEL_WINDOW
+
 	// Engagement: image reposting.
 	EnableImageRepost bool    // PEREGRINE_ENABLE_IMAGE_REPOST
 	ImageRepostChance float64 // PEREGRINE_IMAGE_REPOST_CHANCE
 	ImageRepostDirect float64 // PEREGRINE_IMAGE_REPOST_CHANCE_DIRECT
 	ImageCacheSize    int     // PEREGRINE_IMAGE_CACHE_SIZE
+
+	// ImageMaxPerAuthor caps how much of the cache one person can own.
+	//
+	// This is the anti-poisoning half of SPEC.md section 4, A7: image reposting has the
+	// bot republish user-supplied media under its own name in a channel of its choosing,
+	// so a hostile user seeding the cache is the attack. Enforced inside
+	// storage.Writer.AddImageURL rather than at the caller, for the same reason
+	// CheckLearn lives inside learnMessage.
+	ImageMaxPerAuthor int // PEREGRINE_IMAGE_MAX_PER_AUTHOR
 
 	// Engagement: autonomous posting.
 	EnableAutonomousPost   bool          // PEREGRINE_ENABLE_AUTONOMOUS_POST
@@ -172,6 +197,15 @@ const (
 	WordGameModeActivity = "activity"
 )
 
+// maxActivityThreshold is the ceiling on PEREGRINE_WORDGAME_ACTIVITY_THRESHOLD.
+//
+// It is a ceiling rather than an opinion: the activity tracker keeps a fixed ring of
+// timestamps per channel, so a count saturates at activity.PerChannelHistory and a
+// threshold above that could never be met. The knob would accept the value, the trigger
+// would never fire, and nothing would say why. TestTheActivityCeilingFitsTheTracker
+// asserts the relationship, because two files agreeing by comment is how it drifts.
+const maxActivityThreshold = 100
+
 // deferredVars are documented in .env.example but read by no code yet, mapped to
 // the milestone that starts reading them. Setting one today does nothing, and
 // silence about that is how an operator concludes the bot ignores its own
@@ -187,7 +221,6 @@ var deferredVars = map[string]string{
 	"PEREGRINE_BACKUP_DIR":            "M13",
 	"PEREGRINE_BACKUP_TICK":           "M13",
 	"PEREGRINE_BACKUP_KEEP":           "M13",
-	"PEREGRINE_IMAGE_MAX_PER_AUTHOR":  "M11",
 	"PEREGRINE_WHISPER_MODEL":         "M12",
 	"PEREGRINE_VOICENOTES_DIR":        "M12",
 	"PEREGRINE_TRANSCRIPTION_TIMEOUT": "M12",
@@ -306,6 +339,9 @@ func Load() (*Config, error) {
 		AggroDuration: l.dur("PEREGRINE_AGGRO_DURATION", 20*time.Minute, time.Minute, 30*24*time.Hour),
 		AggroEmoji:    l.str("PEREGRINE_AGGRO_EMOJI", "\U0001F426"),
 
+		AggroActivityWindow: l.dur("PEREGRINE_AGGRO_ACTIVITY_WINDOW", 6*time.Hour, time.Minute, 7*24*time.Hour),
+		ActiveChannelWindow: l.dur("PEREGRINE_ACTIVE_CHANNEL_WINDOW", time.Hour, time.Minute, 7*24*time.Hour),
+
 		// Reposting had no flag at all: it was unconditionally on. The default is
 		// true so this milestone changes no behavior, but it now has an off
 		// switch, which matters because the bot republishes user media under its
@@ -314,6 +350,7 @@ func Load() (*Config, error) {
 		ImageRepostChance: l.float("PEREGRINE_IMAGE_REPOST_CHANCE", 0.015, 0, 1),
 		ImageRepostDirect: l.float("PEREGRINE_IMAGE_REPOST_CHANCE_DIRECT", 0.01, 0, 1),
 		ImageCacheSize:    l.intVal("PEREGRINE_IMAGE_CACHE_SIZE", 100, 1, 100_000),
+		ImageMaxPerAuthor: l.intVal("PEREGRINE_IMAGE_MAX_PER_AUTHOR", 5, 1, 100_000),
 
 		EnableAutonomousPost:   l.boolVal("PEREGRINE_ENABLE_AUTONOMOUS_POST", false),
 		AutonomousPostChannels: l.csv("PEREGRINE_AUTONOMOUS_POST_CHANNELS"),
@@ -352,7 +389,7 @@ func Load() (*Config, error) {
 		// a TRIGGER_CHANCE roll per message. All three were literals: 5, 5 minutes and
 		// 0.025.
 		WordGameActivityWindow:    l.dur("PEREGRINE_WORDGAME_ACTIVITY_WINDOW", 5*time.Minute, time.Minute, 24*time.Hour),
-		WordGameActivityThreshold: l.intVal("PEREGRINE_WORDGAME_ACTIVITY_THRESHOLD", 5, 1, 1000),
+		WordGameActivityThreshold: l.intVal("PEREGRINE_WORDGAME_ACTIVITY_THRESHOLD", 5, 1, maxActivityThreshold),
 		WordGameTriggerChance:     l.float("PEREGRINE_WORDGAME_TRIGGER_CHANCE", 0.025, 0, 1),
 
 		// Word length in RUNES. The old filter was `len(word) > 4` on bytes, so an
@@ -379,6 +416,18 @@ func Load() (*Config, error) {
 			"PEREGRINE_ENABLE_AUTONOMOUS_POST is true but PEREGRINE_AUTONOMOUS_POST_CHANNELS is empty: "+
 				"a bot that speaks unprompted must never do so in a channel nobody named, so set the channel IDs or turn the feature off"))
 	}
+	// A per-author cap at or above the cache size is not a cap. One person can still own
+	// every entry, so the operator believes the A7 protection is on when it does nothing,
+	// which is the exact shape of silence this file exists to refuse. Naming both
+	// variables is the point, because the mistake is in their relationship rather than in
+	// either value.
+	if cfg.EnableImageRepost && cfg.ImageMaxPerAuthor >= cfg.ImageCacheSize {
+		l.errs = append(l.errs, fmt.Errorf(
+			"PEREGRINE_IMAGE_MAX_PER_AUTHOR=%d is not below PEREGRINE_IMAGE_CACHE_SIZE=%d, "+
+				"so one author can still fill the repost cache and the per-author cap protects nothing",
+			cfg.ImageMaxPerAuthor, cfg.ImageCacheSize))
+	}
+
 	if len(l.errs) > 0 {
 		return nil, errors.Join(l.errs...)
 	}

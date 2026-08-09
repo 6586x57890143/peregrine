@@ -496,39 +496,283 @@ func TestDeleteNgramAndRebuild(t *testing.T) {
 	}
 }
 
+// snowflake returns a plausible Discord ID, n milliseconds after the epoch. Ascending
+// n gives ascending, chronologically ordered IDs, which is the property the image
+// cache's key layout depends on.
+func snowflake(n int) string {
+	return strconv.FormatUint((uint64(n)<<22)|1, 10)
+}
+
+func imageURLs(t *testing.T, s *storage.Store) []string {
+	t.Helper()
+	var out []string
+	if err := s.View(func(r *storage.Reader) error {
+		var err error
+		out, err = r.ImageURLs()
+		return err
+	}); err != nil {
+		t.Fatalf("ImageURLs: %v", err)
+	}
+	return out
+}
+
+func cacheImage(t *testing.T, s *storage.Store, url, msgID, author string, maxTotal, perAuthor int) {
+	t.Helper()
+	if err := s.Update(func(w *storage.Writer) error {
+		return w.AddImageURL(url, msgID, author, maxTotal, perAuthor)
+	}); err != nil {
+		t.Fatalf("AddImageURL(%s): %v", url, err)
+	}
+}
+
 func TestImageCacheEvictsOldest(t *testing.T) {
 	s := dbtest.Store(t)
 
-	// URLs whose lexicographic order is the REVERSE of their age, so an eviction that
-	// used cursor order rather than the timestamp would remove the wrong one.
+	// URLs whose lexicographic order is the REVERSE of their age, so eviction that
+	// walked URL order rather than message order would remove the wrong one. That was
+	// the pre-M11b layout's problem: the key was the URL, so cursor order had nothing
+	// to do with age and the trim had to hunt for the minimum timestamp.
 	urls := []string{"https://z.example/3", "https://m.example/2", "https://a.example/1"}
-	if err := s.Update(func(w *storage.Writer) error {
-		for i, u := range urls {
-			if err := w.AddImageURL(u, time.Unix(int64(i), 0), 2); err != nil {
-				return err
-			}
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("AddImageURL: %v", err)
+	for i, u := range urls {
+		cacheImage(t, s, u, snowflake(100+i), snowflake(7), 2, 0)
 	}
 
+	got := imageURLs(t, s)
+	if len(got) != 2 {
+		t.Fatalf("cache holds %d URLs, want 2: %v", len(got), got)
+	}
+	for _, u := range got {
+		if u == urls[0] {
+			t.Errorf("the oldest URL %q survived; eviction used key order rather than message order", u)
+		}
+	}
+}
+
+// TestOneAuthorCannotFillTheImageCache is SPEC.md section 4, A7. Image reposting has
+// the bot republish user-supplied media under its own name in a channel of its
+// choosing, so a hostile user seeding the cache is the attack, and the per-author cap
+// is what bounds their share of it.
+//
+// Verified by reverting: with the cap check removed from AddImageURL, the poisoner
+// owns all 20 entries and this fails on the first assertion.
+func TestOneAuthorCannotFillTheImageCache(t *testing.T) {
+	s := dbtest.Store(t)
+
+	const poisoner = "999000000000000001"
+	for i := 0; i < 20; i++ {
+		cacheImage(t, s, fmt.Sprintf("https://cdn.example/spam-%02d.png", i), snowflake(1000+i), poisoner, 20, 3)
+	}
+
+	var held int
 	if err := s.View(func(r *storage.Reader) error {
-		got, err := r.ImageURLs()
-		if err != nil {
-			return err
+		held = r.ImageAuthorCount(poisoner)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if held != 3 {
+		t.Errorf("one author holds %d cache entries against a cap of 3; the cap is not enforced", held)
+	}
+
+	// And the cap evicts THEIR OLDEST rather than dropping the new URL, so a prolific
+	// poster's share stays current instead of freezing at whatever they posted first.
+	got := imageURLs(t, s)
+	if len(got) != 3 {
+		t.Fatalf("cache holds %v, want the author's 3 most recent", got)
+	}
+	for _, u := range got {
+		if u == "https://cdn.example/spam-00.png" {
+			t.Error("the cap dropped new URLs instead of evicting the author's oldest")
 		}
-		if len(got) != 2 {
-			t.Fatalf("cache holds %d URLs, want 2: %v", len(got), got)
+	}
+	if got[2] != "https://cdn.example/spam-19.png" {
+		t.Errorf("newest cached URL is %q, want the last one posted", got[2])
+	}
+}
+
+// TestTheCapIsPerAuthorAndNotGlobal pins that the cap bounds one author's share
+// rather than the cache: several people together still fill it.
+func TestTheCapIsPerAuthorAndNotGlobal(t *testing.T) {
+	s := dbtest.Store(t)
+
+	msg := 2000
+	for a := 0; a < 4; a++ {
+		author := snowflake(500 + a)
+		for i := 0; i < 3; i++ {
+			cacheImage(t, s, fmt.Sprintf("https://cdn.example/a%d-%d.png", a, i), snowflake(msg), author, 100, 2)
+			msg++
 		}
-		for _, u := range got {
-			if u == urls[0] {
-				t.Errorf("the oldest URL %q survived; eviction used key order rather than age", u)
-			}
+	}
+
+	if got := imageURLs(t, s); len(got) != 8 {
+		t.Errorf("cache holds %d URLs, want 8 (four authors at a cap of two): %v", len(got), got)
+	}
+}
+
+// TestDeleteImagesByMessageRevokesTheRepost is the other half of A7: a deletion is a
+// strong signal that the content must not be republished, so the entries a deleted
+// message contributed have to become unrepostable.
+//
+// Verified by reverting: with DeleteImagesByMessage reduced to a no-op returning 0,
+// the deleted message's URL is still in the cache and this fails.
+func TestDeleteImagesByMessageRevokesTheRepost(t *testing.T) {
+	s := dbtest.Store(t)
+
+	const doomed = "1720000000000000001"
+	const kept = "1730000000000000001"
+	cacheImage(t, s, "https://cdn.example/doomed-a.png", doomed, snowflake(11), 100, 10)
+	cacheImage(t, s, "https://cdn.example/doomed-b.png", doomed, snowflake(11), 100, 10)
+	cacheImage(t, s, "https://cdn.example/kept.png", kept, snowflake(12), 100, 10)
+
+	var removed int
+	if err := s.Update(func(w *storage.Writer) error {
+		var err error
+		removed, err = w.DeleteImagesByMessage(doomed)
+		return err
+	}); err != nil {
+		t.Fatalf("DeleteImagesByMessage: %v", err)
+	}
+	if removed != 2 {
+		t.Errorf("removed %d entries, want both of the deleted message's", removed)
+	}
+
+	got := imageURLs(t, s)
+	if len(got) != 1 || got[0] != "https://cdn.example/kept.png" {
+		t.Errorf("cache holds %v, want only the surviving message's URL", got)
+	}
+
+	// The counter has to move with the delete, or the next insert trims against a
+	// cache size that is no longer true.
+	var cached uint64
+	if err := s.View(func(r *storage.Reader) error {
+		cached = r.Status().ImageCache
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if cached != 1 {
+		t.Errorf("count:image is %d after deleting two of three entries, want 1", cached)
+	}
+}
+
+// TestImageCacheDedupesAURL pins that caching the same URL twice does not spend two
+// slots, and that the second poster does not inherit the entry.
+func TestImageCacheDedupesAURL(t *testing.T) {
+	s := dbtest.Store(t)
+
+	const url = "https://tenor.com/view/bird-flying-gif-12345"
+	first := snowflake(300)
+	second := snowflake(301)
+	cacheImage(t, s, url, snowflake(3000), first, 100, 10)
+	cacheImage(t, s, url, snowflake(3001), second, 100, 10)
+
+	if got := imageURLs(t, s); len(got) != 1 {
+		t.Errorf("cache holds %d copies of one URL, want 1: %v", len(got), got)
+	}
+	if err := s.View(func(r *storage.Reader) error {
+		if n := r.ImageAuthorCount(second); n != 0 {
+			t.Errorf("the second poster was charged %d entries for a URL already cached, want 0", n)
+		}
+		if n := r.ImageAuthorCount(first); n != 1 {
+			t.Errorf("the original poster holds %d entries, want 1: re-posting reattributed it", n)
 		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestImageCacheRefusesInventedIDs. A message or author ID that is not a snowflake can
+// only come from a caller that made it up, and the right answer for that is an error
+// rather than a key nothing will ever find again. Same rule as MarkSeen.
+func TestImageCacheRefusesInventedIDs(t *testing.T) {
+	s := dbtest.Store(t)
+
+	for _, tc := range []struct{ name, msgID, author string }{
+		{"message id", "not-a-snowflake", snowflake(1)},
+		{"author id", snowflake(1), "me"},
+	} {
+		err := s.Update(func(w *storage.Writer) error {
+			return w.AddImageURL("https://cdn.example/x.png", tc.msgID, tc.author, 10, 5)
+		})
+		if err == nil {
+			t.Errorf("%s: AddImageURL accepted a non-snowflake", tc.name)
+		}
+	}
+}
+
+// TestSchemaUpgradeEmptiesTheImageCache pins the version 1 to 2 migration, and the
+// asymmetry it represents: the corpus is refused because converting it means rewriting
+// everything, whereas the image cache is discarded because it refills itself.
+//
+// A version 1 entry left in place would be unreadable under the new codec AND would
+// keep counting against the cache size, so the cache would run permanently short.
+func TestSchemaUpgradeEmptiesTheImageCache(t *testing.T) {
+	path := dbtest.Path(t)
+
+	// A version 1 corpus: real learned data plus an image entry in the old shape,
+	// which was the bare URL as the key and a timestamp as the value.
+	s, err := storage.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := s.Update(func(w *storage.Writer) error {
+		return w.LearnNgram("the bird", "flew", "author-1")
+	}); err != nil {
+		t.Fatalf("seed corpus: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	db, err := bbolt.Open(path, 0600, nil)
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	if err := db.Update(func(tx *bbolt.Tx) error {
+		if err := tx.Bucket([]byte("image")).Put([]byte("https://cdn.example/v1.png"), []byte("12345678")); err != nil {
+			return err
+		}
+		if err := tx.Bucket([]byte("meta")).Put([]byte("count:image"), []byte{0, 0, 0, 0, 0, 0, 0, 1}); err != nil {
+			return err
+		}
+		// Stamp it back to version 1.
+		return tx.Bucket([]byte("meta")).Put([]byte("schema_version"), []byte{0, 0, 0, 0, 0, 0, 0, 1})
+	}); err != nil {
+		t.Fatalf("fabricate a v1 corpus: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+
+	up, err := storage.Open(path)
+	if err != nil {
+		t.Fatalf("Open refused a version 1 corpus instead of upgrading it: %v", err)
+	}
+	defer func() { _ = up.Close() }()
+
+	if got := imageURLs(t, up); len(got) != 0 {
+		t.Errorf("the upgrade left %v in the image cache; a v1 entry is unreadable under the v2 codec", got)
+	}
+	if err := up.View(func(r *storage.Reader) error {
+		st := r.Status()
+		if st.ImageCache != 0 {
+			t.Errorf("count:image is %d after the upgrade, want 0: the counter and the bucket disagree", st.ImageCache)
+		}
+		// The expensive half of the corpus survives. That is the entire reason this is
+		// a migration rather than a refusal.
+		if st.Ngrams == 0 {
+			t.Error("the upgrade discarded learned n-grams; only the image cache is cheap enough to drop")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// And the upgraded corpus takes new-format entries.
+	cacheImage(t, up, "https://cdn.example/v2.png", snowflake(4000), snowflake(9), 10, 5)
+	if got := imageURLs(t, up); len(got) != 1 {
+		t.Errorf("after upgrading, the cache holds %v, want the one new URL", got)
 	}
 }
 

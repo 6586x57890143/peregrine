@@ -115,6 +115,66 @@ func authorKey(prefix, next, authorID string) ([]byte, error) {
 	return key, nil
 }
 
+// imageKey builds <message snowflake be64> NUL <url>.
+//
+// The message ID leads, and that ordering is the whole design of this bucket rather
+// than a preference. It buys three things that the previous key, the bare URL, could
+// not:
+//
+//   - Eviction order. A snowflake's high bits are a millisecond timestamp, so byte
+//     order is numeric order is chronological order and a cursor's First() IS the
+//     oldest cached image. The old layout stored a timestamp in the value and hunted
+//     for the minimum with a full bucket scan INSIDE the eviction loop, which made
+//     trimming k entries cost O(n*k). Same shape as finding 11, one bucket over.
+//   - Deletion by message, which is what SPEC.md section 4.2's deleted-message rule
+//     needs: a message being deleted is a strong signal that the bot must not
+//     republish what was in it. With the URL as the key there was no way to find the
+//     entries a message had contributed, which is why Writer.DeleteImageURL sat here
+//     for a milestone with a comment about deleted messages and no caller.
+//   - Attribution, in the value, which is what makes a per-author cap possible.
+//
+// The separator sits at a FIXED offset because the ID is fixed-width, so a NUL byte
+// inside the snowflake itself cannot make the key ambiguous. That is not true of the
+// variable-width composite keys above, which is why they assert instead.
+func imageKey(msgID, url string) ([]byte, error) {
+	id, err := encodeSnowflake(msgID)
+	if err != nil {
+		return nil, err
+	}
+	if err := assertNoNul(url); err != nil {
+		return nil, err
+	}
+	key := make([]byte, 0, snowflakeLen+1+len(url))
+	key = append(key, id...)
+	key = append(key, sep)
+	key = append(key, url...)
+	return key, nil
+}
+
+// imageMessageRange returns the seek target and exclusive upper bound covering every
+// entry cached from one message.
+func imageMessageRange(msgID string) (seek, limit []byte, err error) {
+	id, err := encodeSnowflake(msgID)
+	if err != nil {
+		return nil, nil, err
+	}
+	seek = append(append([]byte(nil), id...), sep)
+	limit = append(append([]byte(nil), id...), sep+1)
+	return seek, limit, nil
+}
+
+// splitImageKey recovers the URL from an image key.
+//
+// A key that is too short or missing its separator returns false rather than a
+// truncated URL, because the caller's next move is to hand the result to Discord as
+// something to post. Half a URL is worse than no URL.
+func splitImageKey(key []byte) (string, bool) {
+	if len(key) < snowflakeLen+1 || key[snowflakeLen] != sep {
+		return "", false
+	}
+	return string(key[snowflakeLen+1:]), true
+}
+
 // pairKey builds <a> NUL <b>, used for the KN predecessor set and the two
 // association buckets.
 func pairKey(a, b string) ([]byte, error) {
