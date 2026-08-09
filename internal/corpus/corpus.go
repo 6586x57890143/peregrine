@@ -10,6 +10,12 @@
 // No methods that do I/O, no JSON tags that imply a wire format, no behaviour. If
 // something here needs a database, it belongs in storage; if it needs a decision,
 // it belongs in markov.
+//
+// The pure functions here are the exception that proves that rule rather than breaking
+// it: MeanPosition and StartOfWeekUTC define what their neighbouring types MEAN, take no
+// dependency, and exist here precisely so that two consumers cannot hold two different
+// answers. StartOfWeekUTC had three implementations before M11c and one of the
+// disagreements between them is finding 17.
 package corpus
 
 import "time"
@@ -70,6 +76,28 @@ type Name struct {
 type WeeklyStat struct {
 	Count         uint64
 	LastTimestamp time.Time
+}
+
+// StartOfWeekUTC returns the Monday 00:00 UTC that begins t's week.
+//
+// It lives next to WeeklyStat because it defines what "weekly" means for that type, and
+// because it has to be exactly one function. There were three implementations of this
+// boundary before M11c: one in the learn path deciding when a user's count resets, one in
+// the word-game leaderboard deciding when the board resets, and one more in the display
+// that derived the NEXT reset from the host clock while the reset itself consulted NTP.
+// That last disagreement is finding 17, and two sources of truth for one date is how it
+// happened.
+//
+// It is pure and takes no clock, which is what lets both callers be tested by moving time
+// rather than by waiting for a Monday.
+func StartOfWeekUTC(t time.Time) time.Time {
+	u := t.UTC()
+	weekday := int(u.Weekday())
+	if weekday == 0 {
+		weekday = 7 // Sunday ends a week here rather than starting one
+	}
+	return time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC).
+		AddDate(0, 0, -(weekday - 1))
 }
 
 // WordPos carries the positional and association data generation uses to bias

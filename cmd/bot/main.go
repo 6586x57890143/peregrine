@@ -24,7 +24,6 @@ import (
 
 	"github.com/6586x57890143/peregrine/internal/config"
 	"github.com/6586x57890143/peregrine/internal/core"
-	"github.com/6586x57890143/peregrine/internal/legacy"
 	"github.com/6586x57890143/peregrine/internal/maintenance"
 	"github.com/6586x57890143/peregrine/internal/safety"
 	"github.com/6586x57890143/peregrine/internal/storage"
@@ -188,7 +187,9 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 		Dispatcher: dispatcher,
 		Gate:       gate,
 	}, log)
-	registry.Register(legacy.New())
+	if err := registerServices(registry, cfg, session, store, gate, log); err != nil {
+		return err
+	}
 
 	if err := registry.InitAll(); err != nil {
 		return err
