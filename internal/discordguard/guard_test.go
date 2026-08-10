@@ -17,12 +17,19 @@ type fakeSession struct {
 	deletes     [][2]string
 	reactions   [][3]string
 	unreactions [][4]string
+	presences   []discordgo.UpdateStatusData
 
-	sendErr    error
-	editErr    error
-	deleteErr  error
-	reactErr   error
-	unreactErr error
+	sendErr     error
+	editErr     error
+	deleteErr   error
+	reactErr    error
+	unreactErr  error
+	presenceErr error
+}
+
+func (f *fakeSession) UpdateStatusComplex(usd discordgo.UpdateStatusData) error {
+	f.presences = append(f.presences, usd)
+	return f.presenceErr
 }
 
 func (f *fakeSession) ChannelMessageSendComplex(channelID string, data *discordgo.MessageSend, _ ...discordgo.RequestOption) (*discordgo.Message, error) {
@@ -403,5 +410,159 @@ func TestUnreactRespectsTheIgnoreListAndReportsFailure(t *testing.T) {
 	f2 := &fakeSession{unreactErr: errors.New("gone")}
 	if g := newGuard(f2, allowAll{}); g.Unreact("chan", "m", "x", "bot") {
 		t.Error("a failed removal reported success")
+	}
+}
+
+// An embed is still the bot speaking, and mentions in it are suppressed exactly as they are
+// in a plain message. Asserted on the MARSHALLED form for the same reason the plain-send test
+// is: "parse":null and "parse":[] are different bytes, and Discord treating them alike is a
+// reading of the API rather than something the documentation says.
+func TestAnEmbedSendCarriesTheSameSuppressionOnTheWire(t *testing.T) {
+	f := &fakeSession{}
+	g := newGuard(f, allowAll{})
+
+	if _, ok := g.SendEmbed("c1", &discordgo.MessageEmbed{
+		Title:       "Weekly Leaderboard",
+		Description: "one line about <@123>",
+	}); !ok {
+		t.Fatal("SendEmbed reported failure")
+	}
+	if len(f.sends) != 1 {
+		t.Fatalf("got %d sends, want 1", len(f.sends))
+	}
+
+	encoded, err := json.Marshal(f.sends[0])
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	body := string(encoded)
+	if !strings.Contains(body, `"allowed_mentions"`) {
+		t.Fatalf("allowed_mentions was dropped from the embed request entirely, which Discord "+
+			"reads as \"parse every mention\": %s", body)
+	}
+	// Only parse is checked, and that is not an oversight. Roles and Users carry omitempty
+	// in discordgo, so an explicit empty slice marshals away to nothing either way; the
+	// guard sets them anyway as insurance against a future tag change, but there is no wire
+	// form to assert. Parse does not carry omitempty, which is exactly why it is the field
+	// where null and [] are distinguishable and therefore the field that matters.
+	if !strings.Contains(body, `"parse":[]`) {
+		t.Errorf("want \"parse\":[] on an embed send, Discord's documented \"allow nothing\": %s", body)
+	}
+	if strings.Contains(body, `"parse":null`) {
+		t.Errorf("parse marshalled as null on an embed send: %s", body)
+	}
+}
+
+// The gate has to see EVERY text field, not the two anybody remembers. A blocklisted word in
+// a field value is exactly as much of an incident as one in the description, and which part
+// of the struct it landed in is an accident of how the caller built it.
+func TestTheGateReadsEveryTextFieldOfAnEmbed(t *testing.T) {
+	// One embed per field, each carrying the bad word in a different place.
+	cases := map[string]*discordgo.MessageEmbed{
+		"title":       {Title: "NOPE"},
+		"description": {Description: "NOPE"},
+		"author":      {Title: "ok", Author: &discordgo.MessageEmbedAuthor{Name: "NOPE"}},
+		"footer":      {Title: "ok", Footer: &discordgo.MessageEmbedFooter{Text: "NOPE"}},
+		"field name":  {Title: "ok", Fields: []*discordgo.MessageEmbedField{{Name: "NOPE", Value: "v"}}},
+		"field value": {Title: "ok", Fields: []*discordgo.MessageEmbedField{{Name: "n", Value: "NOPE"}}},
+	}
+
+	for where, embed := range cases {
+		f := &fakeSession{}
+		g := newGuard(f, blockMatching{bad: "NOPE"})
+
+		if _, ok := g.SendEmbed("c1", embed); ok {
+			t.Errorf("an embed with the blocked word in its %s was sent anyway", where)
+		}
+		if len(f.sends) != 0 {
+			t.Errorf("a refused embed (%s) still reached the session", where)
+		}
+	}
+}
+
+// A nil embed is refused rather than dereferenced. Discord would reject an empty send anyway,
+// and a caller reaching here with nothing has already decided to stay silent.
+func TestANilEmbedIsRefused(t *testing.T) {
+	f := &fakeSession{}
+	g := newGuard(f, allowAll{})
+
+	if _, ok := g.SendEmbed("c1", nil); ok {
+		t.Error("a nil embed was sent")
+	}
+	if len(f.sends) != 0 {
+		t.Error("a nil embed reached the session")
+	}
+}
+
+// The ignore list covers embeds too. An operator saying "not in there" means it about every
+// kind of message, which is the whole reason the list lives in the guard rather than in the
+// reply path.
+func TestAnIgnoredChannelRefusesAnEmbed(t *testing.T) {
+	f := &fakeSession{}
+	g := newGuard(f, allowAll{}, "c-quiet")
+
+	if _, ok := g.SendEmbed("c-quiet", &discordgo.MessageEmbed{Title: "hello"}); ok {
+		t.Error("an embed was sent into an ignored channel")
+	}
+	if len(f.sends) != 0 {
+		t.Error("an ignored channel still reached the session")
+	}
+}
+
+// The presence line is content-gated, because a caller may put a word from the corpus in it.
+func TestPresenceIsContentGated(t *testing.T) {
+	f := &fakeSession{}
+	g := newGuard(f, blockMatching{bad: "NOPE"})
+
+	if g.Presence("currently thinking about: NOPE") {
+		t.Error("a presence line carrying blocked text was set")
+	}
+	if len(f.presences) != 0 {
+		t.Error("a refused presence still reached the session")
+	}
+
+	if !g.Presence("watching 1,204,553 n-grams") {
+		t.Fatal("an ordinary presence line was refused")
+	}
+	if len(f.presences) != 1 {
+		t.Fatalf("got %d presence updates, want 1", len(f.presences))
+	}
+	if len(f.presences[0].Activities) != 1 ||
+		f.presences[0].Activities[0].Name != "watching 1,204,553 n-grams" {
+		t.Errorf("presence data is wrong: %+v", f.presences[0])
+	}
+}
+
+// NOT pause-gated, and that asymmetry with React is the point. Presence carries no channel
+// content and cannot ping, so freezing it during an incident buys nothing and costs the
+// operator their only sign the process is alive: a bot with a stale status line and no
+// messages looks exactly like a bot that has died. Same reasoning as Unreact.
+//
+// A gate that refuses everything is what a paused Gate looks like from here, so the empty
+// string is the case that distinguishes "paused" from "the content was bad".
+func TestAnEmptyPresenceSkipsTheGateEntirely(t *testing.T) {
+	blocked := &blockAll{}
+	f := &fakeSession{}
+	g := newGuard(f, blocked)
+
+	if !g.Presence("") {
+		t.Error("an empty presence line was refused; there is no content to refuse")
+	}
+	if blocked.calls != 0 {
+		t.Errorf("the gate was consulted %d time(s) for a presence line with no text", blocked.calls)
+	}
+	if len(f.presences) != 1 {
+		t.Errorf("got %d presence updates, want 1", len(f.presences))
+	}
+}
+
+// A failed presence update is reported as a failure rather than swallowed, so a caller that
+// wants to fall back to something simpler can.
+func TestAFailedPresenceUpdateReportsFailure(t *testing.T) {
+	f := &fakeSession{presenceErr: errors.New("gateway is reconnecting")}
+	g := newGuard(f, allowAll{})
+
+	if g.Presence("watching 12 n-grams") {
+		t.Error("Presence reported success after the session returned an error")
 	}
 }

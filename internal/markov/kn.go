@@ -124,6 +124,15 @@ func (o orderStats) lambda(d float64) float64 {
 type model struct {
 	g      *Generator
 	orders map[string]*orderStats
+
+	// minCtxWords is the shortest context, in words, that enumerate actually drew
+	// candidates from. Read by Next for the trace and by nothing else.
+	//
+	// It records how far the backoff had to go, which is the question SPEC.md section 10
+	// leaves open about low-order joins reading as nonsense. A context that turned out to
+	// be empty does not count: it contributed no candidates, so it is not where the
+	// sentence came from.
+	minCtxWords int
 }
 
 func (g *Generator) newModel() *model {
@@ -296,6 +305,7 @@ func (m *model) enumerate(ctxs []string) ([]candidate, error) {
 		if o.total == 0 {
 			continue
 		}
+		m.minCtxWords = strings.Count(ctx, " ") + 1
 
 		succ, err := m.g.corpus.Successors(ctx)
 		if err != nil {

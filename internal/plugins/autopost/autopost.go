@@ -36,6 +36,7 @@ import (
 	"github.com/6586x57890143/peregrine/internal/channels"
 	"github.com/6586x57890143/peregrine/internal/core"
 	"github.com/6586x57890143/peregrine/internal/generate"
+	"github.com/6586x57890143/peregrine/internal/plugins/tuning"
 )
 
 // Guard is the send chokepoint.
@@ -53,6 +54,24 @@ type Guard interface {
 type Speaker interface {
 	Sentence(req generate.Request) (string, generate.Outcome, error)
 }
+
+// Recorder is the tuning export. internal/plugins/tuning satisfies it, and a nil one is
+// replaced by a no-op in New.
+//
+// An unprompted post is a DIFFERENT question from a reply and the export keeps them apart
+// for that reason: one is answering somebody and one is speaking into a room, so a single
+// average over both would average two distributions that should never have met. This path
+// is also the one with the least human context around it, which makes it the most likely to
+// read as a non-sequitur and therefore the most worth measuring.
+type Recorder interface {
+	Record(tuning.Generation)
+}
+
+// noRecorder is what a nil Recorder means. A null object rather than a nil check, matching
+// the reactor and wordgame.noCounter.
+type noRecorder struct{}
+
+func (noRecorder) Record(tuning.Generation) {}
 
 // Options are the dials.
 type Options struct {
@@ -82,6 +101,7 @@ type Service struct {
 	counter  channels.Counter
 	resolver channels.Resolver
 	emoji    generate.EmojiResolver
+	recorder Recorder
 	opts     Options
 
 	loops       sync.WaitGroup
@@ -91,10 +111,14 @@ type Service struct {
 
 // New builds the service.
 func New(guard Guard, speaker Speaker, memories *generate.Memories,
-	counter channels.Counter, resolver channels.Resolver, emoji generate.EmojiResolver, opts Options) *Service {
+	counter channels.Counter, resolver channels.Resolver, emoji generate.EmojiResolver,
+	recorder Recorder, opts Options) *Service {
+	if recorder == nil {
+		recorder = noRecorder{}
+	}
 	return &Service{
 		guard: guard, speaker: speaker, memories: memories,
-		counter: counter, resolver: resolver, emoji: emoji, opts: opts,
+		counter: counter, resolver: resolver, emoji: emoji, recorder: recorder, opts: opts,
 	}
 }
 
@@ -161,23 +185,51 @@ func (s *Service) post() {
 	// The prompt is a fixed literal, so for THIS caller the channel's conversation memory is
 	// the only context there is. That is what makes the graded recency in M19 matter most
 	// here: an unprompted post steered by nothing is a non-sequitur by construction.
+	var trace generate.Trace
 	msg, outcome, err := s.speaker.Sentence(generate.Request{
 		Prompt: "autonomous thought",
 		Memory: s.memories.For(channelID),
 		Emoji:  s.emoji,
+		Trace:  &trace,
 	})
+
+	// One helper for all four exits, so a path cannot be added that records nothing. The
+	// silent ones are the point rather than an afterthought: an unprompted post that
+	// produced nothing is the clearest signal there is that the corpus or the
+	// author-diversity threshold is the problem, and until now it left only a log line.
+	record := func(sentID, text string, sent bool) {
+		s.recorder.Record(tuning.Generation{
+			ID:      sentID,
+			Trigger: "autopost",
+			Channel: channelID,
+			Prompt:  "autonomous thought",
+			Reply:   text,
+			Outcome: outcome.String(),
+			Sent:    sent,
+			Took:    time.Since(start),
+			Trace:   &trace,
+		})
+	}
+
 	if err != nil {
 		log.Println("[AUTONOMOUS] Error generating message:", err)
+		record("", "", false)
 		return
 	}
 	if msg == "" {
 		// This path already said something; the reason is what it was missing.
 		log.Printf("[AUTONOMOUS] Nothing to post, skipping: %s", outcome)
+		record("", "", false)
 		return
 	}
 
+	// A refused send records no text, matching the reply path and internal/safety's rule
+	// that the offending content is never written down.
 	if sent, ok := s.guard.Send(channelID, msg); ok {
 		log.Printf("[AUTONOMOUS] Sent message in %s: %s (ID: %s)", channelID, msg, sent.ID)
+		record(sent.ID, msg, true)
+	} else {
+		record("", "", false)
 	}
 	log.Printf("[AUTONOMOUS] Cycle finished in %s.", time.Since(start))
 }

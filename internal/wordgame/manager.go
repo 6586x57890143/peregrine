@@ -21,6 +21,19 @@ type Game struct {
 	MessageID string
 	StartedAt time.Time
 	ExpiresAt time.Time
+
+	// HintAt is when the first letter should be revealed, and Hinted records that it has
+	// been. Zero HintAt means hints are off.
+	//
+	// A field on the game rather than another timer, for the same reason ExpiresAt is one:
+	// the sweep that already runs collects these too, so a hint costs no goroutine and
+	// inherits the panic isolation and context binding RunLoop gives that sweep for free.
+	HintAt time.Time
+	Hinted bool
+
+	// Planted records that an operator chose this word with !wordgame <word> rather than it
+	// being drawn from the dictionary. Reported so a log line can tell the two apart.
+	Planted bool
 }
 
 // Options are the numbers. Every one of them was a literal in the middle of the handler.
@@ -48,6 +61,12 @@ type Options struct {
 	// busy enough.
 	TriggerChance float64
 
+	// HintAfter is how long into a puzzle the first letter is revealed. Zero disables hints.
+	//
+	// Validated below Timeout by config, because a hint that lands after the game has ended
+	// is a knob wired to nothing, which is worse than no knob.
+	HintAfter time.Duration
+
 	// MaxChannels bounds the cooldown map, which is the only per-channel map left here.
 	MaxChannels int
 }
@@ -70,6 +89,12 @@ func (o Options) withDefaults() Options {
 	}
 	if o.MaxChannels <= 0 {
 		o.MaxChannels = 500
+	}
+	if o.HintAfter < 0 || o.HintAfter >= o.Timeout {
+		// A hint at or past the deadline never fires. Zero is the honest way to express "no
+		// hints", so an out-of-range value becomes that rather than being clamped to
+		// something the operator did not ask for.
+		o.HintAfter = 0
 	}
 	return o
 }
@@ -144,6 +169,12 @@ func NewManager(dict *Dictionary, src Source, counter Counter, opts Options) *Ma
 	}
 }
 
+// WordBounds reports the length limits a planted word has to satisfy.
+//
+// So the refusal can say what would have been accepted. A command that answers "no" without
+// saying why is the shape this milestone exists to remove from the word game.
+func (m *Manager) WordBounds() (min, max int) { return m.dict.Bounds() }
+
 // Available reports whether games can run at all, which is false when the dictionary
 // failed to load.
 //
@@ -158,8 +189,28 @@ func (m *Manager) Available() bool { return m.dict.Len() > 0 }
 // what lets the announcement go through the guard: the Manager cannot send, so it cannot
 // bypass it.
 func (m *Manager) Start(channelID string) (*Game, error) {
+	return m.StartWord(channelID, "")
+}
+
+// StartWord begins a game on a word the caller chose, or draws one when word is empty.
+//
+// This is !wordgame <word>: the operator planting a joke word rather than taking what the
+// dictionary offers. It is one function rather than two because everything after choosing the
+// word is identical, and because a second copy of the "is a game already running here" check
+// is a second place for it to be got wrong.
+//
+// A PLANTED WORD IS HELD TO THE DICTIONARY'S OWN RULES. That is not politeness about input:
+// LoadDictionary excludes words with fewer than two distinct letters specifically because
+// scramble used to recurse forever on them, and its own bound is documented as "a belt to
+// this braces". A word arriving by a route that skipped the loader would leave the belt doing
+// that work alone, which is the arrangement that produced the original stack overflow.
+func (m *Manager) StartWord(channelID, word string) (*Game, error) {
 	if !m.Available() {
 		return nil, ErrNoDictionary
+	}
+	planted := word != ""
+	if planted && !m.dict.Usable(word) {
+		return nil, ErrUnusableWord
 	}
 
 	m.mu.Lock()
@@ -169,7 +220,9 @@ func (m *Manager) Start(channelID string) (*Game, error) {
 		return nil, ErrGameInProgress
 	}
 
-	word := m.dict.words[m.src.IntN(len(m.dict.words))]
+	if !planted {
+		word = m.dict.words[m.src.IntN(len(m.dict.words))]
+	}
 	now := m.now()
 	g := &Game{
 		Word:      word,
@@ -177,6 +230,10 @@ func (m *Manager) Start(channelID string) (*Game, error) {
 		ChannelID: channelID,
 		StartedAt: now,
 		ExpiresAt: now.Add(m.opts.Timeout),
+		Planted:   planted,
+	}
+	if m.opts.HintAfter > 0 {
+		g.HintAt = now.Add(m.opts.HintAfter)
 	}
 	m.games[channelID] = g
 
@@ -326,6 +383,47 @@ func (m *Manager) Expired() []*Game {
 	return out
 }
 
+// DueHints removes the hint flag from every game whose hint time has arrived and returns them.
+//
+// Swept by the same tick as Expired and DueDeletions, which is the whole design: one loop for
+// every deadline this package has, rather than a timer per event. The resolution is therefore
+// the tick, so a hint can land a few seconds late, which is invisible.
+//
+// A game with no announcement is skipped rather than returned. The caller edits the
+// announcement to add the hint, and there is nothing to edit when the guard refused the
+// original send.
+func (m *Manager) DueHints() []*Game {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := m.now()
+	var out []*Game
+	for _, g := range m.games {
+		if g.Hinted || g.HintAt.IsZero() || now.Before(g.HintAt) || g.MessageID == "" {
+			continue
+		}
+		g.Hinted = true
+		out = append(out, g)
+	}
+	// Sorted for the same reason Expired is: deterministic announcements and deterministic
+	// tests, rather than Go's randomized map iteration.
+	sort.Slice(out, func(i, j int) bool { return out[i].ChannelID < out[j].ChannelID })
+	return out
+}
+
+// Hint is the letter to reveal, and how many letters the answer has.
+//
+// The FIRST letter only. Revealing more turns a puzzle into a spelling exercise, and the
+// length is already visible in the scramble, so it is repeated here only because it reads as
+// part of the same sentence.
+func (g *Game) Hint() (first string, letters int) {
+	runes := []rune(g.Word)
+	if len(runes) == 0 {
+		return "", 0
+	}
+	return string(runes[0]), len(runes)
+}
+
 // DeleteLater schedules a message for removal.
 func (m *Manager) DeleteLater(channelID, messageID string) {
 	if messageID == "" || m.opts.AnnounceTTL <= 0 {
@@ -372,4 +470,9 @@ func (m *Manager) Active() int {
 var (
 	ErrNoDictionary   = errors.New("wordgame: no dictionary loaded, word games are unavailable")
 	ErrGameInProgress = errors.New("wordgame: a game is already running in this channel")
+
+	// ErrUnusableWord is a word an operator supplied that the dictionary would have rejected:
+	// wrong length, a non-letter in it, or fewer than two distinct letters. The last is the
+	// one that matters, because it is what stops scramble recursing.
+	ErrUnusableWord = errors.New("wordgame: that word cannot be a puzzle")
 )

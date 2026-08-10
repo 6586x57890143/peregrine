@@ -48,6 +48,13 @@ go run ./cmd/bot -compact ./markov.new      # reclaim free pages; bbolt never sh
 go run ./cmd/bot -purge-author 123456789    # undo one author's contribution to diversity counts
 ```
 
+`-tuning-report` is not one of those and takes no lock: it reads a directory of JSON lines
+rather than the corpus, so it needs no `.env`, no token and no database, and runs against an
+archive pulled off the host with `scp`.
+```sh
+go run ./cmd/bot -tuning-report ./tuning
+```
+
 ## Architecture
 
 ### The entrypoint, and why `internal/legacy` existed
@@ -226,6 +233,40 @@ The dictionary load used to be `log.Fatalf`, so a missing 64 KB word list killed
 **The Manager does not count messages any more; it asks a `Counter` it declares itself.** M11a gave it a per-channel activity map, and M11b took it away, because two other features needed the same number and one of them keeping a private copy is the finding-28 shape. `Note` became `MaybeStart`. `Start` no longer clears the channel's count, since the count belongs to a shared observer now and zeroing it would lie to aggro and autonomous posting about how busy the channel is; a per-channel cooldown of one `ActivityWindow` reproduces the old behaviour exactly, because clearing meant a full window of fresh traffic before the threshold could be met again. A nil `Counter` disables the trigger, which is the quiet direction: no way to tell whether a channel is busy is a reason to start no games.
 
 **`MaybeStart` asks the counter outside its own lock**, because the counter is another package's mutex and holding one lock while taking another is how a lock-ordering deadlock gets built. Nothing needs the count and the game map to be consistent with each other; the worst case is a game started on a count that was true a microsecond ago.
+
+**A refusal that says nothing is the bug, not the silence itself.** `!wordgame` used to `return` on
+an unauthorized caller with no log line and no reply, which is indistinguishable from a broken
+bot. The case that actually bit is the operator's: with `PEREGRINE_BOOTSTRAP_ADMIN_USER_ID`
+unset, `Authorized` fails closed and refuses **everyone** including the person who deployed the
+bot. So the log now names which of the two happened, and a guard-refused announcement says so
+too. It stays silent **in the channel**, which is a different decision: answering a non-admin
+advertises that the command exists and that they are not allowed to use it. That is finding 32's
+shape in a command rather than in the reply path.
+
+**A hint is not a fourth timer.** `HintAt` is a field on the `Game` and `DueHints` is swept by
+the sweep that already expires puzzles, so it costs no goroutine and inherits `RunLoop`'s panic
+isolation and context binding for free. It **edits** the announcement rather than posting again,
+so the hint arrives where people are already looking, and a game whose announcement the guard
+refused is skipped rather than returned, because there is nothing to edit.
+`PEREGRINE_WORDGAME_HINT_AFTER` at or above `PEREGRINE_WORDGAME_TIMEOUT` is a startup error
+naming both: a hint due after the puzzle has ended is a knob wired to nothing.
+
+**A planted word is held to the dictionary's own rules, through the same function.**
+`LoadDictionary` excludes words with fewer than two distinct letters *specifically* because
+`scramble` used to recurse forever on them, and the scrambler's own bound is documented as a belt
+to those braces. `!wordgame <word>` skips the loader, so `Dictionary.Usable` reuses `usable`
+rather than restating it, and the refusal names the length bounds instead of saying no.
+
+**`commandFor` keeps matching the whole message, and the argument form is what preserves that.**
+It accepts exactly two tokens whose **first** is the command, so "you should try !wordgame
+sometime" is still ordinary chat. Taking everything after the command would have turned any
+sentence mentioning it into an invocation carrying the rest of that sentence as its puzzle word.
+
+**Streaks and records are `omitempty` fields on the persisted board**, so an M11-era blob loads
+with zeroes rather than being refused, for the same reason the pre-M11 format is still read.
+`Streak()` reads `lastWinner` rather than scanning for the largest streak, because every other
+entry's number is stale from whenever that player last had one, and it requires two wins: a line
+that appeared after every single game would be noise rather than news.
 
 ### Names: one answer to what somebody is called, and the author is always one
 
@@ -496,6 +537,66 @@ The engine is `internal/markov` as of M7a. Read `SPEC.md` §5 for the full speci
 
 **Custom emote output had never worked, and M3 fixed the cause.** The `:shortcode:` resolver walks `s.State.Guilds`, and the session never requested `IntentsGuilds`, so that slice was always empty and the resolver had never once succeeded. In a meme server the server's own emotes are most of the register, so this was an engagement bug before it was a performance bug. `core.NewSession` now requests the intent. The state cache it populates is what M10 uses to replace the per-message REST `s.Channel` call for the NSFW check; that call site is still REST today. Emote-bearing output has a golden-sample check as of M7a, now that it is possible at all.
 
+## The leaderboard, and the presence line
+
+**`!leaderboard` was slow for one specific reason and it was not the corpus.** It resolved a
+display name for **every** user in the week's stats before sorting anything, through
+`chat.displayName`, which was an uncached `GuildMember` REST GET with a `User` fallback. On a
+server with two hundred weekly talkers that is two hundred-odd sequential, rate-limited
+requests to render twenty rows. `names.NewCachedSession` had existed since M18 for exactly
+this shape and this was the last call site in the module that never got it.
+
+**Rank first, resolve names second.** `wordgame.Rank` is competition ranking (one plus the
+number of people strictly ahead) computed from scores alone, so it needs no names at all, and
+`Board.NamesNeeded` is at most eleven per board. `TestTheLeaderboardResolvesOnlyTheNamesItRenders`
+counts resolver calls, because a behavioural test on the rendered board passes just as happily
+with two hundred lookups behind it. The resolver is memoized across both boards, so somebody on
+each costs one lookup.
+
+**The board keeps user IDs end to end**, which fixed a real defect as well as the speed: it
+used to be `map[displayName]int`, so two people with the same nickname merged into one row, and
+"your rank" was unaskable because the only thing identifying a viewer is their ID.
+
+**Ties order by user ID, not by name.** Arbitrary but stable, and stability is the requirement:
+an unstable order made the ranking shuffle between two identical invocations. Ordering by name
+would be prettier and would put the names back on the critical path, which is the cost this
+change exists to remove.
+
+**`Guard.SendEmbed` runs `CheckEmit` over EVERY text field**, walking the struct rather than
+naming the two fields anybody remembers. Nicknames are user-controlled, so a blocklisted word
+in a field value is exactly as much of an incident as one in the description, and which of them
+it landed in is an accident of how the caller built the embed. Names render as plain text and
+never as `<@id>`: Discord documents embed mentions as not notifying, which is very likely true
+and is precisely the kind of undocumented-adjacent reading `allowedMentions` refuses to lean
+on.
+
+**`Guard.Presence` is content-gated and deliberately NOT pause-gated.** Gated on content
+because the line may quote a corpus word, which is public output with no conversation around it
+and therefore the autonomous poster's category of risk. Not pause-gated because presence
+carries no channel content and cannot ping, so freezing it during an incident buys nothing and
+costs the operator their only sign the process is alive. That is `Unreact`'s asymmetry, made
+for the same kind of reason. A refused corpus word falls back to a count rather than leaving
+the line frozen.
+
+**The presence line has no loop and no interval of its own.** `health.reportStatus` already
+reads `storage.Status` on a ticker, and that page walk is expensive enough to be why the status
+line is on a ticker at all (finding 11). One walk, two consumers. The rotation is round robin
+rather than random, because a random draw repeats and a line that shows the same fact twice
+running reads as a bot that has stopped updating.
+
+**`Reader.ScanTopics` is bounded by the caller and filters nothing.** Storage is the bottom
+layer and must not learn what a word means, so the stop-word and length filters live in
+`health`. The scan starts from a random letter, because the single most frequent non-stop word
+in a corpus never changes and a status line built from it would say the same thing forever.
+
+**There was a FOURTH `StartOfWeekUTC`.** `corpus`'s own doc comment says the function lives
+there "precisely so that two consumers cannot hold two different answers" and records that it
+had three implementations before M11c; `internal/wordgame` still carried a fourth, with
+different arithmetic and the same answer, which is why nothing failed and nothing found it. It
+matters now rather than in principle: the command renders the word-game tally and the chat
+tally as two halves of one embed promising one reset time, and the second filters stats by
+`corpus.StartOfWeekUTC`. It is an alias now.
+
 ## Safety model
 
 `SPEC.md` §4 is the full threat model. Assume users actively try to make the bot say gross or borderline illegal things, and that **the operator carries the consequences of whatever it posts**. Four rules follow, and each exists because of a specific hole.
@@ -545,6 +646,88 @@ Backups are in-process, in `internal/plugins/backup`: `Store.Backup` takes a rea
 **`PEREGRINE_BACKUP_DIR` must be a writable mount in a container.** The image runs `read_only: true`, so any path outside a volume or bind fails on the first write, and a relative path resolves against the distroless working directory. `docker-compose.prod.yml` binds `./backups` to `/backups` for this, and it is deliberately **outside** the corpus volume so that losing or removing that volume does not take the snapshots with it. Each snapshot is a full copy, so the disk cost is `KEEP` times the corpus size.
 
 `markov.db`, the whisper model and the ffmpeg binary are all gitignored. `voicenotes/models/ggml-small.bin` is 465 MiB, over GitHub's hard 100 MiB per-file limit, so a commit containing it cannot be pushed at all and the only remedy is rewriting history. `.dockerignore` exists for the same weight: the working tree is around 692 MB and `COPY . .` would ship all of it into the builder on every build.
+
+## The tuning export, and why the engine grew an observer
+
+`SPEC.md` §10 has six open decisions and five say the same sentence: *revisit against real
+ingested text*. `mu` and `D` are "starting guesses", `DefaultWeights` is "a considered first
+guess, not a measurement", `PEREGRINE_TEMPERATURE` may want to be 1.6, `MIN_DISTINCT_AUTHORS`
+"needs a real value". All five are blocked on the same thing: the only instrument that can
+judge output is the golden harness, and it runs against a 150-line synthetic fixture. Finding
+29's rule is that a tuning constant nobody validated against real data is a guess wearing a
+default's clothes.
+
+`internal/tuning` is the wire format and the rotating JSONL writer; `internal/plugins/tuning`
+is the service that fills it in; `-tuning-report` reads an archive back.
+
+**The wire types are deliberate duplicates of the engine's, not embeds.** An archive has to
+stay comparable across versions, so a field disappearing from `markov.Weights` or
+`storage.Status` must be a decision made in `internal/plugins/tuning/map.go` rather than a
+silent change to the shape of files nobody can regenerate. That is what keeps
+`internal/tuning` a stdlib-only leaf, and the cost is one mapping file.
+
+**`markov.Trace` hangs off `Step` and `SeedInput`, never off the `Generator`.** The Generator
+holds the corpus, the dials and the randomness and keeps no per-sentence state, which is what
+makes it safe for every message goroutine to share without a lock; a counter on it would be
+finding 3 rebuilt on purpose. `Step` already owns exactly this kind of state (it counts
+`Jumps`). Every method on `Trace` guards a nil receiver, so tracing off is one branch per step
+and no allocation, and `TestANilTraceChangesNothing` pins that it changes no output.
+
+**The trace records the seed tier by NAME.** `seedTier` is an unexported int whose values
+shift whenever a tier is added or removed, and two have already been deleted as dead (findings
+34 and 37). A per-tier share of real draws is what would have caught either one on the first
+day rather than on a code read months later, and a mislabelled tier would be worse than no
+trace: it would make a dead tier look alive. The comma-ok on `cands.tierOf` is there because
+`seedTier`'s zero value is `tierName`, so a miss would attribute the draw to the one tier whose
+share this repo has already had to fix once.
+
+**`DeadEnds` and `Starved` are split, and that split is most of the point.** A dead end on an
+unseen prefix is a sparse corpus; a starved step is `PEREGRINE_MIN_DISTINCT_AUTHORS` ending
+the sentence. Those need opposite responses and an operator has never been able to tell which
+one they have.
+
+**Silence is recorded, and it is the most valuable thing in the file.** Finding 32 made the
+`too-short` outcome visible to an operator reading logs; this makes it countable. Both
+producers (`chat.stepReply` and `autopost.post`) route every exit through one `record` closure
+so a new path cannot be added that records nothing.
+
+**Refused sends carry no text.** `internal/safety` never writes the offending content
+anywhere, on purpose, and a telemetry file does not get an exception. A `Sample` whose send
+the guard turned down has `Sent=false` and no `Reply`.
+
+**The recorder drops rather than blocking.** It is called from the reply path with a human
+waiting, so `submit` is a non-blocking channel send that increments a counter when full, which
+is `core.Dispatcher`'s contract for the same reason. The drop count rides in the next snapshot
+and the report prints a warning about it, because an archive assembled from a queue that was
+full half the time is a biased sample and nothing else in it would say so.
+
+**Engagement is a second record, and its map is bounded.** The answer to "did that land"
+arrives minutes later, so filling it into the `Sample` would mean rewriting a line in an
+append-only file or holding every sample in memory. The pending map is keyed by message ID,
+which is the leak this repo has shipped twice, and going over `PEREGRINE_TUNING_TRACK_MAX`
+resolves the **oldest** watch early rather than dropping the newest: a dropped observation
+produces no record, an early one produces a record with a short `WindowS` that an analysis can
+see and exclude.
+
+**`IntentsGuildMessageReactions` is requested unconditionally.** It is not privileged, so it
+cannot cause the 4014 close code `WatchReady` diagnoses. Unconditional because an intent is
+negotiated once at identify, so making it conditional would mean turning the export on needed
+a reconnect rather than a restart.
+
+**`health` hands the status to a `Reporter` rather than tuning asking the corpus itself.**
+`Reader.Status` walks every page in several buckets, which is why it lives on a ticker at all
+(finding 11); a second service asking the same question on its own ticker would pay that cost
+twice for one answer.
+
+**The bot never uploads anything.** Files land on a bind mount and the operator pulls them with
+`scp`. `./tuning` needs the same `sudo chgrp 65532` a bind mount always needs here, and fails
+the same quiet way `./backups` does when it is skipped.
+
+**`-tuning-report` comes before `config.Load` in `run`.** It reads JSON lines, opens no corpus,
+takes no flock and needs no token, so an archive can be analyzed on a laptop that has never run
+this bot. It warns when an archive spans two versions or two sets of dials, because an average
+over both describes neither, and it skips an undecodable line rather than failing: the last
+line of a file copied off a running host is routinely half-written.
 
 ## Transcription is a seam with no engine behind it
 

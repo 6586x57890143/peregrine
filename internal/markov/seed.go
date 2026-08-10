@@ -258,6 +258,11 @@ type SeedInput struct {
 	// alias there would buy a guaranteed miss per lookup. This is looked up in the n-gram
 	// index, where whichever spelling people actually type is what got learned.
 	NameTokens []string
+
+	// Trace records which tier won, or is nil. The same pointer the caller puts on the
+	// Step: a seed and the walk that followed it are one sentence and splitting them across
+	// two traces would mean joining them again at analysis time.
+	Trace *Trace
 }
 
 // Seed picks a starting prefix, or returns "" when the corpus offers nothing.
@@ -270,7 +275,7 @@ func (g *Generator) Seed(in SeedInput) string {
 	// gate below, because echoing somebody's own words back is not poisoning.
 	fromPrompt := map[string]struct{}{}
 
-	return g.drawAttestedSeed(g.collectSeedCands(in, fromPrompt), fromPrompt)
+	return g.drawAttestedSeed(g.collectSeedCands(in, fromPrompt), fromPrompt, in.Trace)
 }
 
 // collectSeedCands runs every tier and returns the unnormalized candidates.
@@ -580,9 +585,28 @@ func (g *Generator) drawSeed(cands map[string]float64) string {
 // Checked on the DRAWN candidate rather than filtered up front, deliberately: attestation is a
 // Successors scan, and there can be hundreds of candidates on a busy prompt. A bounded redraw
 // costs a handful of scans on the reply path where filtering would cost one per candidate.
-func (g *Generator) drawAttestedSeed(cands *seedCands, prompt map[string]struct{}) string {
+func (g *Generator) drawAttestedSeed(cands *seedCands, prompt map[string]struct{}, tr *Trace) string {
+	// Recorded here rather than by the caller because this is the only place that knows
+	// both which key won and which tier owns it, and the tier is the interesting half: two
+	// dead tiers have been found by reading constants rather than by a failing test
+	// (findings 34 and 37), and a share of real draws per tier is what would have shown
+	// either one immediately.
+	// The comma-ok is not defensive noise. seedTier's zero value is tierName, so a lookup
+	// that missed would silently attribute the draw to the name tier, which is the one tier
+	// whose share this repository has already had to fix once (finding 36). A miss records
+	// nothing rather than recording a lie.
+	won := func(seed string) string {
+		if seed == "" {
+			return ""
+		}
+		if tier, ok := cands.tierOf[seed]; ok {
+			tr.seed(tier, seed)
+		}
+		return seed
+	}
+
 	if g.params.MinDistinctAuthors <= 0 {
-		return g.drawSeed(cands.weights())
+		return won(g.drawSeed(cands.weights()))
 	}
 
 	// Enough attempts to get past a few unattested candidates, few enough that a corpus
@@ -601,13 +625,13 @@ func (g *Generator) drawAttestedSeed(cands *seedCands, prompt map[string]struct{
 			return ""
 		}
 		if _, fromPrompt := prompt[seed]; fromPrompt {
-			return seed
+			return won(seed)
 		}
 		// A multi-word seed is a stored prefix, and its own continuations are what the
 		// sampler will gate at the first step, so attestation of the whole phrase is what
 		// matters rather than of one token in it.
 		if g.attested(seed) {
-			return seed
+			return won(seed)
 		}
 		cands.drop(seed)
 		if len(cands.tierOf) == 0 {

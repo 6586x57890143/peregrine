@@ -13,6 +13,7 @@ import (
 	"github.com/6586x57890143/peregrine/internal/discordguard"
 	"github.com/6586x57890143/peregrine/internal/generate"
 	"github.com/6586x57890143/peregrine/internal/learn"
+	"github.com/6586x57890143/peregrine/internal/names"
 	"github.com/6586x57890143/peregrine/internal/plugins/aggro"
 	"github.com/6586x57890143/peregrine/internal/plugins/autopost"
 	"github.com/6586x57890143/peregrine/internal/plugins/backup"
@@ -22,6 +23,7 @@ import (
 	"github.com/6586x57890143/peregrine/internal/plugins/images"
 	"github.com/6586x57890143/peregrine/internal/plugins/ingest"
 	"github.com/6586x57890143/peregrine/internal/plugins/repair"
+	"github.com/6586x57890143/peregrine/internal/plugins/tuning"
 	"github.com/6586x57890143/peregrine/internal/plugins/voicenote"
 	"github.com/6586x57890143/peregrine/internal/safety"
 	"github.com/6586x57890143/peregrine/internal/storage"
@@ -72,7 +74,7 @@ func registerServices(
 	// between the reply path and the autonomous poster, which is why it is built here rather
 	// than owned by either.
 	memories := generate.NewMemories(0)
-	speaker := generate.New(store, generate.Options{
+	dials := generate.Options{
 		MaxNGram:           cfg.MaxNGram,
 		MinWords:           cfg.MinWords,
 		MaxWords:           cfg.MaxWords,
@@ -84,8 +86,33 @@ func registerServices(
 		MinDistinctAuthors: cfg.MinDistinctAuthors,
 		PromptRelevance:    cfg.PromptRelevanceBoost,
 		RoastChance:        cfg.RoastChance,
-	})
+	}
+	speaker := generate.New(store, dials)
 	emoji := core.SessionEmoji(session)
+
+	// One member cache for every path that resolves a nickname. Bounded and TTL'd, because a
+	// permanent one makes the bot use a stale name forever and the map is keyed by person,
+	// which is a leak this repository has shipped twice (M18).
+	members := names.NewCachedSession(session, memberCacheTTL, memberCacheMax)
+
+	// The tuning export. Named as a variable before the features that record into it,
+	// because three of them take it: the reactor, the autonomous poster and the health
+	// report. It is a real service with a nil-safe off state rather than a nil interface, so
+	// nothing downstream has to know whether PEREGRINE_TUNING_DIR was set.
+	//
+	// The SAME dials the generator was built with go into it, deliberately: an archive that
+	// recorded output without recording the numbers that produced it cannot be compared to
+	// the next one, which is the entire point of exporting anything.
+	tuningSvc := tuning.New(session, tuning.Options{
+		Dir:              cfg.TuningDir,
+		Rotate:           cfg.TuningRotate,
+		Keep:             cfg.TuningKeep,
+		Sample:           cfg.TuningSample,
+		EngagementWindow: cfg.TuningEngagementWindow,
+		TrackMax:         cfg.TuningTrackMax,
+		Version:          cfg.Version,
+		Dials:            dials,
+	})
 
 	// The word-game dictionary. Deliberately not fatal: word games are one optional feature,
 	// and taking the whole bot down because a 64 KB word list would not load meant an
@@ -106,6 +133,7 @@ func registerServices(
 		ActivityWindow:    cfg.WordGameActivityWindow,
 		ActivityThreshold: cfg.WordGameActivityThreshold,
 		TriggerChance:     cfg.WordGameTriggerChance,
+		HintAfter:         cfg.WordGameHintAfter,
 	})
 
 	// The reactor is built before the features it calls, because it hands them nothing: they
@@ -134,7 +162,7 @@ func registerServices(
 		AllowChannels:       cfg.AutonomousPostChannels,
 		AdminUserID:         cfg.AdminUserID,
 	})
-	autopostSvc := autopost.New(guard, speaker, memories, tracker, resolver, emoji, autopost.Options{
+	autopostSvc := autopost.New(guard, speaker, memories, tracker, resolver, emoji, tuningSvc, autopost.Options{
 		Enabled:             cfg.EnableAutonomousPost,
 		Tick:                cfg.AutonomousPostTick,
 		SkipChance:          cfg.AutonomousSkipChance,
@@ -164,6 +192,11 @@ func registerServices(
 		Images:   imagesSvc,
 		Games:    gamesSvc,
 		Voice:    voiceSvc,
+		Recorder: tuningSvc,
+		// The member cache, shared with the ingest and mention paths. discordgo's GuildMember
+		// is an unconditional REST GET, and the leaderboard's name lookups were the last call
+		// site in the module that did not go through this.
+		Members: members,
 		Options: chat.Options{
 			SelfMention:  cfg.SelfMention,
 			RoastChance:  cfg.RoastChance,
@@ -204,15 +237,34 @@ func registerServices(
 		Every: cfg.BackupTick,
 		Keep:  cfg.BackupKeep,
 	})
-	healthSvc := health.New(store, dispatcher, gate, health.SessionLatency(session), health.Options{
+	healthSvc := health.New(health.Deps{
+		Store:    store,
+		Queue:    dispatcher,
+		Gate:     gate,
+		Latency:  health.SessionLatency(session),
+		Reporter: tuningSvc,
+		Presence: guard,
+		// The corpus word source, wired only when the operator wants that variant. Passing it
+		// unconditionally would be harmless and would also mean the chance dial had two ways
+		// to be off, which is one more than a knob should have.
+		Topics: health.CorpusTopics(store),
+	}, health.Options{
 		StatusTick:  cfg.StatusTick,
 		LatencyTick: latencyTick,
 		Threshold:   latencyThreshold,
+	}, health.PresenceOptions{
+		Enabled:          cfg.EnablePresence,
+		CorpusWordChance: cfg.PresenceCorpusWordChance,
 	})
 
 	// Registration order, and it is behaviour rather than taste. See the note above this
 	// function: chat goes last among the message-handling features because its Init arms the
 	// gateway handler, and health goes last overall so its Shutdown report is the final word.
+	// FIRST, so it shuts down LAST. Shutdown runs in reverse registration order, and the
+	// export has to outlive everything that records into it: a flush that happened before
+	// the reactor stopped would lose the last replies, which are the ones an operator
+	// investigating a shutdown most wants.
+	registry.Register(tuningSvc)
 	registry.Register(aggroSvc)
 	registry.Register(imagesSvc)
 	registry.Register(gamesSvc)
@@ -239,6 +291,21 @@ func registerServices(
 const (
 	latencyTick      = 2 * time.Minute
 	latencyThreshold = 500 * time.Millisecond
+)
+
+// The member cache's bounds, and neither is caution.
+//
+// A permanent cache would make the bot address somebody by a nickname they changed weeks ago,
+// which is the opposite of what the name path is for. And the map is keyed by person, so
+// without a size bound it grows with everyone the bot ever meets: this repository has shipped
+// that exact leak twice, in the conversation memory before M7b and in the word-game activity
+// map in M11a.
+//
+// Not configurable for the same reason the two health dials above are not: an operator has no
+// incident in which they would change either number.
+const (
+	memberCacheTTL = 15 * time.Minute
+	memberCacheMax = 2000
 )
 
 // emitGate adapts the safety gate to the guard's narrower interface.
