@@ -124,9 +124,32 @@ func line(r wordgame.Row) string {
 }
 
 // leaderboardFooter is the one-line summary under both boards.
-func leaderboardFooter(wins, chat wordgame.Board) string {
-	return fmt.Sprintf("%s playing, %s talking this week",
-		plural(wins.Players, "player"), plural(chat.Players, "person", "people"))
+//
+// The records go here rather than in a field of their own, because they are about the week
+// rather than about a player and a third column would push the two boards into stacking on a
+// desktop. Each part is omitted when it has nothing to say: an empty week says the counts and
+// stops, rather than printing "fastest: nobody".
+func leaderboardFooter(b *wordgame.Leaderboard, wins, chat wordgame.Board, names func(string) string) string {
+	parts := []string{fmt.Sprintf("%s playing, %s talking this week",
+		plural(wins.Players, "player"), plural(chat.Players, "person", "people"))}
+
+	if e, ok := b.Fastest(); ok {
+		parts = append(parts, fmt.Sprintf("fastest solve %s by %s",
+			seconds(e.FastestMS), wordgame.TruncateRunes(names(e.UserID), 16)))
+	}
+	// Only the current winner can be on a streak, and only from two wins up. A line that
+	// appeared after every single game would be noise rather than news.
+	if e, ok := b.Streak(); ok {
+		parts = append(parts, fmt.Sprintf("%s is on %d in a row",
+			wordgame.TruncateRunes(names(e.UserID), 16), e.Streak))
+	}
+	return strings.Join(parts, " | ")
+}
+
+// seconds renders a solve time. Two decimals, because a scramble is usually solved in single
+// digits of seconds and whole seconds would make most records look identical.
+func seconds(ms int64) string {
+	return fmt.Sprintf("%.2fs", float64(ms)/1000)
 }
 
 func plural(n int, singular string, plural ...string) string {

@@ -25,13 +25,35 @@ type Leaderboard struct {
 	mu        sync.Mutex
 	weekStart time.Time
 	scores    map[string]Entry
+
+	// lastWinner is who solved the most recent puzzle, which is all a streak needs: a streak
+	// is consecutive wins, so it grows when the same person wins again and resets to one
+	// when somebody else does. Storing it beats storing a per-player "was the last winner"
+	// flag that N-1 players have to be told to clear.
+	lastWinner string
 }
 
 // Entry is one player's tally.
+//
+// The three fields after Wins are new in M21b and every one carries omitempty, which is the
+// rule this type already runs on: a leaderboard persisted by an older build still loads and
+// simply reports zeros, because a week of wins is not re-derivable from anything. That is the
+// same asymmetry storage.Open makes when it refuses an old corpus outright.
 type Entry struct {
 	UserID   string `json:"user_id"`
 	Username string `json:"username"`
 	Wins     int    `json:"wins"`
+
+	// Streak is consecutive wins right now, and Best is the longest this week.
+	Streak int `json:"streak,omitempty"`
+	Best   int `json:"best_streak,omitempty"`
+
+	// FastestMS is this player's quickest solve this week, in milliseconds.
+	//
+	// Milliseconds rather than a time.Duration, because a Duration marshals as a bare
+	// nanosecond integer that nobody reading the persisted file can interpret, and this file
+	// is read by hand when a week of wins goes wrong.
+	FastestMS int64 `json:"fastest_ms,omitempty"`
 }
 
 // wireLeaderboard is the persisted shape.
@@ -51,6 +73,11 @@ type wireLeaderboard struct {
 
 	// WeekStartDate is the old field name for WeekStart, read for the same reason.
 	WeekStartDate time.Time `json:"week_start_date,omitempty"`
+
+	// LastWinner carries the streak across a restart. Absent in an older file, which starts
+	// everybody's next win as a fresh streak: the wrong answer for one game, and cheaper
+	// than a migration for a value that resets weekly anyway.
+	LastWinner string `json:"last_winner,omitempty"`
 }
 
 // NewLeaderboard returns an empty leaderboard for the week containing now.
@@ -83,8 +110,11 @@ func NewLeaderboard(now time.Time) *Leaderboard {
 // corpus to ask a question this package answers.
 func StartOfWeekUTC(t time.Time) time.Time { return corpus.StartOfWeekUTC(t) }
 
-// AddWin records a win.
-func (l *Leaderboard) AddWin(userID, username string) {
+// AddWin records a win and the time it took.
+//
+// solveTime may be zero, which records no personal best: a caller that does not know how long
+// the puzzle took should not claim it was instant.
+func (l *Leaderboard) AddWin(userID, username string, solveTime time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -92,7 +122,64 @@ func (l *Leaderboard) AddWin(userID, username string) {
 	e.UserID = userID
 	e.Username = username // refreshed, because people rename themselves
 	e.Wins++
+
+	// A streak is consecutive wins, so winning again extends it and anybody else winning
+	// starts it over at one. The previous holder's Streak is deliberately NOT cleared here:
+	// it is stale the moment lastWinner changes, and clearing it would mean touching an
+	// entry this win has nothing to do with. Streak is only ever read for the current winner.
+	if l.lastWinner == userID {
+		e.Streak++
+	} else {
+		e.Streak = 1
+	}
+	if e.Streak > e.Best {
+		e.Best = e.Streak
+	}
+
+	if ms := solveTime.Milliseconds(); ms > 0 && (e.FastestMS == 0 || ms < e.FastestMS) {
+		e.FastestMS = ms
+	}
+
 	l.scores[userID] = e
+	l.lastWinner = userID
+}
+
+// Fastest returns the quickest solve this week, and whether there was one.
+func (l *Leaderboard) Fastest() (Entry, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	var best Entry
+	for _, e := range l.scores {
+		if e.FastestMS == 0 {
+			continue
+		}
+		// Ties break on user ID so the answer does not shuffle between two identical calls,
+		// which is the same requirement Rank has and for the same reason.
+		if best.FastestMS == 0 || e.FastestMS < best.FastestMS ||
+			(e.FastestMS == best.FastestMS && e.UserID < best.UserID) {
+			best = e
+		}
+	}
+	return best, best.FastestMS > 0
+}
+
+// Streak returns who is on a run right now and how long it is.
+//
+// Only the CURRENT winner can be on a streak, which is why this reads lastWinner rather than
+// scanning for the largest Streak: every other entry's Streak is a stale number from whenever
+// that player last had one.
+func (l *Leaderboard) Streak() (Entry, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	e, ok := l.scores[l.lastWinner]
+	if !ok || e.Streak < 2 {
+		// One win is not a streak. Reporting it as one would put a line under the board after
+		// every single game, which is noise rather than news.
+		return Entry{}, false
+	}
+	return e, true
 }
 
 // MaybeReset clears the board if now falls in a later week than the one it holds, and
@@ -124,6 +211,9 @@ func (l *Leaderboard) MaybeReset(now time.Time) bool {
 	}
 	l.weekStart = current
 	l.scores = map[string]Entry{}
+	// The streak goes with the week. A run that survived a reset would be measured against a
+	// board that no longer contains the wins it counts.
+	l.lastWinner = ""
 	return true
 }
 
@@ -324,7 +414,11 @@ func (l *Leaderboard) MarshalJSON() ([]byte, error) {
 	for k, v := range l.scores {
 		scores[k] = v
 	}
-	return json.Marshal(wireLeaderboard{WeekStart: l.weekStart, Scores: scores})
+	return json.Marshal(wireLeaderboard{
+		WeekStart:  l.weekStart,
+		Scores:     scores,
+		LastWinner: l.lastWinner,
+	})
 }
 
 // UnmarshalJSON restores a persisted leaderboard, accepting the pre-M11 field names.
@@ -346,6 +440,7 @@ func (l *Leaderboard) UnmarshalJSON(b []byte) error {
 	if l.scores == nil {
 		l.scores = map[string]Entry{}
 	}
+	l.lastWinner = w.LastWinner
 
 	switch {
 	case !w.WeekStart.IsZero():

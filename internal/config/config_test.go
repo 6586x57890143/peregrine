@@ -33,6 +33,7 @@ func clearEnv(t *testing.T) {
 		"PEREGRINE_AUTONOMOUS_POST_TICK", "PEREGRINE_AUTONOMOUS_SKIP_CHANCE",
 		"PEREGRINE_ENABLE_WORD_GAMES", "PEREGRINE_WORDGAME_FREQUENCY_MODE",
 		"PEREGRINE_WORDGAME_INTERVAL", "PEREGRINE_WORDGAME_DICTIONARY",
+		"PEREGRINE_WORDGAME_TIMEOUT", "PEREGRINE_WORDGAME_HINT_AFTER",
 		"PEREGRINE_ENABLE_TRANSCRIPTION", "PEREGRINE_TRANSCRIPTION_QUEUE",
 		"PEREGRINE_BACKUP_DIR", "PEREGRINE_BACKUP_TICK", "PEREGRINE_BACKUP_KEEP",
 		"PEREGRINE_ASSOC_BACKFILL", "PEREGRINE_ASSOC_BACKFILL_BEFORE",
@@ -381,6 +382,45 @@ func TestThePerAuthorCapIsNotCheckedWhenRepostingIsOff(t *testing.T) {
 
 	if _, err := Load(); err != nil {
 		t.Errorf("unexpected error with image reposting off: %v", err)
+	}
+}
+
+// TestAHintDueAfterTheDeadlineIsRefused. A hint at or past the timeout never fires, so the
+// operator sets it, nothing happens, and the feature gets blamed for ignoring configuration.
+// Same relationship mistake as the image cap above, and both variables are named for the same
+// reason: neither value is wrong on its own.
+func TestAHintDueAfterTheDeadlineIsRefused(t *testing.T) {
+	for _, tc := range []struct{ name, timeout, hint string }{
+		{"equal", "60s", "60s"},
+		{"after", "60s", "90s"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("PEREGRINE_WORDGAME_TIMEOUT", tc.timeout)
+			t.Setenv("PEREGRINE_WORDGAME_HINT_AFTER", tc.hint)
+
+			_, err := Load()
+			if err == nil {
+				t.Fatal("a hint due at or after the timeout must be a startup error")
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "PEREGRINE_WORDGAME_HINT_AFTER") ||
+				!strings.Contains(msg, "PEREGRINE_WORDGAME_TIMEOUT") {
+				t.Errorf("error must name both variables; got:\n%s", msg)
+			}
+		})
+	}
+
+	// Zero is a real choice rather than an out-of-range value: it means no hints.
+	clearEnv(t)
+	t.Setenv("PEREGRINE_WORDGAME_TIMEOUT", "60s")
+	t.Setenv("PEREGRINE_WORDGAME_HINT_AFTER", "0s")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("turning hints off was refused: %v", err)
+	}
+	if cfg.WordGameHintAfter != 0 {
+		t.Errorf("WordGameHintAfter = %v, want 0", cfg.WordGameHintAfter)
 	}
 }
 

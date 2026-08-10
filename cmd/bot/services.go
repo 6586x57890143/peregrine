@@ -133,6 +133,7 @@ func registerServices(
 		ActivityWindow:    cfg.WordGameActivityWindow,
 		ActivityThreshold: cfg.WordGameActivityThreshold,
 		TriggerChance:     cfg.WordGameTriggerChance,
+		HintAfter:         cfg.WordGameHintAfter,
 	})
 
 	// The reactor is built before the features it calls, because it hands them nothing: they

@@ -206,6 +206,7 @@ type Config struct {
 	WordGameMinLength         int           // PEREGRINE_WORDGAME_MIN_LENGTH
 	WordGameMaxLength         int           // PEREGRINE_WORDGAME_MAX_LENGTH
 	WordGameSweepTick         time.Duration // PEREGRINE_WORDGAME_SWEEP_TICK
+	WordGameHintAfter         time.Duration // PEREGRINE_WORDGAME_HINT_AFTER
 
 	// Corpus snapshots. Off by default, because there is no safe guess for a path and
 	// writing megabytes somewhere the operator did not choose is worse than not backing up.
@@ -482,6 +483,11 @@ func Load() (*Config, error) {
 		// goroutine per game this replaces outlived shutdown.
 		WordGameSweepTick: l.dur("PEREGRINE_WORDGAME_SWEEP_TICK", 5*time.Second, time.Second, time.Minute),
 
+		// How far into a puzzle the first letter is revealed. 0 turns hints off, which is why
+		// the range starts there rather than at the sweep tick: "no hints" is a real choice and
+		// has to be expressible.
+		WordGameHintAfter: l.dur("PEREGRINE_WORDGAME_HINT_AFTER", 30*time.Second, 0, time.Hour),
+
 		BackupDir:  l.str("PEREGRINE_BACKUP_DIR", ""),
 		BackupTick: l.dur("PEREGRINE_BACKUP_TICK", 24*time.Hour, time.Minute, 30*24*time.Hour),
 		BackupKeep: l.intVal("PEREGRINE_BACKUP_KEEP", 7, 1, 1000),
@@ -544,6 +550,17 @@ func Load() (*Config, error) {
 			"PEREGRINE_IMAGE_MAX_PER_AUTHOR=%d is not below PEREGRINE_IMAGE_CACHE_SIZE=%d, "+
 				"so one author can still fill the repost cache and the per-author cap protects nothing",
 			cfg.ImageMaxPerAuthor, cfg.ImageCacheSize))
+	}
+
+	// A hint due at or after the deadline never fires, so the knob would be wired to nothing:
+	// the operator sets it, no hint ever appears, and the feature gets blamed for ignoring
+	// configuration. Same relationship mistake as the image cap above, and named the same way.
+	if cfg.WordGameHintAfter > 0 && cfg.WordGameHintAfter >= cfg.WordGameTimeout {
+		l.errs = append(l.errs, fmt.Errorf(
+			"PEREGRINE_WORDGAME_HINT_AFTER=%v is not below PEREGRINE_WORDGAME_TIMEOUT=%v, so the "+
+				"hint would be due after the puzzle has already ended and would never appear. "+
+				"Set it lower, or to 0 to turn hints off",
+			cfg.WordGameHintAfter, cfg.WordGameTimeout))
 	}
 
 	if len(l.errs) > 0 {

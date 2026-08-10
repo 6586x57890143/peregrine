@@ -39,6 +39,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/bwmarrin/discordgo"
 
@@ -82,7 +83,7 @@ type Images interface {
 // Games handles guesses and the bang commands.
 type Games interface {
 	Guess(channelID, messageID, content, authorID, displayName string) bool
-	Command(cmd, channelID, authorID string, names func(userID string) string) bool
+	Command(cmd, arg, channelID, authorID string, names func(userID string) string) bool
 }
 
 // Voice queues a voice attachment for transcription and reports whether it took it.
@@ -477,29 +478,63 @@ func (s *Service) stepWordGame(r *reaction) bool {
 // A command is consumed even when it fails or is refused. An unauthorized !wordgame is still
 // a command rather than something to reply to.
 func (s *Service) stepCommands(r *reaction) bool {
-	cmd := commandFor(r.m.Content)
+	cmd, arg := commandFor(r.m.Content)
 	if cmd == "" {
 		return false
 	}
+	// Counted by command, never by argument. A planted word is user text, and a usage tally
+	// carrying it would put arbitrary content into the tuning archive by a side door.
 	s.recorder.Count("command:" + cmd)
-	return s.games.Command(cmd, r.m.ChannelID, r.m.Author.ID, func(userID string) string {
+	return s.games.Command(cmd, arg, r.m.ChannelID, r.m.Author.ID, func(userID string) string {
 		return s.displayName(r.m.GuildID, userID)
 	})
 }
 
-// commandFor recognizes a command, or returns "".
+// commandFor recognizes a command and its one optional argument, or returns "".
 //
-// It matches the WHOLE trimmed message, not a prefix. That is deliberate: a prefix match
-// would make it impossible to talk ABOUT a command, so "you should try !leaderboard
+// # It still matches the whole message, and that is what makes the argument safe
+//
+// A bare command matches the WHOLE trimmed message, not a prefix. That is deliberate: a prefix
+// match would make it impossible to talk ABOUT a command, so "you should try !leaderboard
 // sometime" would be swallowed and answered instead of being ordinary chat.
-func commandFor(content string) string {
-	switch strings.ToLower(strings.TrimSpace(content)) {
-	case "!leaderboard":
-		return "!leaderboard"
-	case "!wordgame":
-		return "!wordgame"
+//
+// The argument form preserves exactly that property by accepting only TWO tokens whose FIRST is
+// the command. "you should try !wordgame sometime" is four tokens and does not match; "!wordgame
+// banana pancakes" is three and does not either. The alternative, taking everything after the
+// command, would have made a sentence containing "!wordgame" into an invocation with the rest of
+// the sentence as its word.
+//
+// Only !wordgame takes one. !leaderboard renders the invoker's own rank and has nothing to name.
+func commandFor(content string) (cmd, arg string) {
+	fields := strings.Fields(strings.ToLower(strings.TrimSpace(content)))
+	switch len(fields) {
+	case 1:
+		switch fields[0] {
+		case "!leaderboard", "!wordgame":
+			return fields[0], ""
+		}
+	case 2:
+		// Letters only, checked HERE as well as in the Manager. This one is about what counts
+		// as an invocation: "!wordgame :)" should stay chat rather than becoming a command that
+		// answers with a refusal, and the Manager's check is about what can be a puzzle.
+		if fields[0] == "!wordgame" && isWord(fields[1]) {
+			return fields[0], fields[1]
+		}
 	}
-	return ""
+	return "", ""
+}
+
+// isWord reports whether a token is letters and nothing else.
+func isWord(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if !unicode.IsLetter(r) {
+			return false
+		}
+	}
+	return true
 }
 
 // displayName resolves a user ID to the best available name: guild nickname, then username,

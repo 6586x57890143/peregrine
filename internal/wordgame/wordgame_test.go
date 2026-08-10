@@ -16,7 +16,13 @@ func seeded(a, b uint64) Source { return rand.New(rand.NewPCG(a, b)) }
 
 // dictOf builds a Dictionary from literal words, bypassing the file load, so a test can
 // use a word the real list would never contain.
-func dictOf(words ...string) *Dictionary { return &Dictionary{words: words} }
+//
+// It carries the DEFAULT options rather than a zero value, because those are what a planted
+// word is held to: a zero MaxLength would refuse every word, so Usable would look correct for
+// the wrong reason.
+func dictOf(words ...string) *Dictionary {
+	return &Dictionary{words: words, opts: DictionaryOptions{}.withDefaults()}
+}
 
 func testOpts() Options {
 	return Options{
@@ -335,6 +341,179 @@ func TestExpiredSweepsInsteadOfSpawningTimers(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------- hints, M21b
+
+// TestAHintIsSweptOnceAndOnlyWhenItIsDue.
+//
+// A hint is not a fourth timer. It is another thing the sweep already running notices, which is
+// what keeps "one sweep, not a goroutine per game" true as this feature grows: the alternative
+// is a goroutine per puzzle again, and that is the bug the sweep exists to have removed.
+func TestAHintIsSweptOnceAndOnlyWhenItIsDue(t *testing.T) {
+	o := testOpts()
+	o.HintAfter = 20 * time.Second
+	m := NewManager(dictOf("peregrine"), seeded(1, 2), counting(0), o)
+
+	now := time.Now()
+	m.now = func() time.Time { return now }
+
+	if _, err := m.Start("chan"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	m.Announced("chan", "msg1")
+
+	if got := m.DueHints(); len(got) != 0 {
+		t.Fatalf("a hint was due immediately: %d", len(got))
+	}
+
+	now = now.Add(30 * time.Second)
+	due := m.DueHints()
+	if len(due) != 1 || due[0].ChannelID != "chan" {
+		t.Fatalf("due hints = %v, want one for chan", due)
+	}
+	first, letters := due[0].Hint()
+	if first != "p" || letters != len("peregrine") {
+		t.Errorf("Hint() = %q, %d, want \"p\", %d", first, letters, len("peregrine"))
+	}
+
+	// Twice would edit the announcement again with the same text, for nothing.
+	if got := m.DueHints(); len(got) != 0 {
+		t.Error("the same hint came due twice")
+	}
+}
+
+// TestAHintIsNotDueForAGameThatWasSolved. Solving removes the game, so there is nothing left to
+// hint at, and a hint arriving after the answer has been announced is the one visible way this
+// could be wrong.
+func TestAHintIsNotDueForAGameThatWasSolved(t *testing.T) {
+	o := testOpts()
+	o.HintAfter = 20 * time.Second
+	m := NewManager(dictOf("peregrine"), seeded(1, 2), counting(0), o)
+
+	now := time.Now()
+	m.now = func() time.Time { return now }
+
+	if _, err := m.Start("chan"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	m.Announced("chan", "msg1")
+	if _, ok := m.Guess("chan", "peregrine"); !ok {
+		t.Fatal("the game was not solved")
+	}
+
+	now = now.Add(30 * time.Second)
+	if got := m.DueHints(); len(got) != 0 {
+		t.Errorf("a solved game produced a hint: %v", got)
+	}
+}
+
+// TestAGameWithNoAnnouncementIsNotHinted. The caller EDITS the announcement to add the hint, and
+// there is nothing to edit when the guard refused the original send: a paused bot or an ignored
+// channel. Returning it anyway would produce an edit against an empty message ID every tick.
+func TestAGameWithNoAnnouncementIsNotHinted(t *testing.T) {
+	o := testOpts()
+	o.HintAfter = 20 * time.Second
+	m := NewManager(dictOf("peregrine"), seeded(1, 2), counting(0), o)
+
+	now := time.Now()
+	m.now = func() time.Time { return now }
+
+	if _, err := m.Start("chan"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// No Announced call: the send was refused.
+
+	now = now.Add(30 * time.Second)
+	if got := m.DueHints(); len(got) != 0 {
+		t.Errorf("an unannounced game produced a hint to edit into nothing: %v", got)
+	}
+}
+
+// TestHintsOffProducesNoHints, which is what HintAfter zero has to mean.
+func TestHintsOffProducesNoHints(t *testing.T) {
+	m := NewManager(dictOf("peregrine"), seeded(1, 2), counting(0), testOpts()) // HintAfter unset
+	now := time.Now()
+	m.now = func() time.Time { return now }
+
+	if _, err := m.Start("chan"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	m.Announced("chan", "msg1")
+
+	now = now.Add(time.Hour)
+	if got := m.DueHints(); len(got) != 0 {
+		t.Errorf("hints are off and one fired anyway: %v", got)
+	}
+}
+
+// TestAHintDueAtOrPastTheDeadlineIsTurnedOff rather than clamped.
+//
+// A hint that lands after the puzzle has ended is a knob wired to nothing, which is worse than
+// no knob: the operator tunes it, nothing happens, and the feature gets blamed for ignoring
+// configuration. Config refuses this outright; withDefaults is the second line, for a caller
+// that builds Options directly.
+func TestAHintDueAtOrPastTheDeadlineIsTurnedOff(t *testing.T) {
+	for _, after := range []time.Duration{-time.Second, time.Minute, 2 * time.Minute} {
+		o := testOpts() // Timeout is a minute
+		o.HintAfter = after
+		if got := o.withDefaults().HintAfter; got != 0 {
+			t.Errorf("HintAfter %v against a one-minute timeout became %v, want 0", after, got)
+		}
+	}
+}
+
+// ---------------------------------------------------------------- planted words, M21b
+
+// TestAPlantedWordIsHeldToTheDictionarysOwnRules.
+//
+// LoadDictionary excludes words with fewer than two distinct letters SPECIFICALLY because
+// scramble used to recurse forever on them, and scramble's own bound is documented as a belt to
+// those braces. A word arriving by a route that skipped the loader would leave the belt doing
+// that work alone, which is exactly the arrangement that produced the original stack overflow.
+func TestAPlantedWordIsHeldToTheDictionarysOwnRules(t *testing.T) {
+	m := NewManager(dictOf("peregrine"), seeded(1, 2), counting(0), testOpts())
+
+	for _, word := range []string{
+		"aaaaa",                        // one distinct letter: what made scramble recurse
+		"hi",                           // below the minimum length
+		"antidisestablishmentarianism", // above the maximum
+		"two words",                    // not letters
+		"b4nana",                       // not letters
+	} {
+		if _, err := m.StartWord("chan", word); !errors.Is(err, ErrUnusableWord) {
+			t.Errorf("StartWord(%q) error = %v, want ErrUnusableWord", word, err)
+		}
+		if m.Active() != 0 {
+			t.Fatalf("a refused word %q started a game anyway", word)
+		}
+	}
+
+	g, err := m.StartWord("chan", "banana")
+	if err != nil {
+		t.Fatalf("StartWord on a usable word: %v", err)
+	}
+	if g.Word != "banana" {
+		t.Errorf("word = %q, want the planted one", g.Word)
+	}
+	if !g.Planted {
+		t.Error("a chosen word was not marked as planted, so the log cannot tell the two apart")
+	}
+	if g.Scrambled == g.Word {
+		t.Error("the puzzle prints its own answer")
+	}
+}
+
+// TestADrawnWordIsNotMarkedPlanted, which is the other half of the same flag.
+func TestADrawnWordIsNotMarkedPlanted(t *testing.T) {
+	m := NewManager(dictOf("peregrine"), seeded(1, 2), counting(0), testOpts())
+	g, err := m.Start("chan")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if g.Planted {
+		t.Error("a word drawn from the dictionary was marked as planted")
+	}
+}
+
 func TestDueDeletionsAreSweptOnce(t *testing.T) {
 	m := NewManager(dictOf("peregrine"), seeded(1, 2), counting(0), testOpts())
 	now := time.Now()
@@ -508,7 +687,7 @@ func TestLeaderboardResetsOnANewWeekAndCatchesUp(t *testing.T) {
 	// A Wednesday.
 	start := time.Date(2024, 6, 5, 12, 0, 0, 0, time.UTC)
 	l := NewLeaderboard(start)
-	l.AddWin("u1", "alice")
+	l.AddWin("u1", "alice", time.Second)
 
 	if l.MaybeReset(start.Add(time.Hour)) {
 		t.Error("reset within the same week")
@@ -533,7 +712,7 @@ func TestLeaderboardResetsOnANewWeekAndCatchesUp(t *testing.T) {
 
 	// Idempotent: a second tick in the same week must not reset again, or a win recorded
 	// between ticks would vanish.
-	l.AddWin("u2", "bob")
+	l.AddWin("u2", "bob", time.Second)
 	if l.MaybeReset(next.Add(time.Hour)) {
 		t.Error("reset twice in one week, discarding a win")
 	}
@@ -577,7 +756,7 @@ func TestLeaderboardMarshalsUnderTheLock(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			l.AddWin("u"+string(rune('a'+i%26)), "player")
+			l.AddWin("u"+string(rune('a'+i%26)), "player", time.Second)
 		}(i)
 	}
 	for range 50 {
@@ -606,9 +785,9 @@ func TestLeaderboardRoundTripsAndReadsTheOldFormat(t *testing.T) {
 	now := time.Date(2024, 6, 5, 12, 0, 0, 0, time.UTC)
 
 	original := NewLeaderboard(now)
-	original.AddWin("u1", "alice")
-	original.AddWin("u1", "alice")
-	original.AddWin("u2", "bob")
+	original.AddWin("u1", "alice", time.Second)
+	original.AddWin("u1", "alice", time.Second)
+	original.AddWin("u2", "bob", time.Second)
 
 	encoded, err := json.Marshal(original)
 	if err != nil {
@@ -644,14 +823,111 @@ func TestLeaderboardRoundTripsAndReadsTheOldFormat(t *testing.T) {
 	if legacyBoard.WeekStart() != time.Date(2024, 6, 3, 0, 0, 0, 0, time.UTC) {
 		t.Errorf("the old week start was not carried over: %v", legacyBoard.WeekStart())
 	}
+
+	// M21b's fields default to zero rather than failing the load, which is what omitempty buys.
+	// A board persisted before this milestone has no streaks and no records, and saying so is
+	// correct; refusing to load it would throw away a week nothing else can rebuild.
+	if e := got[0]; e.Streak != 0 || e.Best != 0 || e.FastestMS != 0 {
+		t.Errorf("an M11-era entry arrived with invented records: %+v", e)
+	}
+	if _, ok := legacyBoard.Fastest(); ok {
+		t.Error("a board with no recorded solve times claimed a fastest solve")
+	}
+	if _, ok := legacyBoard.Streak(); ok {
+		t.Error("a board with no last winner claimed a streak")
+	}
+}
+
+// ---------------------------------------------------------------- streaks and records, M21b
+
+// TestAStreakBelongsToTheCurrentWinnerOnly.
+//
+// Streak is only ever read for whoever won last, which is why AddWin does not clear the previous
+// holder's number: it is stale the moment lastWinner changes, and clearing it would mean
+// touching an entry this win has nothing to do with.
+func TestAStreakBelongsToTheCurrentWinnerOnly(t *testing.T) {
+	l := NewLeaderboard(time.Now())
+
+	l.AddWin("u1", "alice", 2*time.Second)
+	if _, ok := l.Streak(); ok {
+		t.Error("one win was reported as a streak. That line would appear after every game")
+	}
+
+	l.AddWin("u1", "alice", 3*time.Second)
+	e, ok := l.Streak()
+	if !ok || e.UserID != "u1" || e.Streak != 2 {
+		t.Errorf("streak = %+v, %v, want alice on 2", e, ok)
+	}
+
+	// Somebody else winning ends it rather than shortening it.
+	l.AddWin("u2", "bob", 4*time.Second)
+	if _, ok := l.Streak(); ok {
+		t.Error("alice's streak survived bob winning")
+	}
+
+	// And the best is kept even though the current run is over.
+	for _, entry := range l.Entries() {
+		if entry.UserID == "u1" && entry.Best != 2 {
+			t.Errorf("alice's best streak = %d, want 2", entry.Best)
+		}
+	}
+}
+
+// TestFastestKeepsThePersonalBestAndTheWeeklyRecord.
+func TestFastestKeepsThePersonalBestAndTheWeeklyRecord(t *testing.T) {
+	l := NewLeaderboard(time.Now())
+
+	l.AddWin("u1", "alice", 5*time.Second)
+	l.AddWin("u2", "bob", 2*time.Second)
+	l.AddWin("u1", "alice", 3*time.Second) // alice improves, but not past bob
+
+	e, ok := l.Fastest()
+	if !ok || e.UserID != "u2" || e.FastestMS != 2000 {
+		t.Errorf("fastest = %+v, %v, want bob at 2000ms", e, ok)
+	}
+	for _, entry := range l.Entries() {
+		if entry.UserID == "u1" && entry.FastestMS != 3000 {
+			t.Errorf("alice's personal best = %dms, want 3000: a slower later solve overwrote it",
+				entry.FastestMS)
+		}
+	}
+
+	// A win with no measured time records no record, rather than claiming an instant solve.
+	l2 := NewLeaderboard(time.Now())
+	l2.AddWin("u1", "alice", 0)
+	if _, ok := l2.Fastest(); ok {
+		t.Error("a win with no solve time was recorded as the fastest of the week")
+	}
+}
+
+// TestTheWeeklyResetClearsTheStreakToo. Everything else goes; a run that survived the reset
+// would let somebody hold a streak against a board that no longer has their wins on it.
+func TestTheWeeklyResetClearsTheStreakToo(t *testing.T) {
+	now := time.Date(2024, 6, 5, 12, 0, 0, 0, time.UTC)
+	l := NewLeaderboard(now)
+	l.AddWin("u1", "alice", time.Second)
+	l.AddWin("u1", "alice", time.Second)
+	if _, ok := l.Streak(); !ok {
+		t.Fatal("no streak to reset")
+	}
+
+	if !l.MaybeReset(now.AddDate(0, 0, 7)) {
+		t.Fatal("the week did not turn over")
+	}
+	if _, ok := l.Streak(); ok {
+		t.Error("a streak survived the weekly reset")
+	}
+	if _, ok := l.Fastest(); ok {
+		t.Error("a record survived the weekly reset")
+	}
 }
 
 func TestLeaderboardEntriesAreStablyOrdered(t *testing.T) {
 	l := NewLeaderboard(time.Now())
-	l.AddWin("u1", "zoe")
-	l.AddWin("u2", "adam")
-	l.AddWin("u3", "carol")
-	l.AddWin("u3", "carol")
+	l.AddWin("u1", "zoe", time.Second)
+	l.AddWin("u2", "adam", time.Second)
+	l.AddWin("u3", "carol", time.Second)
+	l.AddWin("u3", "carol", time.Second)
 
 	for range 20 {
 		got := l.Entries()

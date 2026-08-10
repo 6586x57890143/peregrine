@@ -67,6 +67,24 @@ Keying it by source message fixed all three at once. One author can now hold at 
 
 **And the bot stopped asking Discord where people are talking.** Choosing a channel to speak in, and choosing an aggro target, used to page every text channel in every guild fifty messages at a time and then another hundred messages per busy channel. Hundreds of REST calls an hour, answered with rate limits, for information that had already arrived on the websocket and been discarded. `internal/activity` counts the messages the bot already sees; the two functions that paged for it are deleted, and the word-game trigger's private copy of the same tally folded into it. One consequence worth knowing: aggro now targets only people who have spoken since the bot came up, which is the point of aggro.
 
+**M21 was the pass over the parts people actually touch.** `!leaderboard` was slow for one
+specific reason and it was not the corpus: it resolved a display name for every user in the
+week's stats before sorting anything, through an uncached member lookup, so a server with two
+hundred weekly talkers spent two hundred sequential rate-limited requests rendering twenty rows.
+Ranking is computed from the scores alone now and only the eleven rendered rows get a name, which
+is also what makes the eleventh slot possible: ranks 1 to 10, then your own rank under a divider
+if you are outside them. It is one embed with both boards, a fastest-solve and current-streak
+line, and the bot's status line carries a rotating fact about the corpus.
+
+The word games got the same treatment. `!wordgame` refused an unauthorized caller by returning,
+with nothing in the log and nothing in the channel, and the case that actually bit was the
+operator's: with `PEREGRINE_BOOTSTRAP_ADMIN_USER_ID` unset the check fails closed and refuses
+everyone including the person who deployed the bot. It now says which of the two happened. Puzzles
+reveal their first letter after `PEREGRINE_WORDGAME_HINT_AFTER` by editing the announcement,
+swept by the loop that already expires games rather than by a timer of their own, and
+`!wordgame <word>` plants a chosen word, held to the same rules the dictionary loader enforces
+because one of them is what stops the scrambler recursing.
+
 ## Quick start
 
 ```sh
