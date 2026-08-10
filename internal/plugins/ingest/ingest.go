@@ -59,6 +59,16 @@ type Service struct {
 	opts    Options
 	logger  *slog.Logger
 
+	// members is the session the NAME resolver uses, wrapped so a guild member is fetched
+	// once rather than once per mention per message.
+	//
+	// This is not the same object as session on purpose: the walk itself wants the real
+	// session, and only names.Resolve makes the repeated call. discordgo's GuildMember is an
+	// unconditional REST GET with no state-cache check, so the first bootstrap over a large
+	// lookback pays one request per mention across the whole window. That was invisible while
+	// the only long walk lived in another package with its own private cache.
+	members names.Session
+
 	loops       sync.WaitGroup
 	cancelLoops context.CancelFunc
 }
@@ -67,8 +77,25 @@ type Service struct {
 // writer is one per process and the reactor holds the same instance: two Learners would mean two
 // bot IDs and two mention patterns, and only one of them would ever be told who the bot is.
 func New(session *discordgo.Session, store *storage.Store, learner *learn.Learner, opts Options) *Service {
-	return &Service{session: session, store: store, learner: learner, opts: opts}
+	return &Service{
+		session: session,
+		store:   store,
+		learner: learner,
+		opts:    opts,
+		// A SHORTER TTL than a repair pass uses, because this is the live path: a nickname
+		// change should show up in what the bot calls somebody within the hour, whereas a
+		// walk over old messages is applying today's nicknames to old text regardless.
+		members: names.NewCachedSession(session, memberCacheTTL, memberCacheSize),
+	}
 }
+
+// The bounds on the member cache. Constants rather than configuration for the same reason the
+// health dials are: no incident changes either, and a cache an operator can misconfigure into
+// staleness is worse than one they cannot touch.
+const (
+	memberCacheTTL  = time.Hour
+	memberCacheSize = 4096
+)
 
 func (s *Service) Name() string { return "ingest" }
 
@@ -120,7 +147,7 @@ func (s *Service) Once(ctx context.Context) {
 	in := ingest.New(
 		s.session,
 		cursors{store: s.store},
-		learner{session: s.session, store: s.store, learner: s.learner},
+		learner{session: s.members, store: s.store, learner: s.learner},
 		s.logger,
 		ingest.Options{
 			Lookback:           s.opts.Lookback,
@@ -147,7 +174,7 @@ func (s *Service) Once(ctx context.Context) {
 
 // learner adapts the corpus writer to ingest.Learner.
 type learner struct {
-	session *discordgo.Session
+	session names.Session
 	store   *storage.Store
 	learner *learn.Learner
 }

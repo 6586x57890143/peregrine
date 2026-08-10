@@ -279,6 +279,41 @@ It took two milestones because the value and the shape are different problems. M
 
 Note the trap this exposed. The old inline form was `cfg.AdminUserID == "" || m.Author.ID != cfg.AdminUserID`, which short-circuited and therefore never evaluated `m.Author` when no admin was configured. Turning it into a function call made the argument always evaluate, which found a nil `Author` in a test fixture. Production always has one; the fixture did not.
 
+### Repairing history is a job table, and the boundary lives in the corpus
+
+`internal/plugins/repair` re-walks Discord history to rebuild what the corpus cannot rebuild
+itself. It exists because of a failure class rather than one bug: **a fix to a writer is not a
+fix to the data, and whether the data is re-derivable is a property of the layout.** The corpus
+stores n-grams and counts and never message text, so anything derived from message *structure*
+(the two co-occurrence indexes, and any future index keyed on word position or message shape)
+cannot be recomputed. `topic`, `kn_succ` and `kn_pre` can, and already have `RebuildKNIndexes`.
+
+**Adding a repair is a row in `jobs.go`, not a package.** A job names itself, names the
+`learn.Generation` that fixed the writer, says why, and supplies an `Apply` that writes only its
+own index. Three tests check the table against itself, because both dead seed tiers this repo
+has shipped (findings 34 and 37) were found by reading constants rather than by a failure.
+
+**`learn.Generation` is stamped in the corpus by `cmd/bot` on first open, and that is where a
+repair boundary comes from.** Bump it only when a change makes data *already written* wrong or
+incomplete, and add the repair job in the same commit; do not bump it for a change that only
+affects what gets written from now on. M17 asked the operator for that instant instead, which
+works exactly once and only if somebody remembers the deploy. `PEREGRINE_REPAIR_BEFORE` survives
+purely because generation 2 shipped before stamping existed.
+
+**A repair is additive and time-bounded, never drop-and-rebuild.** The reasons are in the
+package comment and the important one is not the obvious one: an interruption after a drop
+leaves unwalked channels with *less* than they started with, since they lose the correct
+post-fix data live traffic has been writing, and data from deleted messages and channels is not
+re-derivable at all. `RebuildKNIndexes` looks like a precedent and is not, because it is
+derivable, deterministic, and atomic inside one transaction.
+
+**`names.NewCachedSession` is a prerequisite for any long walk, not an optimization.**
+discordgo's `GuildMember` is an unconditional REST GET with no state-cache check, and
+`names.Resolve` calls it once per mention, so a history walk is one request per mention per
+message ever sent. It is bounded and has a TTL: a permanent nickname cache makes the bot use a
+stale name forever, and the map is keyed by person, which is a leak this repo has shipped twice.
+The live ingest path uses it too, with a shorter TTL.
+
 ### Ingestion asks "what is new", not "what have I forgotten"
 
 `internal/ingest` walks guilds and channels, `internal/learn` learns, and `internal/plugins/ingest` is the three adapters between them plus the loop. That split is deliberate: reading the wrong messages wastes API budget and corrupts counts, whereas learning them wrongly is a safety question with a gate in front of it.

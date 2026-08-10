@@ -49,6 +49,30 @@ import (
 // TestEndTokenMatchesTheEngine pins that they agree.
 const EndToken = "<end>"
 
+// Generation is the version of the WRITE path, and the corpus records when each one first ran.
+//
+// # When to bump it
+//
+// Bump it when a change makes data ALREADY WRITTEN wrong or incomplete in a way the corpus
+// cannot self-correct, and add the repair job that fixes it in the same commit. Do not bump it
+// for a change that only affects what gets written from now on: the vast majority of changes
+// here are that, and a generation that moves for every edit tells a repair nothing.
+//
+// # Why it exists
+//
+// A repair has to know which messages predate the fix it repairs. M17 asked the operator for
+// that instant as an RFC3339 string, which works exactly once and only if somebody remembers
+// the deploy. Nothing already in the corpus can answer it either: no meta counter is a
+// timestamp, the history bucket is capped and evicted by message time, and the cursor bucket
+// answers "what has been read". So cmd/bot stamps this on the first open of each generation,
+// and a repair reads the stamp instead of asking a human.
+//
+// Generation 1 is everything up to M13. Generation 2 is M14, which fixed the backfill writing
+// no associations at all (SPEC.md section 8, findings 33 and 46). Generation 2 shipped BEFORE
+// stamping existed, so its real start instant is unrecoverable and the association repair still
+// needs the operator override; every generation from 3 onwards gets an exact boundary for free.
+const Generation = 2
+
 // Options are the dials the learn path reads. Every one of them comes from the
 // environment via internal/config; none has a default here, because a zero MaxNGram
 // learning nothing silently is exactly the failure this project keeps closing.

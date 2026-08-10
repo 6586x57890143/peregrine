@@ -14,7 +14,6 @@ import (
 	"github.com/6586x57890143/peregrine/internal/generate"
 	"github.com/6586x57890143/peregrine/internal/learn"
 	"github.com/6586x57890143/peregrine/internal/plugins/aggro"
-	"github.com/6586x57890143/peregrine/internal/plugins/assocfill"
 	"github.com/6586x57890143/peregrine/internal/plugins/autopost"
 	"github.com/6586x57890143/peregrine/internal/plugins/backup"
 	"github.com/6586x57890143/peregrine/internal/plugins/chat"
@@ -22,6 +21,7 @@ import (
 	"github.com/6586x57890143/peregrine/internal/plugins/health"
 	"github.com/6586x57890143/peregrine/internal/plugins/images"
 	"github.com/6586x57890143/peregrine/internal/plugins/ingest"
+	"github.com/6586x57890143/peregrine/internal/plugins/repair"
 	"github.com/6586x57890143/peregrine/internal/plugins/voicenote"
 	"github.com/6586x57890143/peregrine/internal/safety"
 	"github.com/6586x57890143/peregrine/internal/storage"
@@ -186,14 +186,14 @@ func registerServices(
 		ChannelConcurrency: cfg.IngestChannelConcurrency,
 		BatchDelay:         cfg.IngestBatchDelay,
 	})
-	// The one-shot association re-walk. Registered unconditionally and gated inside Start,
-	// so an operator turning it on is a restart rather than a different binary, and so the
-	// service can report what it decided.
-	assocSvc := assocfill.New(session, store, learner, assocfill.Options{
-		Enabled: cfg.AssocBackfill,
-		Before:  cfg.AssocBackfillBefore,
-		// Gentler than the live pass on purpose: this walk has no deadline and the bot
-		// does, so it yields REST budget rather than competing for it.
+	// History repair. Registered unconditionally and gated inside Start, so an operator
+	// turning it on is a restart rather than a different binary, and so the service can
+	// report what it decided.
+	repairSvc := repair.New(session, store, learner, repair.Options{
+		Enabled:  cfg.RepairJobs,
+		Override: cfg.RepairBefore,
+		// Gentler than the live pass on purpose: a repair has no deadline and the bot does,
+		// so it yields REST budget rather than competing for it.
 		GuildConcurrency:   1,
 		ChannelConcurrency: 2,
 		BatchDelay:         time.Second,
@@ -223,7 +223,7 @@ func registerServices(
 	// After ingest, so a restart that resumes both starts the live pass first: the walk that
 	// keeps the corpus current matters more than the one repairing history, and they compete
 	// for the same REST budget.
-	registry.Register(assocSvc)
+	registry.Register(repairSvc)
 	registry.Register(backupSvc)
 	registry.Register(healthSvc)
 	return nil
