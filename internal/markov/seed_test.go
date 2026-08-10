@@ -1,6 +1,8 @@
 package markov
 
 import (
+	"fmt"
+	"math"
 	"strings"
 	"testing"
 
@@ -400,39 +402,71 @@ func TestJumpRefusesAfterAFunctionWord(t *testing.T) {
 	}
 }
 
-// TestTrimDanglingOnlyAppliesToASentenceThatRanOut.
+// TestTrimDanglingHasTwoBands.
 //
-// The caller passes the distinction rather than this guessing it, because the two endings are
-// different claims. An end sentinel means somebody really did finish a message on that word,
-// and in this register that is worth keeping even when it looks abrupt. A dead end means the
-// chain had nowhere left to go, and stopping on "back to the" reads as being cut off.
+// The caller passes whether the model CHOSE to end, because for most function words the two
+// endings are different claims: an end sentinel means somebody really did finish a message on
+// that word, and in this register that is worth keeping even when it looks abrupt.
 //
-// Same asymmetry attested() already makes about EndToken: what the corpus witnessed is
-// evidence, what generation merely ran into is not.
-func TestTrimDanglingOnlyAppliesToASentenceThatRanOut(t *testing.T) {
+// But that is true of the TOKEN and not of the CONSTRUCTION, and a preposition is the case
+// where the difference bites. Two people ended a message with "what are you talking about",
+// so "about" is attested before the sentinel; generation cashed that in on "nurock is coping
+// about", where the phrase never arrives. Nearly a third of golden samples ended this way and
+// every existing assertion passed, which is why the fixture-driven harness found it and no
+// unit test did.
+//
+// So: text.IsDanglingTail trims either way, everything else only when the chain ran out.
+func TestTrimDanglingHasTwoBands(t *testing.T) {
 	cases := []struct {
-		in   []string
-		want []string
+		name  string
+		in    []string
+		chose bool
+		want  []string
 	}{
-		{[]string{"back", "to", "the"}, []string{"back"}},
+		{"ran out, trims the whole tail",
+			[]string{"back", "to", "the"}, false, []string{"back"}},
+
 		// Stops at "even", which is not a function word. "what is the point of even" is a
 		// perfectly good chat line, which is the point: this trims a dangle, it does not
 		// try to make the sentence grammatical.
-		{[]string{"what", "is", "the", "point", "of", "even", "a"},
+		{"ran out, stops at the first content word",
+			[]string{"what", "is", "the", "point", "of", "even", "a"}, false,
 			[]string{"what", "is", "the", "point", "of", "even"}},
-		{[]string{"the", "server", "is", "doomed"}, []string{"the", "server", "is", "doomed"}},
-		{[]string{"the", "of", "a"}, nil},
-		{nil, nil},
+
+		{"ran out, nothing to trim",
+			[]string{"the", "server", "is", "doomed"}, false,
+			[]string{"the", "server", "is", "doomed"}},
+
+		{"ran out, trims to nothing", []string{"the", "of", "a"}, false, nil},
+		{"empty", nil, false, nil},
+
+		// The band that had to be carved out. The model chose to end here, and the old rule
+		// kept it for that reason.
+		{"chose to end, a preposition still goes",
+			[]string{"nurock", "is", "coping", "about"}, true,
+			[]string{"nurock", "is", "coping"}},
+
+		// The other half of the asymmetry, which must survive: a pronoun genuinely ends a
+		// sentence in this register, so an attested ending on one is kept.
+		{"chose to end, a pronoun is kept",
+			[]string{"i", "am", "going", "to", "lose", "it"}, true,
+			[]string{"i", "am", "going", "to", "lose", "it"}},
+
+		// And the same sentence when the chain merely ran out loses it, because then nobody
+		// attested the ending at all.
+		{"ran out, the same pronoun goes",
+			[]string{"i", "am", "going", "to", "lose", "it"}, false,
+			[]string{"i", "am", "going", "to", "lose"}},
 	}
 	for _, c := range cases {
-		got := TrimDangling(c.in)
+		got := TrimDangling(c.in, c.chose)
 		if len(got) != len(c.want) {
-			t.Errorf("TrimDangling(%v) = %v, want %v", c.in, got, c.want)
+			t.Errorf("%s: TrimDangling(%v, %v) = %v, want %v", c.name, c.in, c.chose, got, c.want)
 			continue
 		}
 		for i := range got {
 			if got[i] != c.want[i] {
-				t.Errorf("TrimDangling(%v) = %v, want %v", c.in, got, c.want)
+				t.Errorf("%s: TrimDangling(%v, %v) = %v, want %v", c.name, c.in, c.chose, got, c.want)
 				break
 			}
 		}
@@ -467,35 +501,60 @@ func TestTheNameItselfIsASeed(t *testing.T) {
 		}
 	})
 
-	// CASE 2: outranking an ordinary prompt word. Both are single prompt words, so tier 1
-	// offers both at 30.0 and only this tier separates them.
-	t.Run("outranks an ordinary prompt word", func(t *testing.T) {
+	// CASE 2: the share does not collapse as the prompt gets longer.
+	//
+	// This subtest used to assert that the name beats a single ordinary prompt word, and it
+	// passed for the whole of M14 while the tier was effectively decorative in production.
+	// That is finding 36 in one sentence: with a two-word prompt the old weights gave the
+	// name 57%, and with a seven-word prompt they gave it 3%, because the prompt tier's
+	// influence was its weight TIMES its candidate count. The test asserted the good case and
+	// nothing asserted the bad one.
+	//
+	// So the claim worth pinning is not "beats one word", it is STABILITY: the name tier
+	// spends a fixed share of the draw however many prompt candidates there are. Under
+	// budgets a short prompt gives it less than the old weights did, and that is the trade
+	// being made deliberately.
+	t.Run("its share survives a long prompt", func(t *testing.T) {
 		f := newFake()
-		f.learn(5, "alice", "greg is coping again")
-		f.learn(5, "bob", "greg is coping again")
-		f.learn(5, "alice", "everyone is watching this")
-		f.learn(5, "bob", "everyone is watching this")
+		for _, a := range []string{"alice", "bob"} {
+			f.learn(5, a, "greg is coping again")
+			f.learn(5, a, "everyone is watching this")
+			f.learn(5, a, "what do you know about it")
+			f.learn(5, a, "do you know what i mean")
+		}
 		f.names["greg"] = true
 
-		g := New(f, testParams(), seeded(13, 17))
-		in := SeedInput{
-			PromptWords: []string{"greg", "everyone"},
-			Names:       []string{"greg"},
-			NameTokens:  []string{"greg"},
+		measure := func(prompt []string) float64 {
+			in := SeedInput{PromptWords: prompt, Names: []string{"greg"}, NameTokens: []string{"greg"}}
+			const runs = 4000
+			name := 0
+			for i := range runs {
+				g := New(f, testParams(), seeded(uint64(i), 17))
+				if g.Seed(in) == "greg" {
+					name++
+				}
+			}
+			return float64(name) / float64(runs)
 		}
 
-		// Weighted draw, not argmax, so this is a distribution claim: 40 against 30 is about
-		// 57 percent, and without the tier it would be an even split.
-		const runs = 2000
-		name := 0
-		for range runs {
-			if g.Seed(in) == "greg" {
-				name++
+		short := measure([]string{"greg", "everyone"})
+		long := measure(strings.Fields("what do you know about greg everyone"))
+		t.Logf("name share: short prompt %.1f%%, long prompt %.1f%%", short*100, long*100)
+
+		for _, c := range []struct {
+			name  string
+			share float64
+		}{{"short prompt", short}, {"long prompt", long}} {
+			if c.share < 0.20 || c.share > 0.45 {
+				t.Errorf("%s seeded the name %.1f%% of the time, want roughly a third; the tier "+
+					"must not depend on how many prompt windows happen to exist", c.name, c.share*100)
 			}
 		}
-		if name <= runs/2 {
-			t.Errorf("the name was seeded %d/%d times, no better than an even split against an "+
-				"ordinary prompt word", name, runs)
+
+		// The point of the whole change: the two must not diverge the way they used to.
+		if math.Abs(short-long) > 0.15 {
+			t.Errorf("name share moved from %.1f%% to %.1f%% purely because the prompt got "+
+				"longer, which is finding 36 returning", short*100, long*100)
 		}
 	})
 }
@@ -532,6 +591,48 @@ func TestTheNameSeedIsExemptFromTheAuthorGate(t *testing.T) {
 // TestALoneFunctionWordIsNotASeed. Opening a reply on "is" or "of" can only read as though the
 // first half went missing, and the golden samples had exactly that: "is peak bird behaviour
 // honestly". Only tier 1 can produce it, because the association writers exclude stop words.
+// TestASeedDoesNotOpenOnAConjunction.
+//
+// The lone-function-word rule below exempts multi-word windows, because "the bird" and "the
+// server is" open perfectly well. That exemption let "and lachy are" through, from the
+// prompt "greg and lachy are both", and it generated "and lachy are you know what i am going
+// to lose it": a reply whose first half is visibly missing.
+//
+// Found by reading golden samples. No assertion would have caught it, because the seed was a
+// real prompt window with real continuations and the sentence that followed was perfectly
+// well-formed Markov output.
+func TestASeedDoesNotOpenOnAConjunction(t *testing.T) {
+	f := newFake()
+	for _, a := range []string{"alice", "bob"} {
+		f.learn(5, a, "and lachy are both in queue")
+		f.learn(5, a, "lachy is malding again")
+	}
+
+	g := New(f, testParams(), seeded(3, 5))
+	in := SeedInput{PromptWords: strings.Fields("greg and lachy are both")}
+
+	for range 300 {
+		seed := g.Seed(in)
+		if strings.HasPrefix(seed, "and") {
+			t.Fatalf("seeded on %q, which opens on a conjunction and promises a clause that "+
+				"was never there", seed)
+		}
+	}
+
+	// The control, so this is measuring the conjunction and not a seed selector that
+	// returns nothing at all for this prompt.
+	found := false
+	for range 300 {
+		if strings.HasPrefix(g.Seed(in), "lachy") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("no seed starting at lachy was ever drawn, so the test above passes vacuously")
+	}
+}
+
 func TestALoneFunctionWordIsNotASeed(t *testing.T) {
 	f := newFake()
 	// "is" has continuations, so without the check it is a perfectly good tier 1 candidate.
@@ -560,45 +661,176 @@ func TestALoneFunctionWordIsNotASeed(t *testing.T) {
 	}
 }
 
-// TestAssocWeightCannotEscapeItsTier is the pin for the unbounded-bonus bug.
+// TestAssocScoreStaysWithinItsTier pins the within-tier half of the bound.
 //
-// Each association tier used to add a bare math.Sqrt(count) to its base, so at 50 recorded
-// co-occurrences the name-topic tier reached 32 and outranked the 30 a word the user actually
-// typed gets. That is finding G2 in the seed selector: evidence with no cap turns a ladder into
-// whatever the counts happen to say.
-func TestAssocWeightCannotEscapeItsTier(t *testing.T) {
+// The between-tier half is now structural rather than arithmetic: a candidate is normalized
+// into its tier's budget, so it cannot escape the tier no matter what this returns. This is
+// what let assocSpread be deleted (finding 36's generalization of finding 34), and what is
+// left to check is that one candidate cannot dominate its own tier's share.
+func TestAssocScoreStaysWithinItsTier(t *testing.T) {
 	for _, count := range []uint64{0, 1, 5, 50, 5_000, 1 << 40} {
 		for _, pos := range []float64{0.0, 0.5, 1.0} {
 			d := corpus.TopicAssoc{Count: count, PosSum: pos * float64(count)}
-			// Closed at the top: an enormous count saturates tanh at 1.0 and a position of
-			// 0.0 gives the full position share, so base+assocSpread is attainable. That is
-			// fine, and the band check below is what makes it safe.
-			got := assocWeight(weightTopicWord, d)
-			if got < weightTopicWord || got > weightTopicWord+assocSpread {
-				t.Errorf("assocWeight(count=%d, pos=%.1f) = %.4f, outside [%.1f, %.1f]",
-					count, pos, got, weightTopicWord, weightTopicWord+assocSpread)
+			got := assocScore(d)
+			if got < 1.0 || got > 2.0 {
+				t.Errorf("assocScore(count=%d, pos=%.1f) = %.4f, outside [1, 2]", count, pos, got)
 			}
 		}
 	}
+}
 
-	// And the bands genuinely do not touch, which is what makes the documented ordering real.
-	ladder := []float64{weightTwoHop, weightNamePositional, weightTopicWord, weightNameTopic}
-	for i := 1; i < len(ladder); i++ {
-		if ladder[i-1]+assocSpread > ladder[i] {
-			t.Errorf("tier at %.1f overlaps the tier at %.1f given a spread of %.1f",
-				ladder[i-1], ladder[i], assocSpread)
+// TestSeedTierBudgetsHoldWhateverTheCandidateCount is the direct pin for finding 36, and it
+// fails hard against the pre-budget implementation.
+//
+// The defect was that drawSeed samples proportional to weight over ALL candidates, so a
+// tier's influence was its weight TIMES its candidate count. One tier with two hundred
+// candidates buried a tier with one, however the two weights compared. This asserts the
+// property that makes the documented ladder true: a tier's share of the draw is its budget,
+// full stop, and the number of candidates carrying it changes nothing.
+func TestSeedTierBudgetsHoldWhateverTheCandidateCount(t *testing.T) {
+	c := newSeedCands()
+
+	// One name candidate against two hundred prompt candidates, which is the shape that
+	// produced 4.57% in the live measurement.
+	c.add(tierName, "greg", 1.0)
+	for i := range 200 {
+		c.add(tierPromptNgram, fmt.Sprintf("w%d", i), 1.0)
+	}
+
+	w := c.weights()
+
+	var nameMass, promptMass float64
+	for k, v := range w {
+		if k == "greg" {
+			nameMass += v
+			continue
+		}
+		promptMass += v
+	}
+
+	if math.Abs(nameMass-seedBudget[tierName]) > 1e-9 {
+		t.Errorf("name tier got %.4f of the draw, want its budget %.1f", nameMass, seedBudget[tierName])
+	}
+	if math.Abs(promptMass-seedBudget[tierPromptNgram]) > 1e-9 {
+		t.Errorf("prompt tier got %.4f, want its budget %.1f", promptMass, seedBudget[tierPromptNgram])
+	}
+
+	share := nameMass / (nameMass + promptMass)
+	if share < 0.30 || share > 0.36 {
+		t.Errorf("one name against two hundred prompt candidates draws %.1f%%, want about a third",
+			share*100)
+	}
+}
+
+// TestSeedResolvesANameToTheNameTier.
+//
+// A recognized name is almost always ALSO a prompt unigram. If the prompt tier claimed it
+// first the name tier would be empty on exactly the prompts it exists for, and its budget
+// would go unspent: finding 34's "a weight below the tier that already covers your keys is
+// not a weak preference, it is no preference", restated for budgets.
+func TestSeedResolvesANameToTheNameTier(t *testing.T) {
+	c := newSeedCands()
+	c.add(tierPromptNgram, "greg", 1.0)
+	c.add(tierName, "greg", 1.0)
+
+	if got := c.tierOf["greg"]; got != tierName {
+		t.Errorf("a name that is also a prompt word landed in tier %d, want the name tier", got)
+	}
+	if len(c.byTier[tierPromptNgram]) != 0 {
+		t.Error("the prompt tier kept a copy, so the key would be counted in two budgets")
+	}
+}
+
+// TestSeedRedrawDoesNotDonateARejectedCandidatesShare.
+//
+// Under a flat weight map, deleting a rejected candidate hands its share to every remaining
+// candidate in proportion, which silently moves mass between TIERS. If the name tier's only
+// candidate fails attestation the name tier should contribute nothing, not give a quarter of
+// the draw to the prompt tier.
+func TestSeedRedrawDoesNotDonateARejectedCandidatesShare(t *testing.T) {
+	c := newSeedCands()
+	c.add(tierName, "greg", 1.0)
+	c.add(tierPromptNgram, "the bird", 1.0)
+	c.add(tierTopicWord, "cope", 1.0)
+
+	c.drop("greg")
+	w := c.weights()
+
+	if _, ok := w["greg"]; ok {
+		t.Fatal("dropped candidate is still in the draw")
+	}
+	if math.Abs(w["the bird"]-seedBudget[tierPromptNgram]) > 1e-9 {
+		t.Errorf("prompt tier got %.4f after an unrelated drop, want its unchanged budget %.1f",
+			w["the bird"], seedBudget[tierPromptNgram])
+	}
+	if math.Abs(w["cope"]-seedBudget[tierTopicWord]) > 1e-9 {
+		t.Errorf("topic-word tier got %.4f after an unrelated drop, want its unchanged budget %.1f",
+			w["cope"], seedBudget[tierTopicWord])
+	}
+}
+
+// TestSeedDrawsTheNameOftenEnoughToNotice is the measurable form of the goal this milestone
+// exists for: a reply should engage the person under discussion roughly one time in three,
+// against the 4.57% that was measured before.
+//
+// A band rather than a point, because the share depends on which tiers have candidates at
+// all, and that is the mechanism working: an empty tier spends nothing, so a starved corpus
+// gives the name tier a larger share than a full one. Both ends of that range are inside this
+// band on purpose.
+func TestSeedDrawsTheNameOftenEnoughToNotice(t *testing.T) {
+	f := goldenCorpus()
+	p := testParams()
+	p.MinDistinctAuthors = 2
+
+	in := SeedInput{
+		PromptWords: strings.Fields("bird what do you know about greg"),
+		Names:       []string{"greg"},
+		NameTokens:  []string{"greg"},
+	}
+
+	const runs = 20000
+	hits := 0
+	for i := range runs {
+		g := New(f, p, seeded(uint64(i), 0x5EED))
+		if g.Seed(in) == "greg" {
+			hits++
 		}
 	}
-	// The name seed has to clear a single prompt word or it is dominated by tier 1 for the
-	// same token, which is exactly how weightPromptWord came to be dead code.
-	if weightNameSeed <= weightPromptNgram {
-		t.Errorf("weightNameSeed %.1f does not clear a single prompt word at %.1f, so the tier "+
-			"cannot win for a name that is also a prompt word, which is all of them",
-			weightNameSeed, weightPromptNgram)
+
+	share := float64(hits) / float64(runs)
+	t.Logf("name drawn as the seed %.1f%% of the time", share*100)
+	if share < 0.18 || share > 0.40 {
+		t.Errorf("name seed share %.1f%%, want roughly a quarter to a third; before the budget "+
+			"change this was 4.6%% and the tier was effectively decorative", share*100)
 	}
-	if weightNameSeed >= 2*weightPromptNgram {
-		t.Errorf("weightNameSeed %.1f outranks a two-word prompt phrase at %.1f; a phrase "+
-			"somebody typed carries what they said as well as who they meant",
-			weightNameSeed, 2*weightPromptNgram)
+}
+
+// TestEverySeedTierProducesASurvivingCandidate is the pin that was missing when finding 34
+// and finding 37 each happened.
+//
+// Both were dead tiers, found by reading rather than by a failure, and both were dead for the
+// same reason: another tier already covered every key they could produce. A third one now
+// becomes a test failure instead of a code review.
+func TestEverySeedTierProducesASurvivingCandidate(t *testing.T) {
+	f := goldenCorpus()
+	g := New(f, testParams(), seeded(1, 2))
+
+	in := SeedInput{
+		PromptWords: strings.Fields("bird what do you know about greg"),
+		RecentWords: strings.Fields("the queue is cooked honestly"),
+		Names:       []string{"greg"},
+		NameTokens:  []string{"greg"},
+	}
+
+	c := g.collectSeedCands(in, map[string]struct{}{})
+	names := map[seedTier]string{
+		tierName: "name", tierPromptNgram: "prompt-ngram", tierNameTopic: "name-topic",
+		tierTopicWord: "topic-word", tierTwoHop: "two-hop", tierRecent: "recent",
+	}
+	for tier := range numSeedTiers {
+		if len(c.byTier[tier]) == 0 {
+			t.Errorf("tier %q contributed no candidate, so it cannot decide anything and is "+
+				"either dead or shadowed by a higher tier (findings 34 and 37)", names[tier])
+		}
 	}
 }

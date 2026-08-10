@@ -138,21 +138,43 @@ func (g *Generator) Next(s *Step) (string, error) {
 // empty author for its own messages, so self-learning cannot bootstrap a phrase into
 // eligibility.
 func (g *Generator) eligible(cands []candidate) []candidate {
-	min := g.params.MinDistinctAuthors
-	if min <= 0 {
+	if g.params.MinDistinctAuthors <= 0 {
 		return cands
 	}
 
 	out := cands[:0]
 	for _, c := range cands {
-		// The end sentinel is structural rather than content: gating it on author
-		// diversity would mean a sentence cannot end until several people have ended
-		// a message the same way, which is a length bug wearing a safety hat.
-		if c.token == EndToken || c.authors >= uint32(min) {
+		if g.admits(c.token, c.authors) {
 			out = append(out, c)
 		}
 	}
 	return out
+}
+
+// admits is the gate's decision for one continuation, factored out so that candidate
+// enumeration can count SURVIVORS rather than raw candidates.
+//
+// Splitting it out is not tidiness. The backoff floor used to be measured on the
+// unfiltered pool, so enumeration stopped as soon as five continuations existed and the
+// gate then deleted three or four of them: measured against the golden fixture, a prefix
+// that stopped at the floor left the sampler choosing between TWO candidates, while one
+// that happened to back off further left fourteen. Top-k of 40 and any temperature at all
+// are meaningless against a set of two, which is how the engine went back to being argmax
+// with noise in exactly the places the floor was supposed to prevent it.
+//
+// Note what this does NOT do, because it touches a safety control: every candidate still
+// has to pass the gate. Enumeration keeps LOOKING at lower orders until enough survivors
+// exist; it never admits one that failed. The gate still does not relax when it bites, and
+// when no order supplies survivors the step is still a dead end.
+func (g *Generator) admits(token string, authors uint32) bool {
+	min := g.params.MinDistinctAuthors
+	if min <= 0 {
+		return true
+	}
+	// The end sentinel is structural rather than content: gating it on author diversity
+	// would mean a sentence cannot end until several people have ended a message the same
+	// way, which is a length bug wearing a safety hat.
+	return token == EndToken || authors >= uint32(min)
 }
 
 // assocCache holds the co-occurrence maps one sentence needs, loaded once.

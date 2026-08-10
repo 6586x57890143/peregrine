@@ -346,9 +346,11 @@ func (g *Generator) attempt(r *storage.Reader, promptWords, recentWords []string
 	}
 
 	// chose records whether the sentence ended because the model picked the end sentinel, as
-	// opposed to running out of chain or hitting the cap. TrimDangling needs the distinction:
-	// somebody really did end a message on that word, which is evidence, whereas a sentence
-	// that merely stopped is not.
+	// opposed to running out of chain or hitting the cap. TrimDangling takes it because the
+	// two endings are different claims: somebody really did end a message on that word, which
+	// is evidence, whereas a sentence that merely stopped is not. It trims a trailing
+	// preposition either way, because that attestation was about a construction the composite
+	// key layout does not record.
 	chose := false
 
 	for !length.Done(len(step.Sentence)) {
@@ -405,9 +407,7 @@ func (g *Generator) attempt(r *storage.Reader, promptWords, recentWords []string
 		}
 	}
 
-	if !chose {
-		step.Sentence = markov.TrimDangling(step.Sentence)
-	}
+	step.Sentence = markov.TrimDangling(step.Sentence, chose)
 	return step.Sentence, recognized
 }
 
