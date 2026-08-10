@@ -42,6 +42,8 @@ import (
 // smaller import in exchange for an adapter whose only job was copying an ID.
 type Guard interface {
 	Send(channelID, content string) (*discordgo.Message, bool)
+	SendEmbed(channelID string, embed *discordgo.MessageEmbed) (*discordgo.Message, bool)
+	Edit(channelID, messageID, content string) bool
 	Delete(channelID, messageID string) bool
 }
 
@@ -241,11 +243,14 @@ func (s *Service) Guess(channelID, messageID, content, authorID, displayName str
 	// nickname is interpolated into this string, and a nickname is user-controlled text that
 	// can contain a role mention. Even a message the bot composes itself is
 	// untrusted-input-shaped.
-	if announcement, ok := s.guard.Send(channelID, winnerMessage(displayName, won.Word, time.Since(won.StartedAt))); ok {
+	solveTime := time.Since(won.StartedAt)
+	if announcement, ok := s.guard.Send(channelID, winnerMessage(displayName, won.Word, solveTime)); ok {
 		s.manager.DeleteLater(channelID, announcement.ID)
 	}
 
-	s.board.AddWin(authorID, displayName)
+	// The solve time reaches the board now, which is what makes a weekly record possible. It
+	// was computed for the announcement and then thrown away.
+	s.board.AddWin(authorID, displayName, solveTime)
 	if err := s.save(); err != nil {
 		log.Printf("[WORDGAME] failed to persist a win: %v", err)
 	}
@@ -260,10 +265,13 @@ func (s *Service) Guess(channelID, messageID, content, authorID, displayName str
 //
 // The caller decides what recognition means for the message; here it only means the command
 // ran, or was refused for a reason the operator can see.
-func (s *Service) Command(cmd, channelID, authorID string, names func(userID string) string) bool {
+func (s *Service) Command(cmd, arg, channelID, authorID string, names func(userID string) string) bool {
 	switch cmd {
 	case "!leaderboard":
-		s.postLeaderboard(channelID, names)
+		// The author's ID reaches the board, which is what makes the eleventh slot possible:
+		// showing somebody their own rank requires knowing which of the rows is theirs, and
+		// the only thing that identifies them is their ID.
+		s.postLeaderboard(channelID, authorID, names)
 		return true
 	case "!wordgame":
 		// Only a command when word games are available at all. With the feature off it is
@@ -272,7 +280,7 @@ func (s *Service) Command(cmd, channelID, authorID string, names func(userID str
 		if !s.opts.Enabled || !s.manager.Available() {
 			return false
 		}
-		s.startOnRequest(channelID, authorID)
+		s.startOnRequest(channelID, authorID, arg)
 		return true
 	}
 	return false
@@ -313,18 +321,48 @@ func (s *Service) start(channelID string) {
 	log.Printf("[WORDGAME] Started a game in channel %s.", channelID)
 }
 
-// startOnRequest is !wordgame: the operator asking for a puzzle here, now.
-func (s *Service) startOnRequest(channelID, authorID string) {
+// startOnRequest is !wordgame: the operator asking for a puzzle here, now, optionally on a
+// word they chose.
+//
+// # The refusal is logged, and it was not
+//
+// This used to `return` on an unauthorized caller with no log line and no reply, which is
+// indistinguishable from the bot being broken. The operator case is the one that mattered:
+// with PEREGRINE_BOOTSTRAP_ADMIN_USER_ID unset, Authorized fails closed and refuses EVERYONE
+// including the person who deployed the bot, and the only evidence was a command that did
+// nothing. That is finding 32's shape in a command rather than in the reply path: the bot
+// staying quiet is the design, the operator being unable to tell why is the bug.
+//
+// It stays silent IN THE CHANNEL, which is a different decision from staying silent in the
+// log. Answering a non-admin advertises that the command exists and that they are not allowed
+// to use it, which is an invitation. The message is still consumed either way.
+func (s *Service) startOnRequest(channelID, authorID, word string) {
 	if !s.Authorized(authorID) {
+		if s.opts.AdminUserID == "" {
+			log.Printf("[WORDGAME] !wordgame in %s was refused because "+
+				"PEREGRINE_BOOTSTRAP_ADMIN_USER_ID is unset, so the check fails closed and "+
+				"refuses everyone. Set it to your own Discord user ID.", channelID)
+			return
+		}
+		log.Printf("[WORDGAME] !wordgame in %s from %s was refused: not the configured admin.",
+			channelID, authorID)
 		return
 	}
 
-	g, err := s.manager.Start(channelID)
+	g, err := s.manager.StartWord(channelID, word)
 	switch {
 	case errors.Is(err, wordgame.ErrGameInProgress):
 		// Reported to the channel, because the operator asked for something and deserves to
 		// know why it did not happen.
 		s.guard.Send(channelID, "A word game is already in progress in this channel!")
+		return
+	case errors.Is(err, wordgame.ErrUnusableWord):
+		// Also reported, and it names the rules rather than saying no. The operator typed a
+		// word and the interesting information is which rule it broke.
+		minLen, maxLen := s.manager.WordBounds()
+		s.guard.Send(channelID, fmt.Sprintf(
+			"I cannot scramble that. A puzzle word has to be %d to %d letters, letters only, "+
+				"and use at least two different ones.", minLen, maxLen))
 		return
 	case err != nil:
 		log.Printf("[WORDGAME] Failed to start a game on request: %v", err)
@@ -334,9 +372,19 @@ func (s *Service) startOnRequest(channelID, authorID string) {
 	msg, ok := s.guard.Send(channelID, scrambleMessage(g.Scrambled))
 	if !ok {
 		s.manager.Abandon(channelID)
+		// Said out loud, because the guard refusing this is the other way an operator command
+		// silently does nothing: an ignored channel or a paused bot, neither of which is
+		// visible from the empty channel.
+		log.Printf("[WORDGAME] A requested game in %s was abandoned: the guard refused the "+
+			"announcement, so the channel is on PEREGRINE_IGNORE_CHANNELS or writes are paused.",
+			channelID)
 		return
 	}
 	s.manager.Announced(channelID, msg.ID)
+	if g.Planted {
+		log.Printf("[WORDGAME] Started a game on request in channel %s on a chosen word.", channelID)
+		return
+	}
 	log.Printf("[WORDGAME] Started a game on request in channel %s.", channelID)
 }
 
@@ -356,8 +404,24 @@ func (s *Service) startInterval() {
 	s.start(channelID)
 }
 
-// sweep ends expired puzzles and clears announcements whose time is up.
+// sweep ends expired puzzles, reveals hints and clears announcements whose time is up.
+//
+// One loop for every deadline this feature has. A hint is not a fourth timer: it is another
+// thing the tick already running notices, which is what keeps M11a's "one sweep, not a
+// goroutine per game" true as the feature grows.
 func (s *Service) sweep() {
+	// Hints first, so a puzzle that is both due a hint and about to expire does not get one
+	// after the answer has been announced.
+	for _, g := range s.manager.DueHints() {
+		first, letters := g.Hint()
+		// An EDIT rather than a new message, so the hint arrives where people are already
+		// looking instead of scrolling the puzzle away. Through the guard like everything
+		// else: an edit can introduce a mention the original did not have.
+		if !s.guard.Edit(g.ChannelID, g.MessageID, hintMessage(g.Scrambled, first, letters)) {
+			log.Printf("[WORDGAME] Could not add a hint in channel %s.", g.ChannelID)
+		}
+	}
+
 	for _, g := range s.manager.Expired() {
 		if announcement, ok := s.guard.Send(g.ChannelID, timeUpMessage(g.Word)); ok {
 			s.manager.DeleteLater(g.ChannelID, announcement.ID)
@@ -396,24 +460,68 @@ func (s *Service) maybeReset() {
 // Deliberately NOT gated on the feature flag. The chat half reads the stats bucket, which is
 // populated on every message regardless of whether the scramble game runs, so the command is
 // useful with word games off.
-func (s *Service) postLeaderboard(channelID string, names func(userID string) string) {
-	var scores map[string]int
+func (s *Service) postLeaderboard(channelID, viewerID string, names func(userID string) string) {
+	var chatScores map[string]int
 	if err := s.store.View(func(r *storage.Reader) error {
 		var err error
-		scores, err = weeklyScores(r)
+		chatScores, err = weeklyScores(r)
 		return err
 	}); err != nil {
 		log.Printf("[LEADERBOARD] Error loading user stats: %v", err)
-		s.guard.Send(channelID, "Could not generate chat leaderboard.")
+		s.guard.Send(channelID, "Could not generate the leaderboard.")
 		return
 	}
 
-	named := make(map[string]int, len(scores))
-	for userID, score := range scores {
-		named[names(userID)] = score
-	}
+	// RANK FIRST, RESOLVE NAMES SECOND, and that order is the entire performance fix.
+	//
+	// This used to resolve a display name for EVERY user in the week's stats before sorting
+	// anything, through an uncached GuildMember REST GET with a User fallback. On a server
+	// with two hundred weekly talkers that was two hundred-odd sequential, rate-limited
+	// requests to render twenty rows, and the command took long enough that people assumed
+	// the bot had ignored them.
+	//
+	// A rank is one plus the number of people strictly ahead, so it needs no names at all.
+	// Only the rows that are actually displayed need one, which is at most eleven per board.
+	//
+	// It also fixes a real defect rather than only the speed: the old code keyed the board by
+	// resolved NAME, so two people with the same nickname merged into one row.
+	now := time.Now()
+	wins := wordgame.Rank(s.board.Scores(), viewerID, leaderboardRows)
+	chat := wordgame.Rank(chatScores, viewerID, leaderboardRows)
 
-	s.guard.Send(channelID, s.board.Format(time.Now())+"\n\n"+wordgame.FormatChatLeaderboard(named))
+	// Memoized across BOTH boards, so somebody who is on the word-game board and the chat
+	// board costs one lookup rather than two. In practice that is most of the overlap.
+	resolve := memoize(names)
+	wins = wins.WithNames(resolve)
+	chat = chat.WithNames(resolve)
+
+	// The footer's two record holders go through the SAME memoized resolver, so a record held
+	// by somebody already on a board costs nothing extra. That is at most two more lookups.
+	footer := leaderboardFooter(s.board, wins, chat, resolve)
+
+	embed := leaderboardEmbed(wins, chat, s.board.NextReset(now), footer)
+	if _, ok := s.guard.SendEmbed(channelID, embed); !ok {
+		// The guard has already logged whether this was a refusal or a failure. Said here as
+		// well because a command that produced nothing is a question the operator will be
+		// asked, and silence on the reply path is the bug finding 32 was about.
+		log.Printf("[LEADERBOARD] the board was not sent in %s", channelID)
+	}
+}
+
+// memoize wraps a name resolver so each user is looked up at most once.
+//
+// Not concurrency-safe, and does not need to be: one command invocation resolves its own
+// board on one goroutine. A mutex here would be structure with no failure mode behind it.
+func memoize(resolve func(userID string) string) func(string) string {
+	cache := map[string]string{}
+	return func(userID string) string {
+		if name, ok := cache[userID]; ok {
+			return name
+		}
+		name := resolve(userID)
+		cache[userID] = name
+		return name
+	}
 }
 
 // weeklyScores returns each user's message count for the current week.
@@ -455,6 +563,16 @@ func (s *Service) save() error {
 
 func scrambleMessage(scrambled string) string {
 	return fmt.Sprintf("✨ **Word Scramble!** ✨\n\nUnscramble this word: **%s**", scrambled)
+}
+
+// hintMessage is the announcement with the first letter revealed.
+//
+// It REPLACES the announcement rather than adding a line under it, because this is an edit:
+// the puzzle and its hint are one message, so a player scrolling back sees the current state
+// of the game rather than two messages they have to read in order.
+func hintMessage(scrambled, first string, letters int) string {
+	return fmt.Sprintf("✨ **Word Scramble!** ✨\n\nUnscramble this word: **%s**\n\n"+
+		"💡 Hint: %d letters, starts with **%s**.", scrambled, letters, first)
 }
 
 func timeUpMessage(original string) string {

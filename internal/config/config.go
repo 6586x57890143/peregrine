@@ -131,8 +131,19 @@ type Config struct {
 	// variables, and are gone entirely as of M7b: clustering is deleted rather than
 	// rebuilt, so there is no milestone left to defer them to (SPEC.md section 8,
 	// findings 27 and 29).
-	StatusTick      time.Duration // PEREGRINE_STATUS_TICK
-	LeaderboardTick time.Duration // PEREGRINE_LEADERBOARD_CHECK_TICK
+	StatusTick time.Duration // PEREGRINE_STATUS_TICK
+
+	// The Discord presence line, rotated on the status tick. There is no interval of its own,
+	// because the numbers it shows come from the page walk that tick already pays for.
+	//
+	// PresenceCorpusWordChance is how often the line quotes a WORD FROM THE CORPUS instead of
+	// reporting a count. That is user-typed text on public display, so it goes through the
+	// emit gate like every other emission and falls back to a count when the gate refuses it.
+	// Zero disables the variant entirely, for an operator who does not want the bot's status
+	// to be user-derived at all.
+	EnablePresence           bool          // PEREGRINE_ENABLE_PRESENCE
+	PresenceCorpusWordChance float64       // PEREGRINE_PRESENCE_CORPUS_WORD_CHANCE
+	LeaderboardTick          time.Duration // PEREGRINE_LEADERBOARD_CHECK_TICK
 
 	// Engagement: bird aggro.
 	AggroTick     time.Duration // PEREGRINE_AGGRO_TICK
@@ -195,6 +206,7 @@ type Config struct {
 	WordGameMinLength         int           // PEREGRINE_WORDGAME_MIN_LENGTH
 	WordGameMaxLength         int           // PEREGRINE_WORDGAME_MAX_LENGTH
 	WordGameSweepTick         time.Duration // PEREGRINE_WORDGAME_SWEEP_TICK
+	WordGameHintAfter         time.Duration // PEREGRINE_WORDGAME_HINT_AFTER
 
 	// Corpus snapshots. Off by default, because there is no safe guess for a path and
 	// writing megabytes somewhere the operator did not choose is worse than not backing up.
@@ -206,6 +218,29 @@ type Config struct {
 	BackupDir  string        // PEREGRINE_BACKUP_DIR
 	BackupTick time.Duration // PEREGRINE_BACKUP_TICK
 	BackupKeep int           // PEREGRINE_BACKUP_KEEP
+
+	// The tuning export. Off by default and for the same reason as the backups above: no
+	// safe guess for a path, and the same read_only container caveat applies.
+	//
+	// This one writes MESSAGE TEXT, which the backups also do (the corpus is made of it) but
+	// in a form nobody would read by accident. Prompts and replies land in the export as
+	// plain lines, so the directory deserves the same handling as the corpus rather than
+	// being treated as logs. What it does NOT write is anything the emit gate refused: a
+	// sample whose send was turned down carries no text at all.
+	TuningDir              string        // PEREGRINE_TUNING_DIR
+	TuningRotate           time.Duration // PEREGRINE_TUNING_ROTATE
+	TuningKeep             int           // PEREGRINE_TUNING_KEEP
+	TuningSample           float64       // PEREGRINE_TUNING_SAMPLE
+	TuningEngagementWindow time.Duration // PEREGRINE_TUNING_ENGAGEMENT_WINDOW
+	TuningTrackMax         int           // PEREGRINE_TUNING_TRACK_MAX
+
+	// Version is stamped on every exported record so two archives can be told apart.
+	//
+	// It is an environment variable rather than a build stamp because .dockerignore excludes
+	// .git, so debug.ReadBuildInfo has no vcs revision inside the image. The deploy already
+	// knows the answer: docker-compose.prod.yml passes the image tag, which CI sets to the
+	// commit SHA it built.
+	Version string // PEREGRINE_VERSION
 
 	// Transcription. Off by default, and that default deliberately differs from
 	// the old in-code constant, which was true: transcription shells out to
@@ -370,6 +405,13 @@ func Load() (*Config, error) {
 
 		StatusTick: l.dur("PEREGRINE_STATUS_TICK", 5*time.Minute, time.Minute, 24*time.Hour),
 
+		// On by default, unlike almost everything else here, because it is the one feature in
+		// this bot whose failure mode is purely cosmetic: it cannot ping, cannot post, and
+		// says nothing an operator has to answer for. A blank status line on a bot that is
+		// running is a small lie an operator has to work to see through.
+		EnablePresence:           l.boolVal("PEREGRINE_ENABLE_PRESENCE", true),
+		PresenceCorpusWordChance: l.float("PEREGRINE_PRESENCE_CORPUS_WORD_CHANCE", 0.25, 0, 1),
+
 		LeaderboardTick: l.dur("PEREGRINE_LEADERBOARD_CHECK_TICK", time.Hour, time.Minute, 24*time.Hour),
 
 		AggroTick:     l.dur("PEREGRINE_AGGRO_TICK", time.Hour, time.Minute, 30*24*time.Hour),
@@ -441,9 +483,35 @@ func Load() (*Config, error) {
 		// goroutine per game this replaces outlived shutdown.
 		WordGameSweepTick: l.dur("PEREGRINE_WORDGAME_SWEEP_TICK", 5*time.Second, time.Second, time.Minute),
 
+		// How far into a puzzle the first letter is revealed. 0 turns hints off, which is why
+		// the range starts there rather than at the sweep tick: "no hints" is a real choice and
+		// has to be expressible.
+		WordGameHintAfter: l.dur("PEREGRINE_WORDGAME_HINT_AFTER", 30*time.Second, 0, time.Hour),
+
 		BackupDir:  l.str("PEREGRINE_BACKUP_DIR", ""),
 		BackupTick: l.dur("PEREGRINE_BACKUP_TICK", 24*time.Hour, time.Minute, 30*24*time.Hour),
 		BackupKeep: l.intVal("PEREGRINE_BACKUP_KEEP", 7, 1, 1000),
+
+		TuningDir:    l.str("PEREGRINE_TUNING_DIR", ""),
+		TuningRotate: l.dur("PEREGRINE_TUNING_ROTATE", 24*time.Hour, time.Minute, 30*24*time.Hour),
+		TuningKeep:   l.intVal("PEREGRINE_TUNING_KEEP", 14, 1, 1000),
+
+		// 1.0 records every generation attempt, which is the right default because a reply is
+		// rare compared to a message: the bot answers when addressed. Lower it only if the
+		// file is genuinely too large to move, and know what it costs, since a sampled
+		// archive cannot answer questions about rare outcomes.
+		TuningSample: l.float("PEREGRINE_TUNING_SAMPLE", 1.0, 0.001, 1.0),
+
+		// Ten minutes is long enough for a reaction and short enough that a restart does not
+		// truncate most windows. A truncated window is not lost, since the record carries the
+		// window it actually got, but a file full of two-minute windows measures less.
+		TuningEngagementWindow: l.dur("PEREGRINE_TUNING_ENGAGEMENT_WINDOW", 10*time.Minute, time.Minute, 6*time.Hour),
+
+		// Bounds the map of replies being watched. Keyed by message ID, so this is the bound
+		// that stops a leak this repository has shipped twice before.
+		TuningTrackMax: l.intVal("PEREGRINE_TUNING_TRACK_MAX", 500, 10, 100_000),
+
+		Version: l.str("PEREGRINE_VERSION", "dev"),
 
 		EnableTranscription: l.boolVal("PEREGRINE_ENABLE_TRANSCRIPTION", false),
 		TranscriptionQueue:  l.intVal("PEREGRINE_TRANSCRIPTION_QUEUE", 32, 1, 10_000),
@@ -482,6 +550,17 @@ func Load() (*Config, error) {
 			"PEREGRINE_IMAGE_MAX_PER_AUTHOR=%d is not below PEREGRINE_IMAGE_CACHE_SIZE=%d, "+
 				"so one author can still fill the repost cache and the per-author cap protects nothing",
 			cfg.ImageMaxPerAuthor, cfg.ImageCacheSize))
+	}
+
+	// A hint due at or after the deadline never fires, so the knob would be wired to nothing:
+	// the operator sets it, no hint ever appears, and the feature gets blamed for ignoring
+	// configuration. Same relationship mistake as the image cap above, and named the same way.
+	if cfg.WordGameHintAfter > 0 && cfg.WordGameHintAfter >= cfg.WordGameTimeout {
+		l.errs = append(l.errs, fmt.Errorf(
+			"PEREGRINE_WORDGAME_HINT_AFTER=%v is not below PEREGRINE_WORDGAME_TIMEOUT=%v, so the "+
+				"hint would be due after the puzzle has already ended and would never appear. "+
+				"Set it lower, or to 0 to turn hints off",
+			cfg.WordGameHintAfter, cfg.WordGameTimeout))
 	}
 
 	if len(l.errs) > 0 {

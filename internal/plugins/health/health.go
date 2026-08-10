@@ -56,6 +56,22 @@ type Latency interface {
 	HeartbeatLatency() time.Duration
 }
 
+// Reporter receives the same status this package logs, for anything that wants it as data
+// rather than as a line. internal/plugins/tuning satisfies it.
+//
+// It is here, taking what reportStatus has already computed, for the reason finding 17
+// keeps restating: Reader.Status walks every page in several buckets, which is genuinely
+// expensive and is why it lives on a ticker rather than on the message path. A second
+// service asking the corpus the same question on its own ticker would pay that cost twice
+// for one answer.
+//
+// The signature is wide on purpose. A struct would need one of the two packages to own it,
+// and the counters do not belong to either: they come from the dispatcher and the safety
+// gate, and health is only the thing that happens to read them.
+type Reporter interface {
+	Snapshot(st storage.Status, queueDropped, learnRejected, emitRejected uint64, paused bool)
+}
+
 // Options are the dials.
 type Options struct {
 	// StatusTick is how often the corpus and counter line is printed.
@@ -70,12 +86,20 @@ type Options struct {
 
 // Service is the feature.
 type Service struct {
-	store   *storage.Store
-	queue   Queue
-	gate    Gate
-	latency Latency
-	opts    Options
-	logger  *slog.Logger
+	store    *storage.Store
+	queue    Queue
+	gate     Gate
+	latency  Latency
+	reporter Reporter
+	presence Presence
+	topics   Topics
+	opts     Options
+	logger   *slog.Logger
+
+	// presenceAt is the round-robin cursor for the status line. Only the status loop touches
+	// it, and there is one status loop, so it needs no lock.
+	presenceAt   int
+	presenceOpts PresenceOptions
 
 	// Previous counter values, so the report can carry deltas. Only the status loop touches
 	// them, and there is one status loop, so they need no lock.
@@ -87,9 +111,30 @@ type Service struct {
 	cancelLoops context.CancelFunc
 }
 
+// Deps are the collaborators. A struct because the constructor reached seven positional
+// arguments, three of them optional interfaces, which is where argument-order bugs live.
+type Deps struct {
+	Store   *storage.Store
+	Queue   Queue
+	Gate    Gate
+	Latency Latency
+
+	// Reporter takes the status as data. Nil whenever the tuning export is off.
+	Reporter Reporter
+
+	// Presence sets the status line, and Topics supplies the occasional corpus word for it.
+	// Either may be nil, which turns off that half rather than failing.
+	Presence Presence
+	Topics   Topics
+}
+
 // New builds the service.
-func New(store *storage.Store, queue Queue, gate Gate, latency Latency, opts Options) *Service {
-	return &Service{store: store, queue: queue, gate: gate, latency: latency, opts: opts}
+func New(d Deps, opts Options, presence PresenceOptions) *Service {
+	return &Service{
+		store: d.Store, queue: d.Queue, gate: d.Gate, latency: d.Latency,
+		reporter: d.Reporter, presence: d.Presence, topics: d.Topics,
+		opts: opts, presenceOpts: presence,
+	}
 }
 
 func (s *Service) Name() string { return "health" }
@@ -167,6 +212,19 @@ func (s *Service) reportStatus() {
 	}
 
 	dropped, learnRejected, emitRejected := s.counters()
+
+	// Handed on as data BEFORE the log line, so a reporter that panics is caught by the
+	// RunLoop wrapper with the status still unlogged rather than half-logged. The counters
+	// passed are the TOTALS: this is one observation for an archive, where a delta is a
+	// subtraction between two adjacent timestamped records, whereas the log line below is
+	// skimmed once and a lifetime total there says nothing about now.
+	if s.reporter != nil {
+		s.reporter.Snapshot(st, dropped.total, learnRejected.total, emitRejected.total, s.gate.Paused())
+	}
+
+	// The status line, from the counts this pass already paid for. No second page walk, no
+	// second loop, and no second interval to configure: the rotation IS the status tick.
+	s.updatePresence(st)
 
 	// One record with everything, rather than a line per subsystem. An operator comparing two
 	// reports wants them adjacent.

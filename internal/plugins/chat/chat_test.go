@@ -97,7 +97,10 @@ func (g *fakeGames) Guess(string, string, string, string, string) bool {
 	return false
 }
 
-func (g *fakeGames) Command(cmd, _, _ string, _ func(string) string) bool {
+func (g *fakeGames) Command(cmd, arg, _, _ string, _ func(string) string) bool {
+	if arg != "" {
+		cmd += " " + arg
+	}
 	g.commands = append(g.commands, cmd)
 	return g.consume
 }
@@ -244,19 +247,33 @@ func TestACommandTheFeatureDeclinesIsNotConsumed(t *testing.T) {
 	}
 }
 
+// TestCommandForMatchesTheWholeMessage, so people can talk ABOUT a command.
+//
+// The argument form is the interesting half now. It accepts exactly two tokens whose FIRST is
+// the command, which is what preserves this property: taking "everything after !wordgame"
+// instead would have turned any sentence mentioning it into an invocation carrying the rest of
+// that sentence as its puzzle word.
 func TestCommandForMatchesTheWholeMessage(t *testing.T) {
-	cases := map[string]string{
-		"!leaderboard":                         "!leaderboard",
-		"!LEADERBOARD":                         "!leaderboard",
-		"  !wordgame\t":                        "!wordgame",
-		"!wordgame please":                     "",
-		"you should try !leaderboard sometime": "",
-		"leaderboard":                          "",
-		"":                                     "",
+	type want struct{ cmd, arg string }
+	cases := map[string]want{
+		"!leaderboard":                         {"!leaderboard", ""},
+		"!LEADERBOARD":                         {"!leaderboard", ""},
+		"  !wordgame\t":                        {"!wordgame", ""},
+		"!wordgame banana":                     {"!wordgame", "banana"},
+		"  !WordGame Banana  ":                 {"!wordgame", "banana"},
+		"!wordgame banana pancakes":            {"", ""},
+		"!wordgame :)":                         {"", ""},
+		"!wordgame b4nana":                     {"", ""},
+		"!leaderboard banana":                  {"", ""},
+		"you should try !wordgame sometime":    {"", ""},
+		"you should try !leaderboard sometime": {"", ""},
+		"leaderboard":                          {"", ""},
+		"":                                     {"", ""},
 	}
-	for content, want := range cases {
-		if got := commandFor(content); got != want {
-			t.Errorf("commandFor(%q) = %q, want %q", content, got, want)
+	for content, w := range cases {
+		cmd, arg := commandFor(content)
+		if cmd != w.cmd || arg != w.arg {
+			t.Errorf("commandFor(%q) = %q, %q, want %q, %q", content, cmd, arg, w.cmd, w.arg)
 		}
 	}
 }

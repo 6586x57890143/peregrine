@@ -65,6 +65,16 @@ var embeddedDictionary embed.FS
 // been a data race. Owning it makes that structural instead of circumstantial.
 type Dictionary struct {
 	words []string
+
+	// opts are the rules the words were filtered on, kept so a word supplied from OUTSIDE the
+	// list can be held to exactly the same ones.
+	//
+	// That is what !wordgame <word> needs. An operator planting a puzzle bypasses the list,
+	// and with it the guarantee the list exists to provide: the scrambler's bound is
+	// documented as "a belt to this braces", so a word with one distinct letter arriving by a
+	// second route would leave the belt doing the work alone. Reusing usable() rather than
+	// writing a second check is the point.
+	opts DictionaryOptions
 }
 
 // DictionaryOptions bounds which words are usable.
@@ -124,7 +134,7 @@ func LoadDictionary(path string, opts DictionaryOptions) (*Dictionary, error) {
 	}
 	defer func() { _ = file.Close() }()
 
-	d := &Dictionary{}
+	d := &Dictionary{opts: opts}
 	var rejected int
 
 	scanner := bufio.NewScanner(file)
@@ -165,6 +175,26 @@ func usable(word string, opts DictionaryOptions) bool {
 		distinct[r] = struct{}{}
 	}
 	return len(distinct) >= 2
+}
+
+// Usable reports whether a word could have been in this dictionary.
+//
+// For a word an operator supplied by hand. Same function, same options, so a planted puzzle
+// cannot be something the loader would have thrown away.
+func (d *Dictionary) Usable(word string) bool {
+	if d == nil {
+		return false
+	}
+	return usable(word, d.opts)
+}
+
+// Bounds reports the length limits, so a caller can say WHY a word was refused rather than
+// only that it was.
+func (d *Dictionary) Bounds() (min, max int) {
+	if d == nil {
+		return 0, 0
+	}
+	return d.opts.MinLength, d.opts.MaxLength
 }
 
 // Len reports how many usable words were loaded, for the startup log line.

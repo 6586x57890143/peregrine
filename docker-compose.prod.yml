@@ -19,6 +19,17 @@ services:
       - ALL
     env_file:
       - .env
+    environment:
+      # The commit SHA CI built, stamped onto every tuning-export record so two
+      # archives can be told apart and the report can refuse to average across a
+      # change it cannot see.
+      #
+      # It comes from deployed-tag.env, which the deploy already writes and sources
+      # before running compose, so this is the same value the image tag above uses.
+      # A build stamp would be the obvious alternative and does not work:
+      # .dockerignore excludes .git, so debug.ReadBuildInfo has no vcs revision
+      # inside the image.
+      PEREGRINE_VERSION: ${PEREGRINE_IMAGE_TAG:-dev}
     volumes:
       # The corpus. A named volume rather than a bind so its ownership matches
       # the image's nonroot uid, which is what /data was chowned to in the
@@ -38,6 +49,22 @@ services:
       #
       #   sudo chgrp 65532 backups && chmod 775 backups
       - ./backups:/backups
+      # The tuning export, on a host bind for the same reason as the backups: it is
+      # pulled OFF this machine, with scp, and a named volume is awkward to reach.
+      #
+      # SAME UID TREATMENT, same failure if it is skipped. A bind keeps its host
+      # ownership, so a directory owned by deploy is not writable by uid 65532 and
+      # every record is dropped. It fails a tick after startup rather than at
+      # startup, so nobody watching the boot logs sees it:
+      #
+      #   sudo chgrp 65532 tuning && chmod 775 tuning
+      #
+      # Set PEREGRINE_TUNING_DIR=/tuning in .env to turn it on. Empty is the
+      # default and means nothing is written.
+      #
+      # It holds MESSAGE TEXT: prompts people typed and replies the bot sent.
+      # Treat it like the corpus, not like logs.
+      - ./tuning:/tuning
       # The blocklist, read-only, as data rather than baked into the image so the
       # operator can edit it mid-incident and restart, with no rebuild and no
       # public diff. Set PEREGRINE_BLOCKLIST_PATH=/blocklist.txt in .env to use it.

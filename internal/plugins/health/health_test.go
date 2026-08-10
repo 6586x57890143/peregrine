@@ -44,11 +44,11 @@ func fixture(t *testing.T, latency Latency) (*Service, *fakeQueue, *fakeGate, *b
 	var buf bytes.Buffer
 	queue := &fakeQueue{}
 	gate := &fakeGate{}
-	s := New(dbtest.Store(t), queue, gate, latency, Options{
+	s := New(Deps{Store: dbtest.Store(t), Queue: queue, Gate: gate, Latency: latency}, Options{
 		StatusTick:  time.Minute,
 		LatencyTick: time.Minute,
 		Threshold:   500 * time.Millisecond,
-	})
+	}, PresenceOptions{})
 	if err := s.Init(core.Deps{Logger: slog.New(slog.NewTextHandler(&buf, nil))}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
@@ -224,9 +224,9 @@ func TestShutdownReportsOnceMore(t *testing.T) {
 func TestAnUnreadableCorpusIsReportedRatherThanPanicking(t *testing.T) {
 	var buf bytes.Buffer
 	store := dbtest.Store(t)
-	s := New(store, &fakeQueue{}, &fakeGate{}, fakeLatency(0), Options{
+	s := New(Deps{Store: store, Queue: &fakeQueue{}, Gate: &fakeGate{}, Latency: fakeLatency(0)}, Options{
 		StatusTick: time.Minute, LatencyTick: time.Minute, Threshold: time.Second,
-	})
+	}, PresenceOptions{})
 	if err := s.Init(core.Deps{Logger: slog.New(slog.NewTextHandler(&buf, nil))}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
@@ -250,9 +250,9 @@ func TestTheCorpusCountsComeFromTheStore(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	s := New(store, &fakeQueue{}, &fakeGate{}, fakeLatency(0), Options{
+	s := New(Deps{Store: store, Queue: &fakeQueue{}, Gate: &fakeGate{}, Latency: fakeLatency(0)}, Options{
 		StatusTick: time.Minute, LatencyTick: time.Minute, Threshold: time.Second,
-	})
+	}, PresenceOptions{})
 	if err := s.Init(core.Deps{Logger: slog.New(slog.NewTextHandler(&buf, nil))}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}

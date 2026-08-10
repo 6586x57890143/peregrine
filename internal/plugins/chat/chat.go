@@ -39,6 +39,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/bwmarrin/discordgo"
 
@@ -47,6 +48,7 @@ import (
 	"github.com/6586x57890143/peregrine/internal/learn"
 	"github.com/6586x57890143/peregrine/internal/names"
 	"github.com/6586x57890143/peregrine/internal/plugins/images"
+	"github.com/6586x57890143/peregrine/internal/plugins/tuning"
 	"github.com/6586x57890143/peregrine/internal/safety"
 	"github.com/6586x57890143/peregrine/internal/storage"
 )
@@ -81,12 +83,36 @@ type Images interface {
 // Games handles guesses and the bang commands.
 type Games interface {
 	Guess(channelID, messageID, content, authorID, displayName string) bool
-	Command(cmd, channelID, authorID string, names func(userID string) string) bool
+	Command(cmd, arg, channelID, authorID string, names func(userID string) string) bool
 }
 
 // Voice queues a voice attachment for transcription and reports whether it took it.
 type Voice interface {
 	Offer(channelID, messageID, authorID string, attachments []discordgo.MessageAttachment) bool
+}
+
+// Recorder is the tuning export.
+//
+// It names tuning.Generation rather than a local shape for the same reason Images names
+// images.Attachment: Go requires exact type identity on an interface method's parameters,
+// so a local type would force an adapter whose only job is copying fields.
+//
+// Every method must be safe to call on a nil-free no-op implementation, because the export
+// is off by default and this package should not learn what "off" means.
+type Recorder interface {
+	// Record takes one generation attempt, including the ones that produced nothing.
+	Record(tuning.Generation)
+
+	// NoteReply says a human replied to one of the bot's messages, which is the strongest
+	// engagement signal available. This package already computes REPLY_TO_BOT to decide
+	// whether to answer, so it costs nothing new here.
+	NoteReply(botMessageID string)
+
+	// NoteActivity says a message arrived in a channel, as the denominator for the above.
+	NoteActivity(channelID string)
+
+	// Count tallies a named event.
+	Count(event string)
 }
 
 // Speaker produces a sentence, and says why when it does not.
@@ -127,11 +153,26 @@ type Service struct {
 	images   Images
 	games    Games
 	voice    Voice
+	recorder Recorder
+	members  names.Session
 	opts     Options
 
 	dispatcher *core.Dispatcher
 	botID      string
 }
+
+// noRecorder is what a nil Recorder means: the export is off and every call is a no-op.
+//
+// A null object rather than a nil check at each of the five call sites, matching
+// wordgame.noCounter. The reason is the one this repo keeps rediscovering: a rule applied at
+// four of five call sites is not a rule, and the fifth is where the nil dereference comes
+// from.
+type noRecorder struct{}
+
+func (noRecorder) Record(tuning.Generation) {}
+func (noRecorder) NoteReply(string)         {}
+func (noRecorder) NoteActivity(string)      {}
+func (noRecorder) Count(string)             {}
 
 // Deps is everything the reactor needs. A struct rather than fifteen parameters, because a
 // fifteen-parameter constructor is a positional-argument bug waiting to happen.
@@ -149,16 +190,29 @@ type Deps struct {
 	Images   Images
 	Games    Games
 	Voice    Voice
-	Options  Options
+	Recorder Recorder
+
+	// Members resolves guild members for the leaderboard's display names. In production it is
+	// names.NewCachedSession over the same session, because discordgo's GuildMember is an
+	// unconditional REST GET and this was the last call site in the module without the cache
+	// M18 added for exactly this shape. Nil falls back to the state cache and the User
+	// lookup, which is what the tests use.
+	Members names.Session
+
+	Options Options
 }
 
 // New builds the reactor.
 func New(d Deps) *Service {
+	recorder := d.Recorder
+	if recorder == nil {
+		recorder = noRecorder{}
+	}
 	return &Service{
 		session: d.Session, store: d.Store, gate: d.Gate, guard: d.Guard,
 		learner: d.Learner, speaker: d.Speaker, memories: d.Memories, emoji: d.Emoji,
 		activity: d.Activity, aggro: d.Aggro, images: d.Images, games: d.Games,
-		voice: d.Voice, opts: d.Options,
+		voice: d.Voice, recorder: recorder, members: d.Members, opts: d.Options,
 	}
 }
 
@@ -367,6 +421,11 @@ func (s *Service) stepLearnGate(r *reaction) bool {
 // it toward the place it should be ignoring.
 func (s *Service) stepActivity(r *reaction) bool {
 	s.activity.Note(r.m.ChannelID, r.m.Author.ID)
+
+	// The tuning export's denominator, recorded from the same place and after the same gate,
+	// so "did anyone say anything after the bot spoke" counts only traffic the corpus was
+	// willing to see. Counting spam here would make a raid look like engagement.
+	s.recorder.NoteActivity(r.m.ChannelID)
 	return false
 }
 
@@ -419,50 +478,126 @@ func (s *Service) stepWordGame(r *reaction) bool {
 // A command is consumed even when it fails or is refused. An unauthorized !wordgame is still
 // a command rather than something to reply to.
 func (s *Service) stepCommands(r *reaction) bool {
-	cmd := commandFor(r.m.Content)
+	cmd, arg := commandFor(r.m.Content)
 	if cmd == "" {
 		return false
 	}
-	return s.games.Command(cmd, r.m.ChannelID, r.m.Author.ID, func(userID string) string {
+	// Counted by command, never by argument. A planted word is user text, and a usage tally
+	// carrying it would put arbitrary content into the tuning archive by a side door.
+	s.recorder.Count("command:" + cmd)
+	return s.games.Command(cmd, arg, r.m.ChannelID, r.m.Author.ID, func(userID string) string {
 		return s.displayName(r.m.GuildID, userID)
 	})
 }
 
-// commandFor recognizes a command, or returns "".
+// commandFor recognizes a command and its one optional argument, or returns "".
 //
-// It matches the WHOLE trimmed message, not a prefix. That is deliberate: a prefix match
-// would make it impossible to talk ABOUT a command, so "you should try !leaderboard
+// # It still matches the whole message, and that is what makes the argument safe
+//
+// A bare command matches the WHOLE trimmed message, not a prefix. That is deliberate: a prefix
+// match would make it impossible to talk ABOUT a command, so "you should try !leaderboard
 // sometime" would be swallowed and answered instead of being ordinary chat.
-func commandFor(content string) string {
-	switch strings.ToLower(strings.TrimSpace(content)) {
-	case "!leaderboard":
-		return "!leaderboard"
-	case "!wordgame":
-		return "!wordgame"
+//
+// The argument form preserves exactly that property by accepting only TWO tokens whose FIRST is
+// the command. "you should try !wordgame sometime" is four tokens and does not match; "!wordgame
+// banana pancakes" is three and does not either. The alternative, taking everything after the
+// command, would have made a sentence containing "!wordgame" into an invocation with the rest of
+// the sentence as its word.
+//
+// Only !wordgame takes one. !leaderboard renders the invoker's own rank and has nothing to name.
+func commandFor(content string) (cmd, arg string) {
+	fields := strings.Fields(strings.ToLower(strings.TrimSpace(content)))
+	switch len(fields) {
+	case 1:
+		switch fields[0] {
+		case "!leaderboard", "!wordgame":
+			return fields[0], ""
+		}
+	case 2:
+		// Letters only, checked HERE as well as in the Manager. This one is about what counts
+		// as an invocation: "!wordgame :)" should stay chat rather than becoming a command that
+		// answers with a refusal, and the Manager's check is about what can be a puzzle.
+		if fields[0] == "!wordgame" && isWord(fields[1]) {
+			return fields[0], fields[1]
+		}
 	}
-	return ""
+	return "", ""
+}
+
+// isWord reports whether a token is letters and nothing else.
+func isWord(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if !unicode.IsLetter(r) {
+			return false
+		}
+	}
+	return true
 }
 
 // displayName resolves a user ID to the best available name: guild nickname, then username,
 // then the raw ID.
 //
+// Three sources, cheapest first, and the order is the point.
+//
+//  1. The gateway state cache, which costs NOTHING. discordgo already holds members it has
+//     seen, and the leaderboard is asking about people who have just been talking, so this
+//     answers most of it.
+//  2. s.members, which in production is names.NewCachedSession: bounded, with a TTL, and
+//     shared with the ingest and mention paths. discordgo's GuildMember is an unconditional
+//     REST GET with no state-cache check, which is why that wrapper exists at all (M18). This
+//     call site never got it until M21a and was the last uncached one.
+//  3. A plain User lookup for somebody who has left the guild.
+//
 // The ID fallback is deliberate rather than an error path. A leaderboard that omits whoever
 // has left the server silently loses entries, and one that fails entirely because of a single
 // departed member is worse than one showing a number for them.
 func (s *Service) displayName(guildID, userID string) string {
-	if member, err := s.session.GuildMember(guildID, userID); err == nil && member != nil {
-		if member.Nick != "" {
-			return member.Nick
-		}
-		if member.User != nil {
-			return member.User.Username
+	if s.session != nil && s.session.State != nil {
+		if member, err := s.session.State.Member(guildID, userID); err == nil && member != nil {
+			if name := memberName(member); name != "" {
+				return name
+			}
 		}
 	}
-	if user, err := s.session.User(userID); err == nil && user != nil {
-		return user.Username
+	if s.members != nil {
+		if member, err := s.members.GuildMember(guildID, userID); err == nil && member != nil {
+			if name := memberName(member); name != "" {
+				return name
+			}
+		}
+	}
+	if s.session != nil {
+		if user, err := s.session.User(userID); err == nil && user != nil {
+			return user.Username
+		}
 	}
 	log.Printf("[LEADERBOARD] Could not resolve a name for user ID %s", userID)
 	return userID
+}
+
+// memberName picks the best spelling off a member, or "" when it carries none.
+//
+// GlobalName before Username, which is the order names.Spellings uses and the reason it exists:
+// since Discord usernames became lowercase handles, the global display name is the one most
+// people actually type and recognise. Three sites hand-built this before M14 and all three
+// threw it away.
+func memberName(m *discordgo.Member) string {
+	if m == nil {
+		return ""
+	}
+	if m.Nick != "" {
+		return m.Nick
+	}
+	if m.User == nil {
+		return ""
+	}
+	if m.User.GlobalName != "" {
+		return m.User.GlobalName
+	}
+	return m.User.Username
 }
 
 // stepAggro hands the message to the aggro feature.
@@ -504,6 +639,11 @@ func (s *Service) stepClassify(r *reaction) bool {
 		r.referenced = ref
 		if ref.Author != nil && ref.Author.ID == s.botID {
 			r.flags["REPLY_TO_BOT"] = true
+
+			// A human answering the bot, which is the strongest signal the export can get
+			// that a reply landed. Free here: this branch already exists to decide whether
+			// to reply, so nothing extra is fetched or computed.
+			s.recorder.NoteReply(ref.ID)
 		}
 	}
 
@@ -618,6 +758,12 @@ func (s *Service) stepReply(r *reaction) bool {
 		}
 	}
 
+	// The trace is allocated unconditionally, which costs one struct on a path that is
+	// already opening a read transaction and walking a corpus. Making it conditional would
+	// mean this package knowing whether the export is on, which is precisely the knowledge
+	// the Recorder seam exists to keep out of here.
+	var trace generate.Trace
+
 	reply, outcome, err := s.speaker.Sentence(generate.Request{
 		Prompt:       prompt,
 		Context:      context,
@@ -625,9 +771,34 @@ func (s *Service) stepReply(r *reaction) bool {
 		Roast:        roast,
 		Memory:       s.memories.For(m.ChannelID),
 		Emoji:        s.emoji,
+		Trace:        &trace,
 	})
+
+	// record closes over everything the export wants, so each of the four ways out of this
+	// function below records once and cannot forget a field. THE SILENT OUTCOMES MATTER MOST:
+	// "the bot said nothing" is the case where the seed tier and the starved-step count are
+	// the only evidence there is, and it is the one an operator on a young corpus has to
+	// diagnose (finding 32 made it visible in the log; this makes it countable).
+	record := func(sentID, text string, sent bool) {
+		s.recorder.Record(tuning.Generation{
+			ID:         sentID,
+			Trigger:    "reply",
+			Channel:    m.ChannelID,
+			Prompt:     prompt,
+			HasContext: context != "",
+			Names:      contextNames,
+			Roast:      roast,
+			Reply:      text,
+			Outcome:    outcome.String(),
+			Sent:       sent,
+			Took:       time.Since(replyStart),
+			Trace:      &trace,
+		})
+	}
+
 	if err != nil {
 		log.Printf("[ERR] reply generation failed: %v", err)
+		record("", "", false)
 		return false
 	}
 	if reply == "" {
@@ -647,6 +818,7 @@ func (s *Service) stepReply(r *reaction) bool {
 			// Unreachable: Produced with an empty string would be a bug in generate.
 			log.Printf("[RESP] nothing to say to %s, and no reason was given", m.Author.Username)
 		}
+		record("", "", false)
 		return false
 	}
 
@@ -657,10 +829,17 @@ func (s *Service) stepReply(r *reaction) bool {
 		&discordgo.MessageReference{MessageID: m.ID, ChannelID: m.ChannelID})
 	if !ok {
 		// The guard has already logged whether this was a refusal or a failure, and which.
+		//
+		// NO TEXT IN THE EXPORT for this one, which is the point of routing it through the
+		// same helper as the successes rather than skipping it. The guard refuses on the
+		// emit gate among other things, and internal/safety deliberately never records the
+		// offending content anywhere: a telemetry file is not an exception to that.
 		log.Printf("[RESP] reply to %s was not sent", m.Author.Username)
+		record("", "", false)
 		return false
 	}
 	log.Printf("[RESP] replied to %s in %s: %q", m.Author.Username, time.Since(replyStart), reply)
+	record(sent.ID, reply, true)
 
 	s.selfLearn(r, sent.ID, reply)
 	return false
