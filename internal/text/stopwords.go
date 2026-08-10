@@ -80,6 +80,20 @@ func IsDanglingTail(lower string) bool {
 	return ok
 }
 
+// determiners bind rightward to the noun they introduce, so nothing may be inserted after
+// one. "the tbh bird" is the failure; see markov.safeInsertPositions.
+var determiners = map[string]struct{}{
+	"a": {}, "an": {}, "the": {}, "this": {}, "that": {}, "these": {}, "those": {},
+	"my": {}, "your": {}, "his": {}, "her": {}, "its": {}, "our": {}, "their": {},
+	"every": {}, "each": {}, "another": {}, "some": {}, "any": {}, "no": {},
+}
+
+// IsDeterminer reports whether a lowercased token introduces a noun phrase.
+func IsDeterminer(lower string) bool {
+	_, ok := determiners[lower]
+	return ok
+}
+
 // conjunctions cannot begin a reply, because they promise a clause that was never there.
 //
 // The mirror of danglingTails and deliberately much smaller. A reply may open on a

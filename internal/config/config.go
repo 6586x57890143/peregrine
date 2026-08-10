@@ -93,6 +93,8 @@ type Config struct {
 	// passes resume from a stored per-channel cursor. The old meaning was the mechanism
 	// behind finding 13, since re-reading a window whose dedup record had been evicted
 	// counted the same n-grams twice.
+	AssocBackfill            bool          // PEREGRINE_ASSOC_BACKFILL
+	AssocBackfillBefore      time.Time     // PEREGRINE_ASSOC_BACKFILL_BEFORE
 	IngestTick               time.Duration // PEREGRINE_INGEST_TICK
 	IngestLookback           time.Duration // PEREGRINE_INGEST_LOOKBACK
 	IngestBatchDelay         time.Duration // PEREGRINE_INGEST_BATCH_DELAY
@@ -334,6 +336,11 @@ func Load() (*Config, error) {
 
 		SelfMention: l.regex("PEREGRINE_SELF_MENTION_PATTERN", `(?i)\b(peregrine|bird)\b`),
 
+		// The one-shot association re-walk (finding 46). Default OFF: it re-reads the whole
+		// of history, which is an operator's decision rather than a deploy's.
+		AssocBackfill:       l.boolVal("PEREGRINE_ASSOC_BACKFILL", false),
+		AssocBackfillBefore: l.timestamp("PEREGRINE_ASSOC_BACKFILL_BEFORE"),
+
 		IngestTick:       l.dur("PEREGRINE_INGEST_TICK", 10*time.Minute, time.Minute, 24*time.Hour),
 		IngestLookback:   l.dur("PEREGRINE_INGEST_LOOKBACK", 24*time.Hour, time.Minute, 30*24*time.Hour),
 		IngestBatchDelay: l.dur("PEREGRINE_INGEST_BATCH_DELAY", 500*time.Millisecond, 0, time.Minute),
@@ -435,6 +442,18 @@ func Load() (*Config, error) {
 	// The old arrangement had the feature const false AND the channel list
 	// empty, so flipping either one alone produced no posts and no explanation
 	// of why. Naming both variables in the error is the entire point.
+	// The association re-walk needs its boundary, and naming both variables is the point:
+	// the mistake is in their relationship rather than in either value. Without a boundary
+	// the pass would walk all of history and re-count associations for every message the
+	// fixed writer has already handled since M14, which is the double-counting the
+	// time bound exists to make impossible (finding 46).
+	if cfg.AssocBackfill && cfg.AssocBackfillBefore.IsZero() {
+		l.errs = append(l.errs, errors.New(
+			"PEREGRINE_ASSOC_BACKFILL is true but PEREGRINE_ASSOC_BACKFILL_BEFORE is unset: "+
+				"set it to the RFC3339 instant the association fix deployed, because only messages "+
+				"older than that were learned without associations and walking newer ones would "+
+				"count them twice"))
+	}
 	if cfg.EnableAutonomousPost && len(cfg.AutonomousPostChannels) == 0 {
 		l.errs = append(l.errs, errors.New(
 			"PEREGRINE_ENABLE_AUTONOMOUS_POST is true but PEREGRINE_AUTONOMOUS_POST_CHANNELS is empty: "+
@@ -604,6 +623,25 @@ func (l *loader) boolVal(key string, def bool) bool {
 // csv splits a comma-separated list, dropping empty entries so a trailing comma
 // or a value of "," does not produce a channel ID of "" that matches nothing and
 // looks like a configured channel.
+// timestamp reads an RFC3339 instant, or the zero Time when unset.
+//
+// Unset is not an error here, because the variable is only meaningful when
+// PEREGRINE_ASSOC_BACKFILL is on, and Load reports THAT combination rather than this
+// field in isolation. A value that does not parse is always an error, per the rule that a
+// bad value must never fall back to a default.
+func (l *loader) timestamp(key string) time.Time {
+	raw, ok := os.LookupEnv(key)
+	if !ok || raw == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		l.errs = append(l.errs, fmt.Errorf("%s=%q is not an RFC3339 timestamp (want 2026-08-09T21:00:00Z)", key, raw))
+		return time.Time{}
+	}
+	return t
+}
+
 func (l *loader) csv(key string) []string {
 	v := os.Getenv(key)
 	if strings.TrimSpace(v) == "" {
