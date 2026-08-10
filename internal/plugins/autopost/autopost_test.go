@@ -45,7 +45,8 @@ type fakeSpeaker struct {
 	mems    []*generate.Memory
 }
 
-func (s *fakeSpeaker) Sentence(prompt string, _ bool, mem *generate.Memory, _ generate.EmojiResolver) (string, generate.Outcome, error) {
+func (s *fakeSpeaker) Sentence(req generate.Request) (string, generate.Outcome, error) {
+	prompt, mem := req.Prompt, req.Memory
 	s.prompts = append(s.prompts, prompt)
 	s.mems = append(s.mems, mem)
 	return s.reply, s.outcome, nil

@@ -95,7 +95,7 @@ type Voice interface {
 // re-seed dead-ended" or "the author gate refused everything" with no way to tell, so a bot
 // that had learned 27 messages and stayed quiet reported nothing an operator could act on.
 type Speaker interface {
-	Sentence(prompt string, roast bool, mem *generate.Memory, emoji generate.EmojiResolver) (string, generate.Outcome, error)
+	Sentence(req generate.Request) (string, generate.Outcome, error)
 }
 
 // Options are the dials this package reads.
@@ -276,6 +276,10 @@ type reaction struct {
 	// nine REST calls where three would do.
 	mentioned    []names.User
 	mentionedSet bool
+
+	// referenced is the message this one replies to, when there is one. Filled by
+	// stepClassify and read by stepReply, so the fetch happens once.
+	referenced *discordgo.Message
 }
 
 // step is one stage of handling. It reports whether it CONSUMED the message.
@@ -370,8 +374,24 @@ func (s *Service) stepActivity(r *reaction) bool {
 //
 // Per channel, so context does not bleed across unrelated threads (finding G8). Never
 // consumes: remembering is not answering.
+//
+// MENTIONS ARE SUBSTITUTED FIRST, which they were not. Without it the memory stores <@123>
+// blobs where a name belongs, and those reach the recent seed tier and the recency term as
+// opaque tokens that match nothing. stepReply and stepLearn both already do this; memory was
+// the one path that did not, which is M14's gap one step over. s.mentions is memoized on the
+// reaction and two later steps call it anyway, so this costs no extra REST call.
+//
+// The names are recorded alongside the words so that WHO the channel was talking about decays
+// at the same rate as WHAT it said.
 func (s *Service) stepMemory(r *reaction) bool {
-	s.memories.For(r.m.ChannelID).Add(r.m.Content)
+	mentioned := s.mentions(r)
+
+	about := make([]string, 0, len(mentioned))
+	for _, u := range mentioned {
+		about = append(about, u.Username)
+	}
+
+	s.memories.For(r.m.ChannelID).Add(names.Substitute(r.m.Content, mentioned), about)
 	return false
 }
 
@@ -466,9 +486,23 @@ func (s *Service) stepClassify(r *reaction) bool {
 		r.flags["MENTIONED"] = true
 	}
 
-	if m.MessageReference != nil && m.MessageReference.MessageID != "" && m.MessageReference.ChannelID != "" {
-		if ref, err := s.session.ChannelMessage(m.MessageReference.ChannelID, m.MessageReference.MessageID); err == nil &&
-			ref != nil && ref.Author != nil && ref.Author.ID == s.botID {
+	// THE REFERENCED MESSAGE, kept rather than discarded (SPEC.md section 8, finding 50).
+	//
+	// This used to make a REST call, read ref.Author.ID to set one boolean, and throw the
+	// content away. The content is exactly the context a reply needs, and it was already being
+	// paid for.
+	//
+	// The gateway payload usually carries it, so the REST call is now a FALLBACK and the
+	// request count goes down. It cannot be deleted: discordgo documents three distinct nil
+	// cases, and only one of them (Discord did not attempt the fetch) is worth retrying.
+	//
+	// A FORWARD is not a reply. MessageReference.Type distinguishes them and the old check
+	// ignored it, so a forwarded message triggered a fetch that could never identify a bot
+	// author. A forward also carries snapshots rather than a referenced message, so there is
+	// nothing here to answer.
+	if ref := s.referenced(m); ref != nil {
+		r.referenced = ref
+		if ref.Author != nil && ref.Author.ID == s.botID {
 			r.flags["REPLY_TO_BOT"] = true
 		}
 	}
@@ -487,6 +521,39 @@ func (s *Service) stepClassify(r *reaction) bool {
 		r.flags["SELF_MENTION_KEYWORD"] = true
 	}
 	return false
+}
+
+// referenced returns the message m replies to, preferring the gateway payload.
+//
+// Three things this has to get right, and the old inline version got one of them:
+//
+//   - A FORWARD IS NOT A REPLY. MessageReference.Type distinguishes them, and a forward
+//     carries message snapshots rather than a referenced message, so there is nothing to
+//     answer and the fetch below could never succeed at identifying an author.
+//   - ReferencedMessage is usually already on the payload for an ordinary reply, so asking
+//     Discord again is asking the network for something already in hand, which is finding
+//     17's shape. Preferring it makes this path cost FEWER requests than it used to.
+//   - A nil ReferencedMessage is ambiguous. discordgo documents three cases: not a reply,
+//     a reply Discord chose not to fetch, and a reply whose target was deleted. Only the
+//     middle one is worth a REST call, and the other two make it fail harmlessly, so the
+//     fallback stays rather than being cleverly conditioned.
+func (s *Service) referenced(m *discordgo.MessageCreate) *discordgo.Message {
+	ref := m.MessageReference
+	if ref == nil || ref.MessageID == "" || ref.ChannelID == "" {
+		return nil
+	}
+	if ref.Type == discordgo.MessageReferenceTypeForward {
+		return nil
+	}
+	if m.ReferencedMessage != nil {
+		return m.ReferencedMessage
+	}
+
+	got, err := s.session.ChannelMessage(ref.ChannelID, ref.MessageID)
+	if err != nil {
+		return nil
+	}
+	return got
 }
 
 // stepReply generates and posts a reply when the bot was addressed.
@@ -529,7 +596,36 @@ func (s *Service) stepReply(r *reaction) bool {
 		}
 	}
 
-	reply, outcome, err := s.speaker.Sentence(prompt, roast, s.memories.For(m.ChannelID), s.emoji)
+	// THE REFERENCED MESSAGE STEERS, IT DOES NOT SEED. That distinction is the whole rule:
+	// the referenced message says what we are talking about, the prompt says what was said to
+	// me. Generation puts Context into the topic and association terms and never into the
+	// prompt set or the prompt seed tier, because starting a reply on a third party's phrasing
+	// is answering the wrong message.
+	//
+	// It is not learned here either, and that is not an omission: it is already in the corpus
+	// under its own message ID, and learning it again would count its n-grams twice.
+	var (
+		context      string
+		contextNames []string
+	)
+	if ref := r.referenced; ref != nil && ref.Content != "" && ref.Author != nil && ref.Author.ID != s.botID {
+		// The bot's own messages are excluded on purpose. Its output already re-enters the
+		// corpus through selfLearn, and feeding it back as context as well is a loop that
+		// makes the bot progressively more like itself.
+		context = names.Substitute(ref.Content, names.Spellings(ref.Author, ref.Member))
+		if ref.Author.Username != "" {
+			contextNames = append(contextNames, ref.Author.Username)
+		}
+	}
+
+	reply, outcome, err := s.speaker.Sentence(generate.Request{
+		Prompt:       prompt,
+		Context:      context,
+		ContextNames: contextNames,
+		Roast:        roast,
+		Memory:       s.memories.For(m.ChannelID),
+		Emoji:        s.emoji,
+	})
 	if err != nil {
 		log.Printf("[ERR] reply generation failed: %v", err)
 		return false
@@ -601,6 +697,13 @@ func (s *Service) selfLearn(r *reaction, replyID, replyContent string) {
 	// contributes nothing to author diversity (SPEC.md section 4, A6).
 	mentioned := s.mentions(r)
 	channelID := r.m.ChannelID
+
+	// THE BOT HEARS ITSELF NOW. Its replies were written to the corpus and never added to
+	// conversation memory, so the one participant that speaks in every exchange was the only
+	// one absent from the channel's record of what was being discussed. Added synchronously,
+	// before the goroutine, because Memory is in-process and ordering matters: the reply
+	// should be the freshest entry when the next message arrives.
+	s.memories.For(channelID).Add(replyContent, nil)
 
 	go func() {
 		if err := s.store.Update(func(w *storage.Writer) error {

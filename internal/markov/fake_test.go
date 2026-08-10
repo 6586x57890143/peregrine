@@ -241,14 +241,14 @@ func testParams() Params {
 // caller in production always has them.
 func newStep(prefix []string) *Step {
 	return &Step{
-		Prefix:     prefix,
-		Sentence:   append([]string{}, prefix...),
-		PromptSet:  map[string]struct{}{},
-		RecentSet:  map[string]struct{}{},
-		Used:       map[string]int{},
-		Ngrams:     map[string]struct{}{},
-		CoreTopics: map[string]float64{},
-		NameAssoc:  map[string]corpus.TopicAssoc{},
-		Length:     Length{Min: 4, Max: 18, Target: 8},
+		Prefix:        prefix,
+		Sentence:      append([]string{}, prefix...),
+		PromptSet:     map[string]struct{}{},
+		RecentWeights: map[string]float64{},
+		Used:          map[string]int{},
+		Ngrams:        map[string]struct{}{},
+		CoreTopics:    map[string]float64{},
+		NameAssoc:     map[string]corpus.TopicAssoc{},
+		Length:        Length{Min: 4, Max: 18, Target: 8},
 	}
 }

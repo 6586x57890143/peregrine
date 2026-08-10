@@ -45,9 +45,16 @@ type Step struct {
 	// Prompt is the original prompt text, for the similarity term.
 	Prompt string
 
-	// PromptSet and RecentSet are normalized word sets.
+	// PromptSet is the normalized set of words the user actually typed.
 	PromptSet map[string]struct{}
-	RecentSet map[string]struct{}
+
+	// RecentWeights is the conversation context, token to how recent it is in [0, 1].
+	//
+	// GRADED rather than a set, which is finding 48. It was a set, so RecentContext at 0.25
+	// paid a word from the fiftieth-oldest message exactly what it paid one from the message
+	// immediately before this reply. The weighting existed upstream and was collapsed away
+	// here. Because the value is already bounded by construction the term needs no tanh.
+	RecentWeights map[string]float64
 
 	// Used counts how often each word has been emitted in this sentence, and Ngrams
 	// holds the 1, 2 and 3-grams already produced.
@@ -326,8 +333,8 @@ func (g *Generator) heuristics(s *Step, c candidate, assoc assocCache) float64 {
 	if _, ok := s.PromptSet[tok]; ok {
 		logit += g.params.PromptRelevance
 	}
-	if _, ok := s.RecentSet[tok]; ok {
-		logit += w.RecentContext
+	if weight := s.RecentWeights[tok]; weight > 0 {
+		logit += w.RecentContext * weight
 	}
 
 	// PROMPT GRAVITY IS GONE, and it was three things at once, none of them what it claimed

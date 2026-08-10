@@ -51,7 +51,7 @@ type Guard interface {
 // Speaker produces a sentence, and says why when it does not. internal/generate's Generator
 // satisfies it.
 type Speaker interface {
-	Sentence(prompt string, roast bool, mem *generate.Memory, emoji generate.EmojiResolver) (string, generate.Outcome, error)
+	Sentence(req generate.Request) (string, generate.Outcome, error)
 }
 
 // Options are the dials.
@@ -158,7 +158,14 @@ func (s *Service) post() {
 	// Seeded with the CHANNEL'S OWN recent context. The old code passed the channel's
 	// LastMessageID: a snowflake, tokenized into a meaningless integer and fed to the
 	// generator as if somebody had said it.
-	msg, outcome, err := s.speaker.Sentence("autonomous thought", false, s.memories.For(channelID), s.emoji)
+	// The prompt is a fixed literal, so for THIS caller the channel's conversation memory is
+	// the only context there is. That is what makes the graded recency in M19 matter most
+	// here: an unprompted post steered by nothing is a non-sequitur by construction.
+	msg, outcome, err := s.speaker.Sentence(generate.Request{
+		Prompt: "autonomous thought",
+		Memory: s.memories.For(channelID),
+		Emoji:  s.emoji,
+	})
 	if err != nil {
 		log.Println("[AUTONOMOUS] Error generating message:", err)
 		return
