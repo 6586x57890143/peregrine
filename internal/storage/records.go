@@ -754,3 +754,58 @@ func (r *Reader) ForEachCursor(fn func(channelID, messageID string) error) error
 		return fn(string(k), decodeSnowflake(v))
 	})
 }
+
+// AssocCursor and SetAssocCursor are the association re-walk's own high-water marks.
+//
+// A SEPARATE BUCKET from the ingest cursor, and that separation is the whole reason the
+// re-walk is safe to run at all. The two passes read the same channels for different
+// reasons and at different speeds: ingest is asking "what is new" and must never rewind,
+// while the re-walk is asking "what is old" and finishes. Sharing one mark would mean
+// either pass moving the other's, and moving the ingest mark backwards is finding 13.
+func (r *Reader) AssocCursor(channelID string) string {
+	b := r.bucket(bucketAssocCursor)
+	if b == nil {
+		return ""
+	}
+	v := b.Get([]byte(channelID))
+	if len(v) == 0 {
+		return ""
+	}
+	return decodeSnowflake(v)
+}
+
+// SetAssocCursor advances the re-walk's mark, refusing to move backwards for the same
+// reason SetCursor does: a batch processed out of order would otherwise cause the same
+// messages to have their associations counted twice.
+func (w *Writer) SetAssocCursor(channelID, messageID string) error {
+	if channelID == "" {
+		return fmt.Errorf("refusing to store an association cursor for an empty channel ID")
+	}
+	next, err := encodeSnowflake(messageID)
+	if err != nil {
+		return fmt.Errorf("association cursor for channel %s: %w", channelID, err)
+	}
+
+	b := w.bucket(bucketAssocCursor)
+	if current := b.Get([]byte(channelID)); len(current) > 0 && bytes.Compare(next, current) <= 0 {
+		return nil
+	}
+	return b.Put([]byte(channelID), next)
+}
+
+// AssocBackfillState reports whether the association re-walk has run. See finding 46.
+func (r *Reader) AssocBackfillState() string {
+	b := r.bucket(bucketMeta)
+	if b == nil {
+		return AssocBackfillPending
+	}
+	return string(b.Get([]byte(metaAssocBackfill)))
+}
+
+// SetAssocBackfillState records progress through the re-walk.
+//
+// Persisted rather than held in memory because the walk spans hours and restarts, and the
+// marker is what stops a completed pass from running again on every boot.
+func (w *Writer) SetAssocBackfillState(state string) error {
+	return w.bucket(bucketMeta).Put([]byte(metaAssocBackfill), []byte(state))
+}

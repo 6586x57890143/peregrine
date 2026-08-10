@@ -35,6 +35,7 @@ func clearEnv(t *testing.T) {
 		"PEREGRINE_WORDGAME_INTERVAL", "PEREGRINE_WORDGAME_DICTIONARY",
 		"PEREGRINE_ENABLE_TRANSCRIPTION", "PEREGRINE_TRANSCRIPTION_QUEUE",
 		"PEREGRINE_BACKUP_DIR", "PEREGRINE_BACKUP_TICK", "PEREGRINE_BACKUP_KEEP",
+		"PEREGRINE_ASSOC_BACKFILL", "PEREGRINE_ASSOC_BACKFILL_BEFORE",
 	}
 	for k := range deferredVars {
 		keys = append(keys, k)
@@ -554,5 +555,61 @@ func TestLevel(t *testing.T) {
 		if got := cfg.Level().String(); got != wantString {
 			t.Errorf("LOG_LEVEL=%q gave level %s, want %s", in, got, wantString)
 		}
+	}
+}
+
+// TestAssocBackfillNeedsItsBoundary.
+//
+// The pass is additive rather than a drop-and-rebuild precisely because it stops at the
+// instant the association fix deployed. Without that boundary it would walk all of history and
+// re-count associations for every message the fixed writer has already handled, which is the
+// double-counting the bound exists to make impossible (finding 46). Naming both variables is
+// the point: the mistake is in their relationship.
+func TestAssocBackfillNeedsItsBoundary(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("PEREGRINE_ASSOC_BACKFILL", "true")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("the backfill enabled with no boundary loaded cleanly, so it would re-walk " +
+			"history that already has correct associations")
+	}
+	for _, want := range []string{"PEREGRINE_ASSOC_BACKFILL", "PEREGRINE_ASSOC_BACKFILL_BEFORE"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not name %s: %v", want, err)
+		}
+	}
+}
+
+// TestAssocBackfillBeforeMustParse, per the rule that a bad value is a startup error and never
+// a silent fallback to the default. A fallback here would be a zero time, which reads as "walk
+// nothing" and would make an enabled pass do nothing at all.
+func TestAssocBackfillBeforeMustParse(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("PEREGRINE_ASSOC_BACKFILL", "true")
+	t.Setenv("PEREGRINE_ASSOC_BACKFILL_BEFORE", "last tuesday")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("an unparseable timestamp loaded cleanly")
+	} else if !strings.Contains(err.Error(), "RFC3339") {
+		t.Errorf("the error does not say what format is wanted: %v", err)
+	}
+}
+
+// TestAssocBackfillAcceptsAValidBoundary, the control.
+func TestAssocBackfillAcceptsAValidBoundary(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("PEREGRINE_ASSOC_BACKFILL", "true")
+	t.Setenv("PEREGRINE_ASSOC_BACKFILL_BEFORE", "2026-08-09T21:00:00Z")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.AssocBackfill {
+		t.Error("AssocBackfill is false after being set true")
+	}
+	if cfg.AssocBackfillBefore.IsZero() {
+		t.Error("AssocBackfillBefore is zero after being set to a valid timestamp")
 	}
 }

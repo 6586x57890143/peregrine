@@ -440,13 +440,75 @@ func TestStopWordsAreExcludedFromAssociations(t *testing.T) {
 // the package and asserts the gate call is inside Learner.Message's own body. If someone
 // hoists it to the callers for performance, or adds a fifth caller that forgets it, every
 // behavioural test above still passes and this fails.
-func TestTheGateIsInsideMessageNotAtItsCallers(t *testing.T) {
-	fn := findMethod(t, "Message")
-	if !containsCall(fn.Body, "CheckLearn") {
-		t.Error("Learner.Message does not call CheckLearn. That check must live INSIDE this " +
-			"function, because it has multiple callers and a check at one call site is not a " +
-			"check. See SPEC.md section 4, A1.")
+// TestEveryWriterEntryPointCallsCheckLearn.
+//
+// This began as a check that Learner.Message contains a CheckLearn call, which was the whole
+// of A1's structural fix while Message was the only way into the corpus. M17 added
+// Associations, and a test naming one method would have been blind to it: that is finding
+// 31's shape exactly, a rule applied to one of two producers.
+//
+// So the claim is widened rather than duplicated. EVERY exported method on *Learner that
+// takes a *storage.Writer must contain the call in its own body, which means a third entry
+// point is covered by the rule that already exists rather than by somebody remembering.
+//
+// Deliberately literal about "in its own body". Routing both through a shared helper would
+// satisfy a looser test and would put one hop between the entry point and the gate, which the
+// next refactor turns into two.
+func TestEveryWriterEntryPointCallsCheckLearn(t *testing.T) {
+	entries := writerEntryPoints(t)
+	if len(entries) < 2 {
+		t.Fatalf("found %d writing entry points, expected at least Message and Associations: "+
+			"if this test cannot see them it cannot enforce anything", len(entries))
 	}
+
+	for _, fn := range entries {
+		if !containsCall(fn.Body, "CheckLearn") {
+			t.Errorf("Learner.%s takes a *storage.Writer and does not call CheckLearn. That "+
+				"check must live INSIDE every entry point, because a check at one of them is "+
+				"not a check. See SPEC.md section 4, A1.", fn.Name.Name)
+		}
+	}
+}
+
+// writerEntryPoints returns every exported *Learner method that can write to the corpus.
+func writerEntryPoints(t *testing.T) []*ast.FuncDecl {
+	t.Helper()
+
+	var out []*ast.FuncDecl
+	for _, file := range parsePackage(t) {
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Recv == nil || !fn.Name.IsExported() || fn.Body == nil {
+				continue
+			}
+			if takesWriter(fn) {
+				out = append(out, fn)
+			}
+		}
+	}
+	return out
+}
+
+// takesWriter reports whether a function has a *storage.Writer parameter.
+func takesWriter(fn *ast.FuncDecl) bool {
+	if fn.Type.Params == nil {
+		return false
+	}
+	for _, param := range fn.Type.Params.List {
+		star, ok := param.Type.(*ast.StarExpr)
+		if !ok {
+			continue
+		}
+		sel, ok := star.X.(*ast.SelectorExpr)
+		if !ok {
+			continue
+		}
+		pkg, ok := sel.X.(*ast.Ident)
+		if ok && pkg.Name == "storage" && sel.Sel.Name == "Writer" {
+			return true
+		}
+	}
+	return false
 }
 
 // TestVerdictHasNoFieldForRewrittenText pins reject-never-launder at the type level.
@@ -473,21 +535,6 @@ func TestVerdictHasNoFieldForRewrittenText(t *testing.T) {
 			}
 		}
 	}
-}
-
-// findMethod returns the named method declaration from this package.
-func findMethod(t *testing.T, name string) *ast.FuncDecl {
-	t.Helper()
-	for _, file := range parsePackage(t) {
-		for _, decl := range file.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if ok && fn.Name.Name == name && fn.Recv != nil {
-				return fn
-			}
-		}
-	}
-	t.Fatalf("method %s not found in this package", name)
-	return nil
 }
 
 // parsePackage parses every non-test file here.
@@ -575,4 +622,133 @@ func structFields(t *testing.T, pkg, typeName string) []string {
 		t.Fatalf("found no fields on %s.%s; this test proves nothing", pkg, typeName)
 	}
 	return out
+}
+
+// TestAssociationsWritesOnlyTheTwoAssociationIndexes is the pin for the whole safety argument
+// behind a second entry point (SPEC.md section 8, finding 46).
+//
+// The association re-walk re-reads history that has ALREADY been learned. If this method
+// touched anything else, every message it repaired would have its n-grams counted twice, its
+// author's weekly stat bumped again, or a live dedup entry evicted from a capped window.
+// Asserting "associations changed" is the easy half; asserting nothing else moved is the half
+// that matters, so every other counter is checked explicitly.
+func TestAssociationsWritesOnlyTheTwoAssociationIndexes(t *testing.T) {
+	s, l := fixture(t)
+	who := author(7)
+
+	// A message learned the normal way first, which is the state the re-walk finds: n-grams
+	// present, associations missing because the old backfill wrote none.
+	learnOne(t, s, l, "greg is coping about the queue", snowflake(400), who)
+
+	type snapshot struct {
+		ngrams  map[string]corpus.Successor
+		learned uint64
+		history uint64
+		topics  uint64
+		stat    corpus.WeeklyStat
+		name    corpus.Name
+	}
+	take := func() snapshot {
+		var snap snapshot
+		if err := s.View(func(r *storage.Reader) error {
+			snap.ngrams = map[string]corpus.Successor{}
+			got, err := r.Successors("greg is")
+			if err != nil {
+				return err
+			}
+			for _, sc := range got {
+				snap.ngrams[sc.Token] = sc
+			}
+			snap.learned = r.MessagesLearned()
+			snap.history = r.HistoryCount()
+			snap.topics = r.TotalTopicCount()
+			snap.stat, _, _ = r.UserStat(who.UserID)
+			snap.name, _, _ = r.Name(who.Username)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return snap
+	}
+
+	before := take()
+
+	if err := s.Update(func(w *storage.Writer) error {
+		return l.Associations(w, "greg is coping about the queue", who, nil)
+	}); err != nil {
+		t.Fatalf("Associations: %v", err)
+	}
+
+	after := take()
+
+	if len(after.ngrams) != len(before.ngrams) {
+		t.Errorf("the n-gram set changed size, %d to %d", len(before.ngrams), len(after.ngrams))
+	}
+	for tok, sc := range after.ngrams {
+		if was := before.ngrams[tok]; sc.Count != was.Count {
+			t.Errorf("n-gram %q count moved from %d to %d: re-reading history through this "+
+				"method would double-count every message it repairs (finding 13)",
+				tok, was.Count, sc.Count)
+		}
+	}
+	if after.learned != before.learned {
+		t.Errorf("messages-learned counter moved from %d to %d", before.learned, after.learned)
+	}
+	if after.history != before.history {
+		t.Errorf("history count moved from %d to %d: filling the capped dedup window with old "+
+			"message IDs would evict the live entries that stop real double-learning",
+			before.history, after.history)
+	}
+	if after.topics != before.topics {
+		t.Errorf("topic total moved from %d to %d; topic counts are written outside associate's "+
+			"guard and were already correct", before.topics, after.topics)
+	}
+	if after.stat.Count != before.stat.Count {
+		t.Errorf("the author's weekly count moved from %d to %d", before.stat.Count, after.stat.Count)
+	}
+	if after.name.Count != before.name.Count {
+		t.Errorf("Name.Count moved from %d to %d: names.Record bumps it on every call, and the "+
+			"historical pass already recorded these people", before.name.Count, after.name.Count)
+	}
+
+	// And the thing it is FOR actually happened.
+	var assoc map[string]corpus.TopicAssoc
+	if err := s.View(func(r *storage.Reader) error {
+		var err error
+		assoc, err = r.NameTopicsFor(who.Username)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(assoc) == 0 {
+		t.Error("no name associations were written, so the pass repairs nothing")
+	}
+}
+
+// TestAssociationsRefusesWhatTheGateRefuses, behaviourally, so the AST test is not the only
+// thing holding the gate in place on this path.
+func TestAssociationsRefusesWhatTheGateRefuses(t *testing.T) {
+	s, l := fixture(t)
+	who := author(7)
+
+	if err := s.Update(func(w *storage.Writer) error {
+		return l.Associations(w, "greg said exampleslur about the queue", who, nil)
+	}); err != nil {
+		t.Fatalf("Associations: %v", err)
+	}
+
+	if err := s.View(func(r *storage.Reader) error {
+		for _, word := range []string{"greg", "exampleslur", "queue"} {
+			got, err := r.TopicWordsFor(word)
+			if err != nil {
+				return err
+			}
+			if len(got) != 0 {
+				t.Errorf("blocked content produced associations for %q: %v", word, got)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 }

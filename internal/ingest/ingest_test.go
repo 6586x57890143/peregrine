@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -691,5 +692,72 @@ func TestManyGuildsAndChannelsConcurrently(t *testing.T) {
 	}
 	if l.total() != wantMsgs {
 		t.Errorf("learner saw %d messages, want %d", l.total(), wantMsgs)
+	}
+}
+
+// TestWalkStopsAtTheUntilBound is the pin for the association re-walk's whole safety argument
+// (SPEC.md section 8, finding 46).
+//
+// That pass repairs messages learned BEFORE a fix deployed, and it is additive rather than a
+// drop-and-rebuild precisely because it stops at the fix's instant: everything newer already
+// has correct associations, so walking it would count them twice. If this bound leaks, the
+// pass silently double-counts and nothing downstream can tell.
+func TestWalkStopsAtTheUntilBound(t *testing.T) {
+	f := newFake()
+	f.guilds = []*discordgo.UserGuild{{ID: "g1", Name: "guild"}}
+	f.channels["g1"] = []*discordgo.Channel{{ID: "c1", Name: "general", Type: discordgo.ChannelTypeGuildText}}
+
+	base := time.Now().Add(-72 * time.Hour)
+	boundary := base.Add(2 * time.Hour)
+	for i := range 6 {
+		at := base.Add(time.Duration(i) * time.Hour)
+		f.messages["c1"] = append(f.messages["c1"], msg(at, i, "message "+strconv.Itoa(i)))
+	}
+
+	rec := newLearner()
+	in := New(f, newCursors(), rec, nil, Options{
+		Lookback: 365 * 24 * time.Hour,
+		Until:    boundary,
+	})
+	if _, err := in.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// The messages at base+0h and base+1h are older than the bound. The one AT base+2h must
+	// not be learned, because "at or after" is where the fixed writer starts.
+	if got := len(rec.order); got != 2 {
+		t.Fatalf("learned %d messages, want the 2 strictly older than the bound: %v",
+			got, rec.order)
+	}
+	for _, m := range f.messages["c1"] {
+		learned := rec.count(m.ID) > 0
+		wantLearned := m.Timestamp.Before(boundary)
+		if learned != wantLearned {
+			t.Errorf("message at %s: learned=%v, want %v (bound %s)",
+				m.Timestamp.Format(time.RFC3339), learned, wantLearned,
+				boundary.Format(time.RFC3339))
+		}
+	}
+}
+
+// TestWalkWithNoUntilBoundIsUnchanged, so the zero value cannot quietly become a filter for
+// every existing caller.
+func TestWalkWithNoUntilBoundIsUnchanged(t *testing.T) {
+	f := newFake()
+	f.guilds = []*discordgo.UserGuild{{ID: "g1", Name: "guild"}}
+	f.channels["g1"] = []*discordgo.Channel{{ID: "c1", Name: "general", Type: discordgo.ChannelTypeGuildText}}
+
+	base := time.Now().Add(-72 * time.Hour)
+	for i := range 4 {
+		f.messages["c1"] = append(f.messages["c1"], msg(base.Add(time.Duration(i)*time.Hour), i, "m"))
+	}
+
+	rec := newLearner()
+	in := New(f, newCursors(), rec, nil, Options{Lookback: 365 * 24 * time.Hour})
+	if _, err := in.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := len(rec.order); got != 4 {
+		t.Errorf("learned %d of 4 messages with no bound set", got)
 	}
 }
