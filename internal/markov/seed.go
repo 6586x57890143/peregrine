@@ -32,25 +32,6 @@ import (
 // The second change is that weights are additive in a log-space draw rather than raw
 // multipliers in a linear one, matching the rest of the engine.
 
-// Seed tier weights.
-//
-// These were the legacy weights, preserved through M7a so that a change in output could be
-// attributed to the two-hop tier rather than to a simultaneous retuning. That reason has
-// expired, and reading them against each other turned up two real problems, so the ladder is
-// respaced here.
-//
-// FIRST, THE BONUSES WERE UNBOUNDED. Each association tier added a bare
-// math.Sqrt(count) to its base weight, so a tier could climb straight out of its own band:
-// at 50 recorded co-occurrences the name-topic tier reached 32, above the 30 a word the user
-// actually typed gets. That is finding G2's shape in the seed selector rather than the
-// scorer, and the scorer's own rule is the fix: every term that sums over evidence is
-// squashed so it cannot exceed its own weight. assocSpread is that cap here, so each tier
-// occupies a band it cannot leave and the ordering below is the ordering that happens.
-//
-// SECOND, ONE TIER WAS DEAD. weightPromptWord added single prompt words at 15.0, but tier 1
-// runs n down to 1 and had already added exactly those keys at 30.0, and add() keeps the
-// maximum. It could never win. Deleted rather than fixed: the question it asked was already
-// answered one tier up, which is finding 28's shape.
 // seedTier identifies where a candidate came from. HIGHEST PRECEDENCE FIRST: a key that
 // qualifies under two tiers is counted in the earlier one.
 //
@@ -847,4 +828,33 @@ func TrimDangling(sentence []string, choseEnd bool) []string {
 		break
 	}
 	return sentence[:end]
+}
+
+// SeedTopic reduces a seed to the single word the sentence is about.
+//
+// Step.CurrentTopic used to be the seed verbatim (SPEC.md section 8, finding 44). A seed is
+// a stored n-gram prefix and is therefore usually several words, while topic_word is keyed by
+// single words, so TopicWordsFor("what do you know") returned an EMPTY NON-NIL map. That
+// passes the `a != nil` guard in the scorer and then never matches a candidate, so the 0.35
+// CurrentTopic term was silently absent for roughly nine sentences in ten. It got worse as
+// the corpus grew, because more long prompt windows gain successors and win the seed draw.
+//
+// The LAST content word rather than the first, because that is the word the chain actually
+// continues from and therefore the one whose associations describe where the sentence is.
+//
+// Exported because production and the golden harness both set CurrentTopic, and two callers
+// computing "what topic is this sentence in" is how they come to disagree.
+func SeedTopic(seed string) string {
+	words := strings.Fields(seed)
+	for i := len(words) - 1; i >= 0; i-- {
+		if !text.IsStopWord(words[i]) {
+			return words[i]
+		}
+	}
+	// All function words. Returning the last one is better than returning the whole phrase,
+	// which is guaranteed to miss, and the scorer treats "" as no topic at all.
+	if len(words) > 0 {
+		return words[len(words)-1]
+	}
+	return ""
 }

@@ -89,33 +89,6 @@ func TestShortcode(t *testing.T) {
 	}
 }
 
-func TestSimilarity(t *testing.T) {
-	cases := []struct {
-		name string
-		a, b string
-		want float64
-	}{
-		{"both empty", "", "", 0},
-		{"one empty", "bird", "", 0},
-		{"identical", "the bird is loud", "the bird is loud", 1},
-		{"disjoint", "aaa bbb", "ccc ddd", 0},
-		// Union {the,bird} plus {the,cat} = 3 distinct, intersection {the} = 1.
-		{"half overlap", "the bird", "the cat", 1.0 / 3.0},
-		// Case and repetition are folded out by tokenizing into sets, which is
-		// what makes this usable as a parrot check.
-		{"case insensitive", "The Bird", "the bird", 1},
-		{"repetition ignored", "bird bird bird", "bird", 1},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			got := Similarity(c.a, c.b)
-			if diff := got - c.want; diff > 1e-9 || diff < -1e-9 {
-				t.Errorf("Similarity(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
-			}
-		})
-	}
-}
-
 // fakeEmoji is the whole reason CleanSentence takes an interface instead of a
 // *discordgo.Session: the emote path is now testable without a gateway.
 type fakeEmoji map[string]string

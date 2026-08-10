@@ -3,6 +3,8 @@ package markov
 import (
 	"math"
 	"strings"
+
+	"github.com/6586x57890143/peregrine/internal/text"
 )
 
 // The persona layer: ONE mechanism where there were two.
@@ -125,13 +127,18 @@ func Style(src Source, w Weights, s string, p Persona, aboutName bool) string {
 		chance = w.StyleChanceName
 	}
 	if p == PersonaRoast {
-		chance = math.Min(1.0, chance*1.3)
+		chance *= 1.3
 	}
 
 	// Longer sentences carry filler better than short ones, so intensity scales with
 	// length. Kept from legacy, which had the same idea with the numbers inline.
 	lengthFactor := math.Min(1.0, float64(len(fields))/20.0)
 	chance *= 0.7 + 0.6*lengthFactor
+
+	// THE CAP GOES LAST OR IT IS NOT A CAP. It used to sit on the roast multiplier, before
+	// the length factor multiplied the result again, so a long reply about a named person in
+	// roast mode reached a chance above 1.0 and filler was certain rather than likely.
+	chance = math.Min(1.0, chance)
 
 	if src.Float64() >= chance {
 		return s
@@ -143,11 +150,23 @@ func Style(src Source, w Weights, s string, p Persona, aboutName bool) string {
 	case 1:
 		return s + " " + closers[src.IntN(len(closers))]
 	case 2:
-		return insertAt(fields, interjections[src.IntN(len(interjections))], insertPos(src, len(fields)))
+		pos := insertPos(src, safeInsertPositions(fields))
+		if pos < 0 {
+			// NO SAFE POSITION MEANS NO FILLER, rather than falling back to an opener or a
+			// closer. Two reasons: saying less is this repo's direction for a failure that
+			// reads as a malfunction, and redistributing this branch's probability into the
+			// other two would silently change the mix of the four styles, which is exactly
+			// what a before-and-after golden read needs to stay attributable.
+			return s
+		}
+		return insertAt(fields, interjections[src.IntN(len(interjections))], pos)
 	default:
 		// A meta-comment attaches to the end of a word rather than standing alone, so
 		// it reads as an aside rather than as a dropped token.
-		pos := insertPos(src, len(fields))
+		pos := insertPos(src, safeInsertPositions(fields))
+		if pos < 0 {
+			return s
+		}
 		out := append([]string(nil), fields...)
 		out[pos-1] += " " + metaComments[src.IntN(len(metaComments))]
 		return strings.Join(out, " ")
@@ -159,7 +178,44 @@ func (g *Generator) Style(s string, p Persona, aboutName bool) string {
 	return Style(g.src, g.weights, s, p, aboutName)
 }
 
-// insertPos picks where filler goes, weighted toward the middle.
+// safeInsertPositions returns the interior positions where filler can go without splitting a
+// construction. Position p means "between fields[p-1] and fields[p]".
+//
+// # Why this exists (SPEC.md section 8, finding 45)
+//
+// Style is the FOURTH producer of words in the pipeline, after the sampler, the seed and the
+// dead-end jump, and it was the only one with no rule about what it was joining. It spliced
+// by position alone and produced "why would ngl you say" in live output, splitting a modal
+// from its subject. Jump got "NOT AFTER A FUNCTION WORD" in M14 for exactly this failure; a
+// rule applied to three of four producers is not a rule.
+//
+// # The two conditions, and why it is not "neither neighbour is a function word"
+//
+// That stricter rule is the obvious one and it is wrong, which measuring said and reasoning
+// did not. Filler sitting between a copula and a participle is the natural home of an
+// adverb: "alexiane ratioed greg is lowkey coping" and "what is lowkey starting drama again"
+// both read correctly, and both have a function word on the left. Rejecting them would cost
+// good output for nothing.
+//
+// What actually breaks is inserting BEFORE a function word, because a function word binds
+// leftward to what it follows: "are | like | you", "do | ngl | you", "server | ngl | is".
+// The one case that misses is a determiner on the left, which binds rightward to its noun:
+// "the | tbh | bird". So the rule is those two conditions and no more.
+func safeInsertPositions(fields []string) []int {
+	if len(fields) <= 2 {
+		return nil
+	}
+	out := make([]int, 0, len(fields))
+	for p := 1; p <= len(fields)-1; p++ {
+		if text.IsStopWord(fields[p]) || text.IsDeterminer(fields[p-1]) {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// insertPos picks one of the candidate positions, weighted toward the middle.
 //
 // This is the part of the old implementation that was actually wrong rather than merely
 // duplicated: it used `1 + rand.IntN(len(fields)-2)`, a flat draw over the interior. A
@@ -167,16 +223,18 @@ func (g *Generator) Style(s string, p Persona, aboutName bool) string {
 // the middle, and at the edges an interjection reads as a typo. A triangular draw, the
 // average of two uniforms, concentrates on the middle with no tuning constant.
 //
-// Returns a position in [1, n-1], so filler never precedes the first word (that is what
-// an opener is for) and never follows the last (that is a closer).
-func insertPos(src Source, n int) int {
-	if n <= 2 {
-		return 1
+// The draw is over the index into the candidate list rather than over the raw span, so the
+// mid-sentence preference survives the filter above.
+func insertPos(src Source, positions []int) int {
+	switch len(positions) {
+	case 0:
+		return -1
+	case 1:
+		return positions[0]
 	}
-	span := n - 1 // valid positions are 1..n-1
-	a := src.IntN(span)
-	b := src.IntN(span)
-	return 1 + (a+b)/2
+	a := src.IntN(len(positions))
+	b := src.IntN(len(positions))
+	return positions[(a+b)/2]
 }
 
 // insertAt splices a word into a field slice at pos.
