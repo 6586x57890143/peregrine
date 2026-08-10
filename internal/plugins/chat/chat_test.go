@@ -110,11 +110,17 @@ type fakeSpeaker struct {
 	// inferred from whether something was posted.
 	prompts []string
 	roasts  []bool
+
+	// The whole Request, so the reply-chain rule is observable rather than inferred.
+	reqs []generate.Request
 }
 
-func (s *fakeSpeaker) Sentence(prompt string, roast bool, _ *generate.Memory, _ generate.EmojiResolver) (string, generate.Outcome, error) {
+func (s *fakeSpeaker) Sentence(req generate.Request) (string, generate.Outcome, error) {
+	prompt, roast := req.Prompt, req.Roast
+	_ = roast
 	s.prompts = append(s.prompts, prompt)
 	s.roasts = append(s.roasts, roast)
+	s.reqs = append(s.reqs, req)
 	return s.reply, s.outcome, nil
 }
 
@@ -753,5 +759,155 @@ func TestOrdinaryChatDoesNotTriggerAReply(t *testing.T) {
 				t.Errorf("replied to ordinary chat: %v", posts)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------- context (M19)
+
+// replyTo builds a message that replies to another, the way the gateway delivers one:
+// MessageReference plus the referenced message inline.
+func replyTo(content string, ref *discordgo.Message) *discordgo.MessageCreate {
+	m := message(content).m
+	m.MessageReference = &discordgo.MessageReference{
+		MessageID: ref.ID,
+		ChannelID: m.ChannelID,
+	}
+	m.ReferencedMessage = ref
+	return m
+}
+
+// TestTheReferencedMessageSteersButIsNotThePrompt is the pin for the one rule context obeys.
+//
+// The referenced message says what we are talking about; the prompt says what was said to me.
+// Only the prompt may seed, both may steer. If the referenced content leaked into Prompt the
+// bot would be answering the wrong message, and generation would be free to start a reply on a
+// third party's phrasing.
+func TestTheReferencedMessageSteersButIsNotThePrompt(t *testing.T) {
+	s, _, _, _, _, _ := fixture(t)
+	speaker := &fakeSpeaker{reply: "sure"}
+	s.speaker = speaker
+
+	ref := &discordgo.Message{
+		ID:      snowflake(50),
+		Content: "greg is coping about the queue",
+		Author:  &discordgo.User{ID: snowflake(9), Username: "carol"},
+	}
+	m := replyTo("<@"+s.botID+"> what do you think", ref)
+
+	s.handle(m)
+
+	if len(speaker.reqs) != 1 {
+		t.Fatalf("generation was asked %d times, want 1", len(speaker.reqs))
+	}
+	req := speaker.reqs[0]
+
+	if strings.Contains(req.Prompt, "coping") {
+		t.Errorf("the referenced message leaked into the prompt: %q", req.Prompt)
+	}
+	if !strings.Contains(req.Context, "coping") {
+		t.Errorf("the referenced message did not reach Context: %q", req.Context)
+	}
+	if len(req.ContextNames) == 0 {
+		t.Error("the referenced message's author was not offered as a context name")
+	}
+}
+
+// TestTheBotsOwnMessageIsNotContext.
+//
+// Its output already re-enters the corpus through selfLearn. Feeding it back as context too is
+// a loop that makes each reply more like the last one.
+func TestTheBotsOwnMessageIsNotContext(t *testing.T) {
+	s, _, _, _, _, _ := fixture(t)
+	speaker := &fakeSpeaker{reply: "sure"}
+	s.speaker = speaker
+
+	ref := &discordgo.Message{
+		ID:      snowflake(60),
+		Content: "the bird is loose again",
+		Author:  &discordgo.User{ID: s.botID, Username: "peregrine"},
+	}
+	s.handle(replyTo("<@"+s.botID+"> ok", ref))
+
+	if len(speaker.reqs) != 1 {
+		t.Fatalf("generation was asked %d times, want 1", len(speaker.reqs))
+	}
+	if speaker.reqs[0].Context != "" {
+		t.Errorf("the bot's own message was used as context: %q", speaker.reqs[0].Context)
+	}
+}
+
+// TestAForwardIsNotAReply.
+//
+// MessageReference.Type distinguishes a forward from a reply, and the old check ignored it, so
+// a forwarded message triggered a REST fetch that could never identify a bot author. A forward
+// also carries snapshots rather than a referenced message, so there is nothing here to answer.
+func TestAForwardIsNotAReply(t *testing.T) {
+	s, _, _, _, _, _ := fixture(t)
+	speaker := &fakeSpeaker{reply: "sure"}
+	s.speaker = speaker
+
+	m := message("<@" + s.botID + "> look at this").m
+	m.MessageReference = &discordgo.MessageReference{
+		Type:      discordgo.MessageReferenceTypeForward,
+		MessageID: snowflake(69),
+		ChannelID: m.ChannelID,
+	}
+	m.ReferencedMessage = &discordgo.Message{
+		ID:      snowflake(69),
+		Content: "something forwarded",
+		Author:  &discordgo.User{ID: snowflake(8), Username: "dave"},
+	}
+
+	s.handle(m)
+
+	if len(speaker.reqs) != 1 {
+		t.Fatalf("generation was asked %d times, want 1", len(speaker.reqs))
+	}
+	if speaker.reqs[0].Context != "" {
+		t.Errorf("a forwarded message was treated as a reply chain: %q", speaker.reqs[0].Context)
+	}
+}
+
+// TestTheBotHearsItself.
+//
+// selfLearn wrote the reply to the corpus and never added it to conversation memory, so the one
+// participant present in every exchange was the only one missing from the channel's record of
+// what was being discussed.
+func TestTheBotHearsItself(t *testing.T) {
+	s, _, guard, _, _, _ := fixture(t)
+	s.speaker = &fakeSpeaker{reply: "absolutely cooked honestly"}
+
+	m := message("<@" + s.botID + "> hello").m
+	s.handle(m)
+
+	if len(guard.replies) == 0 {
+		t.Fatal("nothing was posted, so there is no reply to remember")
+	}
+
+	w := s.memories.For(m.ChannelID).Weights()
+	if w["cooked"] == 0 {
+		t.Errorf("the bot's own reply is absent from conversation memory: %v", w)
+	}
+}
+
+// TestMemoryStoresNamesRatherThanMentionMarkup.
+//
+// stepReply and stepLearn both substitute mentions; memory was the one path that did not, so it
+// stored <@123> blobs where a name belongs and those reached the recent seed tier as tokens
+// that match nothing.
+func TestMemoryStoresNamesRatherThanMentionMarkup(t *testing.T) {
+	s, _, _, _, _, _ := fixture(t)
+
+	m := message("hello <@" + snowflake(7) + "> how are you").m
+	// Resolvable, because Substitute deliberately leaves an ID it does not know exactly as it
+	// was: an unresolved mention is still a word in the middle of a sentence, and dropping it
+	// would cost the structure around it.
+	m.Mentions = []*discordgo.User{{ID: snowflake(7), Username: "greg", GlobalName: "greg"}}
+	s.handle(m)
+
+	for token := range s.memories.For(m.ChannelID).Weights() {
+		if strings.HasPrefix(token, "<@") {
+			t.Errorf("conversation memory stored raw mention markup: %q", token)
+		}
 	}
 }

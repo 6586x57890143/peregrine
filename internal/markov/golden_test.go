@@ -2,6 +2,7 @@ package markov
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 
@@ -63,7 +64,22 @@ func generate(g *Generator, prompt string, persona Persona) []string {
 		}
 	}
 
-	seedIn := SeedInput{PromptWords: promptWords, Names: names, NameTokens: nameTokens}
+	// THE CONVERSATION MEMORY, which this harness did not have at all until now.
+	//
+	// RecentMessages was never set and RecentSet was left empty, so the recent seed tier and
+	// the recency term had never once appeared in a printed sample: every context-aware part
+	// of the engine was invisible to the only instrument for judging output. That is the third
+	// time this shape has turned up, after M14 found the harness resolving no Names and M16
+	// found Style called with aboutName hardcoded false. An instrument that silently omits a
+	// code path reports on a bot that does not exist.
+	recentMessages, recentWeights := harnessMemory()
+
+	seedIn := SeedInput{
+		PromptWords:    promptWords,
+		RecentMessages: recentMessages,
+		Names:          names,
+		NameTokens:     nameTokens,
+	}
 	seed := g.Seed(seedIn)
 	if seed == "" {
 		if len(promptWords) == 0 {
@@ -76,19 +92,19 @@ func generate(g *Generator, prompt string, persona Persona) []string {
 	length := NewLength(g.src, g.params.MinWords, g.params.MaxWords)
 
 	s := &Step{
-		Prompt:       prompt,
-		PromptSet:    map[string]struct{}{},
-		RecentSet:    map[string]struct{}{},
-		Used:         map[string]int{},
-		Ngrams:       map[string]struct{}{},
-		CoreTopics:   map[string]float64{},
-		NameAssoc:    nameAssoc,
-		PromptNames:  promptNames,
-		Length:       length,
-		Persona:      persona,
-		Prefix:       append([]string{}, words...),
-		Sentence:     append([]string{}, words...),
-		CurrentTopic: SeedTopic(seed),
+		Prompt:        prompt,
+		PromptSet:     map[string]struct{}{},
+		RecentWeights: recentWeights,
+		Used:          map[string]int{},
+		Ngrams:        map[string]struct{}{},
+		CoreTopics:    map[string]float64{},
+		NameAssoc:     nameAssoc,
+		PromptNames:   promptNames,
+		Length:        length,
+		Persona:       persona,
+		Prefix:        append([]string{}, words...),
+		Sentence:      append([]string{}, words...),
+		CurrentTopic:  SeedTopic(seed),
 	}
 	for _, w := range promptWords {
 		s.PromptSet[w] = struct{}{}
@@ -331,4 +347,57 @@ func ExampleGenerator_Next() {
 	next, _ := g.Next(&Step{Prefix: []string{"bird", "is"}, Length: Length{Min: 4, Max: 18, Target: 8}})
 	fmt.Println(next)
 	// Output: loose
+}
+
+// harnessTranscript is a small fixed conversation the harness pretends preceded every prompt.
+//
+// Fixed rather than generated, and short rather than realistic, because its job is to make the
+// recency path VISIBLE in printed samples rather than to be a second corpus. Every line is in
+// the fixture's register and touches a different one of its topic clusters, so a reply steered
+// by recency is recognisable as such when reading the sweep.
+//
+// Oldest first, matching Memory.Messages.
+//
+// IT USES ONLY BRIDGE VOCABULARY, never a word from distinctiveWords, and that constraint is
+// load-bearing rather than stylistic. The prompt-responsiveness gate scores a reply by whose
+// distinctive words it contains, so a transcript mentioning nurock or pizza would push those
+// words into replies and the gate would be measuring the transcript instead of the prompt. The
+// first draft did exactly that, and raising RecentContext appeared to improve topicality when
+// it was really improving the overlap between two parts of the instrument.
+//
+// The same rule as the fixture itself: an instrument has to be built to exclude the thing it
+// is trying to measure.
+func harnessTranscript() []string {
+	return []string{
+		"the queue is cooked honestly",
+		"everyone is malding at this hour",
+		"we are all coping in queue",
+	}
+}
+
+// harnessMemory returns the transcript in the two shapes generation consumes, with the same
+// decay Memory applies.
+//
+// Duplicating the decay constant here rather than importing internal/generate is deliberate:
+// markov must not import it, and the number is one line. If they drift the samples get less
+// realistic, which is visible, rather than wrong, which would not be.
+func harnessMemory() ([][]string, map[string]float64) {
+	const decayPerMessage = 0.8
+
+	lines := harnessTranscript()
+	messages := make([][]string, 0, len(lines))
+	weights := map[string]float64{}
+
+	for i, line := range lines {
+		// Newest is 1.0, each older one faded once more.
+		decay := math.Pow(decayPerMessage, float64(len(lines)-1-i))
+		words := strings.Fields(line)
+		messages = append(messages, words)
+		for _, w := range words {
+			if decay > weights[w] {
+				weights[w] = decay
+			}
+		}
+	}
+	return messages, weights
 }

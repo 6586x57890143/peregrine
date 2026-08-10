@@ -1,6 +1,7 @@
 package markov
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"testing"
@@ -65,9 +66,34 @@ func sourceBigrams() map[string]map[int]struct{} {
 // tuning decisions are actually made against.
 func sweepSamples(t *testing.T) []string {
 	t.Helper()
+	out := make([]string, 0, 256)
+	for _, s := range sweepAttributed(t) {
+		out = append(out, s.line)
+	}
+	return out
+}
+
+// sample is one generated line and the prompt that produced it.
+type sample struct {
+	prompt string
+	line   string
+
+	// cell identifies the temperature, top-k and styled combination, so a variety gate can
+	// ask whether the draws WITHIN one configuration differ without comparing across
+	// configurations that are meant to differ.
+	cell string
+}
+
+// sweepAttributed generates the grid and keeps which prompt produced each line.
+//
+// sweepSamples used to be this without the attribution, which the two gates added in M19 both
+// need: "did the reply answer its prompt" and "is one phrase answering every prompt" are both
+// questions about the pairing rather than about the lines.
+func sweepAttributed(t *testing.T) []sample {
+	t.Helper()
 
 	f := goldenCorpus()
-	var out []string
+	var out []sample
 	for _, temp := range []float64{0.7, 1.0, 1.6} {
 		for _, topK := range []int{0, 40} {
 			p := testParams()
@@ -81,10 +107,23 @@ func sweepSamples(t *testing.T) []string {
 				// splices AFTER TrimDangling has run, so a sample that skips it cannot say
 				// whether the finished string is well formed.
 				for _, styled := range []bool{false, true} {
-					g := New(f, p, seeded(0xC0FFEE, 0xBADF00D))
+					// A DIFFERENT SEED PER PASS, and this was a real defect rather than a
+					// refinement. Both passes used seeded(0xC0FFEE, 0xBADF00D), so the styled
+					// run replayed the identical stream and produced the same text plus
+					// filler: half the sweep was a decorated copy of the other half. Every
+					// rate computed over it was therefore computed over a sample set that was
+					// half duplicates, which matters most for the variety gate below, where
+					// duplication is the thing being measured.
+					seed := uint64(0xBADF00D)
+					if styled {
+						seed = 0x5CA1AB1E
+					}
+					g := New(f, p, seeded(0xC0FFEE, seed))
+
+					cell := fmt.Sprintf("t=%.1f k=%d styled=%v", temp, topK, styled)
 					for range 3 {
 						if line := generateReply(g, prompt, PersonaNeutral, styled); line != "" {
-							out = append(out, line)
+							out = append(out, sample{prompt: prompt, line: line, cell: cell})
 						}
 					}
 				}
@@ -369,4 +408,299 @@ func longestFiller() int {
 		}
 	}
 	return longest
+}
+
+// ---------------------------------------------------------------- criterion 7
+
+// minTopicalRatio is how much more a reply must be about the person its prompt named than
+// about the other four people in the fixture.
+//
+// MEASURED, not chosen, and measured twice. On the engine before M19's context work, 144
+// name-bearing samples gave 40 on-topic hits against 30 off-topic, a ratio of 1.33. With graded
+// recency at its shipped weight the same sweep gives 44 against 16, a ratio of 2.75.
+//
+// The floor sits well below the achieved value on purpose. The number that matters is not how
+// high the ratio is but whether it can fall to 1.0, which is chance, or below it, which is the
+// bot answering about somebody else entirely. The counts are small enough that the ratio is
+// jumpy, so a floor close to the measurement would fail on noise rather than on a regression.
+//
+// It is a modest ratio and that is the fixture rather than the engine: the corpus is built on
+// shared idioms so that recombination has somewhere to come from, and those bridges produce
+// genuine cross-talk. A fixture with cleanly separated topics would score far higher here and
+// would be a worse instrument for every other gate.
+const minTopicalRatio = 1.40
+
+// minEngagementRate is how often a reply to a prompt naming somebody must actually engage with
+// that person, by naming them or by using vocabulary the corpus ties to them.
+//
+// This is the second half of the gate and it exists because the ratio above has a blind spot
+// found by reading samples: a reply saying nothing about anybody contributes to neither side,
+// so a bot that went quiet on every named prompt would score a perfect ratio. The two together
+// say "engage, and engage with the right person".
+//
+// MEASURED at the shipped weights: of 144 name-bearing samples, 50.0% engage, 11.1% reach for
+// the wrong person and 38.9% do neither. The floor is set at the operator's stated target of
+// roughly one reply in three rather than at the measurement, because that target is the
+// requirement and the surplus is headroom.
+const minEngagementRate = 0.33
+
+// TestGoldenSamplesRespondToTheirPrompt is SPEC.md section 5.5 criterion 7.
+//
+// # The hole it closes
+//
+// Nothing else in the suite asserts that a reply has anything to do with what was said to it.
+// Recitation, spans-sources and the length-and-artifact gate would all pass a bot that ignored
+// its prompt completely and emitted well-formed, recombined, correctly-lengthed corpus soup.
+// Criterion 4 is pinned by TestSeedDrawsTheNameOftenEnoughToNotice, which measures the SEED
+// draw and says nothing about the finished reply.
+//
+// # Why it is discriminative rather than a threshold on overlap
+//
+// An absolute "the reply must share N words with the prompt" is satisfied by a fixture that is
+// topically narrow, and it would measure ECHO rather than aboutness: a reply that parrots the
+// prompt back scores perfectly and is the failure mode next door. So this compares each reply
+// against the person its prompt named versus the four it did not, using only the vocabulary
+// that actually distinguishes them (see distinctiveWords, which is fixture data for exactly
+// this reason).
+//
+// AGGREGATE, never per reply. The fixture's bridge words exist to make recombination possible
+// and produce cross-talk on purpose; asserting per reply would be asserting that the bridges
+// do not work.
+func TestGoldenSamplesRespondToTheirPrompt(t *testing.T) {
+	samples := sweepAttributed(t)
+	if len(samples) == 0 {
+		t.Fatal("no samples generated, so this gate would pass vacuously")
+	}
+
+	dist := distinctiveWords()
+	people := make([]string, 0, len(dist))
+	for p := range dist {
+		people = append(people, p)
+	}
+	sort.Strings(people)
+
+	var onTopic, offTopic, named, engaged, wrongPerson int
+	for _, s := range samples {
+		inPrompt := map[string]bool{}
+		for _, p := range people {
+			if strings.Contains(s.prompt, p) {
+				inPrompt[p] = true
+			}
+		}
+		if len(inPrompt) == 0 {
+			continue
+		}
+		named++
+
+		said := map[string]bool{}
+		for _, w := range strings.Fields(s.line) {
+			said[w] = true
+		}
+		var hitOwn, hitOther bool
+		for _, person := range people {
+			// Naming the person outright engages with them as surely as using their
+			// vocabulary does, and the seed's name tier exists to make it happen.
+			if inPrompt[person] && said[person] {
+				hitOwn = true
+			}
+			for _, w := range dist[person] {
+				if !said[w] {
+					continue
+				}
+				if inPrompt[person] {
+					onTopic++
+					hitOwn = true
+				} else {
+					offTopic++
+					hitOther = true
+				}
+			}
+		}
+		switch {
+		case hitOwn:
+			engaged++
+		case hitOther:
+			wrongPerson++
+		}
+	}
+
+	if named == 0 {
+		t.Fatal("no prompt in the sweep names anybody, so this gate cannot measure anything")
+	}
+
+	ratio := float64(onTopic) / float64(max(offTopic, 1))
+	rate := float64(engaged) / float64(named)
+	t.Logf("topicality: %d name-bearing samples, on-topic %d, off-topic %d, ratio %.2f (floor %.2f)",
+		named, onTopic, offTopic, ratio, minTopicalRatio)
+	t.Logf("engagement: %d of %d replies engage the person named (%.1f%%, floor %.0f%%); "+
+		"%d reach for somebody else", engaged, named, rate*100, minEngagementRate*100, wrongPerson)
+
+	if ratio < minTopicalRatio {
+		t.Errorf("replies are only %.2fx more about the person their prompt named than about "+
+			"somebody else, floor %.2f: at 1.0 the bot is answering at chance, which is the "+
+			"failure SPEC.md section 5.5 criterion 7 exists to catch", ratio, minTopicalRatio)
+	}
+	if rate < minEngagementRate {
+		t.Errorf("only %.1f%% of replies to a prompt naming somebody engage with that person, "+
+			"floor %.0f%%: the ratio above cannot catch this on its own, because a reply that "+
+			"says nothing about anybody counts on neither side of it",
+			rate*100, minEngagementRate*100)
+	}
+}
+
+// ---------------------------------------------------------------- criterion 8
+
+// The variety bounds, all three MEASURED on the engine as it stood when this gate was written
+// rather than chosen in advance.
+//
+// Baseline at that point, over 252 samples and 7 prompts: the worst trigram by share was
+// "going to lose" in 18.3% of samples across 4 prompts; the widest-spread was "the bird
+// ratioed" across 5 of 7 prompts at 8.7%; and 12 of 84 prompt-and-cell groups (14.3%) produced
+// three identical draws.
+//
+// The caps sit above those with room to move, because the question this gate answers is not
+// "is concentration low" but "is it getting worse". Some concentration is honest on a
+// 149-message fixture where the author-diversity gate admits only well-attested paths: the
+// engine is funnelled into the few phrases two people both said. A real corpus widens that
+// funnel by orders of magnitude, which is why these are not tuned toward zero.
+const (
+	maxAttractorShare  = 0.25
+	maxAttractorSpread = 6.0 / 7.0
+	maxIdenticalDraws  = 0.25
+)
+
+// attractorMinContent is how many of a trigram's three words must carry meaning before it
+// counts. Two, so that a run of function words shared by every sentence in English does not
+// register as the bot repeating itself.
+const attractorMinContent = 2
+
+// TestGoldenSamplesDoNotCollapseToOnePhrase is SPEC.md section 5.5 criterion 8.
+//
+// # The hole it closes
+//
+// Nothing measured variety at all. Every other gate is about one sample against the corpus;
+// none of them compares samples to each other, so the suite was silent on the failure where
+// one phrase becomes the answer to everything. Two shapes of it were visible in live output
+// and in the golden sweep, and both passed every existing assertion:
+//
+//   - CROSS-PROMPT. "i am going to lose it" answering "bro what", "the bird" and "bird what do
+//     you know about beezle" alike. One well-attested path sits at the centre of the corpus
+//     and the engine falls into it regardless of what was asked.
+//   - WITHIN-PROMPT. Three consecutive draws for "the server is" returning "the server is
+//     doomed" twice. Top-k and temperature are meaningless when the eligible set is one.
+//
+// # Why this ships with M19 rather than after it
+//
+// It is the gate the context work is most likely to break. Grading recency, recalling names
+// and feeding a referenced message all pull every reply toward the same recent material, which
+// is the same motion as falling into an attractor. A gate written after the change it polices
+// gets its threshold chosen to pass.
+//
+// What it must NOT flag is the register. The fixture defends verbatim memes on purpose:
+// "bird moment", "ratio ratio ratio", "no cap fr fr". A variety floor that treats those as
+// repetition is measuring the voice, which is the mistake the four-word recitation threshold
+// made once already.
+func TestGoldenSamplesDoNotCollapseToOnePhrase(t *testing.T) {
+	samples := sweepAttributed(t)
+	if len(samples) == 0 {
+		t.Fatal("no samples generated, so this gate would pass vacuously")
+	}
+
+	prompts := map[string]struct{}{}
+	share := map[string]int{}
+	spread := map[string]map[string]struct{}{}
+
+	for _, s := range samples {
+		prompts[s.prompt] = struct{}{}
+		words := strings.Fields(s.line)
+
+		// Counted once per sample, so a sentence that stutters does not inflate its own
+		// trigram's share. Stuttering is the repetition penalties' problem, not this gate's.
+		seen := map[string]struct{}{}
+		for i := 0; i+3 <= len(words); i++ {
+			content := 0
+			for _, w := range words[i : i+3] {
+				if !text.IsStopWord(w) {
+					content++
+				}
+			}
+			if content < attractorMinContent {
+				continue
+			}
+			key := strings.Join(words[i:i+3], " ")
+			if spread[key] == nil {
+				spread[key] = map[string]struct{}{}
+			}
+			spread[key][s.prompt] = struct{}{}
+			if _, dup := seen[key]; !dup {
+				seen[key] = struct{}{}
+				share[key]++
+			}
+		}
+	}
+
+	worstShare, worstShareKey := 0.0, ""
+	worstSpread, worstSpreadKey := 0.0, ""
+	for key, n := range share {
+		if s := float64(n) / float64(len(samples)); s > worstShare {
+			worstShare, worstShareKey = s, key
+		}
+		if s := float64(len(spread[key])) / float64(len(prompts)); s > worstSpread {
+			worstSpread, worstSpreadKey = s, key
+		}
+	}
+	t.Logf("attractors: worst share %.1f%% (%q), worst spread %.0f%% of prompts (%q)",
+		worstShare*100, worstShareKey, worstSpread*100, worstSpreadKey)
+
+	if worstShare > maxAttractorShare {
+		t.Errorf("the trigram %q is in %.1f%% of all replies, cap %.0f%%: one phrase is "+
+			"becoming the answer to everything", worstShareKey, worstShare*100, maxAttractorShare*100)
+	}
+	if worstSpread > maxAttractorSpread {
+		t.Errorf("the trigram %q appears in replies to %.0f%% of distinct prompts, cap %.0f%%: "+
+			"an answer that fits every question is not answering any of them",
+			worstSpreadKey, worstSpread*100, maxAttractorSpread*100)
+	}
+
+	// The within-prompt half. Grouped by prompt AND configuration, so this asks whether the
+	// three draws from one generator differ, not whether two different temperatures agree.
+	groups := map[string][]string{}
+	for _, s := range samples {
+		key := s.cell + "|" + s.prompt
+		groups[key] = append(groups[key], s.line)
+	}
+
+	identical, considered := 0, 0
+	var examples []string
+	for key, lines := range groups {
+		if len(lines) < 2 {
+			continue
+		}
+		considered++
+		same := true
+		for _, l := range lines[1:] {
+			if l != lines[0] {
+				same = false
+				break
+			}
+		}
+		if same {
+			identical++
+			examples = append(examples, key+" -> "+lines[0])
+		}
+	}
+	if considered == 0 {
+		t.Fatal("no prompt produced more than one draw, so the within-prompt half cannot measure anything")
+	}
+
+	rate := float64(identical) / float64(considered)
+	t.Logf("identical draws: %d of %d prompt-and-cell groups (%.1f%%, cap %.0f%%)",
+		identical, considered, rate*100, maxIdenticalDraws*100)
+
+	if rate > maxIdenticalDraws {
+		sort.Strings(examples)
+		t.Errorf("%.1f%% of prompt-and-cell groups produced three identical replies, cap %.0f%%: "+
+			"top-k and temperature are meaningless when the eligible set is one.\n  %s",
+			rate*100, maxIdenticalDraws*100, strings.Join(dedupe(examples), "\n  "))
+	}
 }
