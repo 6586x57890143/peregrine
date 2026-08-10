@@ -207,6 +207,29 @@ type Config struct {
 	BackupTick time.Duration // PEREGRINE_BACKUP_TICK
 	BackupKeep int           // PEREGRINE_BACKUP_KEEP
 
+	// The tuning export. Off by default and for the same reason as the backups above: no
+	// safe guess for a path, and the same read_only container caveat applies.
+	//
+	// This one writes MESSAGE TEXT, which the backups also do (the corpus is made of it) but
+	// in a form nobody would read by accident. Prompts and replies land in the export as
+	// plain lines, so the directory deserves the same handling as the corpus rather than
+	// being treated as logs. What it does NOT write is anything the emit gate refused: a
+	// sample whose send was turned down carries no text at all.
+	TuningDir              string        // PEREGRINE_TUNING_DIR
+	TuningRotate           time.Duration // PEREGRINE_TUNING_ROTATE
+	TuningKeep             int           // PEREGRINE_TUNING_KEEP
+	TuningSample           float64       // PEREGRINE_TUNING_SAMPLE
+	TuningEngagementWindow time.Duration // PEREGRINE_TUNING_ENGAGEMENT_WINDOW
+	TuningTrackMax         int           // PEREGRINE_TUNING_TRACK_MAX
+
+	// Version is stamped on every exported record so two archives can be told apart.
+	//
+	// It is an environment variable rather than a build stamp because .dockerignore excludes
+	// .git, so debug.ReadBuildInfo has no vcs revision inside the image. The deploy already
+	// knows the answer: docker-compose.prod.yml passes the image tag, which CI sets to the
+	// commit SHA it built.
+	Version string // PEREGRINE_VERSION
+
 	// Transcription. Off by default, and that default deliberately differs from
 	// the old in-code constant, which was true: transcription shells out to
 	// ffmpeg and whisper-cli and needs a 465 MiB model, none of which exist in a
@@ -444,6 +467,27 @@ func Load() (*Config, error) {
 		BackupDir:  l.str("PEREGRINE_BACKUP_DIR", ""),
 		BackupTick: l.dur("PEREGRINE_BACKUP_TICK", 24*time.Hour, time.Minute, 30*24*time.Hour),
 		BackupKeep: l.intVal("PEREGRINE_BACKUP_KEEP", 7, 1, 1000),
+
+		TuningDir:    l.str("PEREGRINE_TUNING_DIR", ""),
+		TuningRotate: l.dur("PEREGRINE_TUNING_ROTATE", 24*time.Hour, time.Minute, 30*24*time.Hour),
+		TuningKeep:   l.intVal("PEREGRINE_TUNING_KEEP", 14, 1, 1000),
+
+		// 1.0 records every generation attempt, which is the right default because a reply is
+		// rare compared to a message: the bot answers when addressed. Lower it only if the
+		// file is genuinely too large to move, and know what it costs, since a sampled
+		// archive cannot answer questions about rare outcomes.
+		TuningSample: l.float("PEREGRINE_TUNING_SAMPLE", 1.0, 0.001, 1.0),
+
+		// Ten minutes is long enough for a reaction and short enough that a restart does not
+		// truncate most windows. A truncated window is not lost, since the record carries the
+		// window it actually got, but a file full of two-minute windows measures less.
+		TuningEngagementWindow: l.dur("PEREGRINE_TUNING_ENGAGEMENT_WINDOW", 10*time.Minute, time.Minute, 6*time.Hour),
+
+		// Bounds the map of replies being watched. Keyed by message ID, so this is the bound
+		// that stops a leak this repository has shipped twice before.
+		TuningTrackMax: l.intVal("PEREGRINE_TUNING_TRACK_MAX", 500, 10, 100_000),
+
+		Version: l.str("PEREGRINE_VERSION", "dev"),
 
 		EnableTranscription: l.boolVal("PEREGRINE_ENABLE_TRANSCRIPTION", false),
 		TranscriptionQueue:  l.intVal("PEREGRINE_TRANSCRIPTION_QUEUE", 32, 1, 10_000),

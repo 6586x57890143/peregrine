@@ -73,7 +73,7 @@ func fixture(t *testing.T, o Options, traffic map[string]int) (*Service, *fakeGu
 
 	guard := &fakeGuard{}
 	speaker := &fakeSpeaker{reply: "the bird is loose in the server"}
-	s := New(guard, speaker, generate.NewMemories(0), tracker, chans, nil, o)
+	s := New(guard, speaker, generate.NewMemories(0), tracker, chans, nil, nil, o)
 	if err := s.Init(core.Deps{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}

@@ -88,6 +88,15 @@ type Step struct {
 	// Jumps counts the dead-end jumps this sentence has already taken. Jump reads it and
 	// increments it, so the count cannot drift away from the sentence it describes.
 	Jumps int
+
+	// Trace collects what the walk did, for the tuning export, or is nil.
+	//
+	// Here rather than on the Generator because the Generator holds no per-sentence state
+	// and is shared by every message goroutine: a counter on it would be a data race on the
+	// hottest path in the bot, which is finding 3 rebuilt deliberately. Nil is the normal
+	// case and every method on Trace guards its own receiver, so tracing off is one branch
+	// per step and no allocation.
+	Trace *Trace
 }
 
 // Next picks the continuation, or returns "" when there is nothing eligible.
@@ -109,13 +118,23 @@ func (g *Generator) Next(s *Step) (string, error) {
 		return "", err
 	}
 	if len(cands) == 0 {
+		// No continuation at any order. Distinct from the starved case below, and the
+		// distinction is the whole reason the trace splits them: this is a sparse corpus,
+		// that is the author-diversity gate ending the sentence.
+		s.Trace.deadEnd(false, 0)
 		return "", nil
 	}
 
+	// Counted before the filter, because eligible reuses the backing array and the count is
+	// gone the moment it returns.
+	before := len(cands)
 	cands = g.eligible(cands)
+	refused := before - len(cands)
 	if len(cands) == 0 {
+		s.Trace.deadEnd(true, refused)
 		return "", nil
 	}
+	s.Trace.step(m.minCtxWords, len(cands), refused)
 
 	assoc := g.loadAssoc(s)
 	for i := range cands {

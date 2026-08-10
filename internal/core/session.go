@@ -23,6 +23,19 @@ import (
 //
 // One intent fixes both (SPEC.md section 8, finding 7).
 //
+// IntentsGuildMessageReactions is new in M20 and is the tuning export's half. It is
+// NOT privileged, so it needs no Developer Portal change and cannot cause the 4014
+// close code WatchReady exists to diagnose. It buys the only engagement signal the
+// bot can observe without asking Discord for anything: whether somebody reacted to
+// what it said. Peregrine's whole tuning problem is that output quality has never
+// been measurable outside a synthetic fixture, and a reaction is the closest thing
+// to a human answering the question.
+//
+// It is requested unconditionally rather than only when the export is configured.
+// An intent is negotiated once at identify, so making it conditional would mean the
+// gateway connection differed by configuration, and turning the export on would then
+// need a reconnect rather than a restart. It costs one event type the bot ignores.
+//
 // MESSAGE CONTENT is privileged and is what the bot exists for: without it
 // Discord refuses the connection outright and peregrine can read nothing. That
 // is why callers must pair this with WatchReady rather than trusting Open to
@@ -34,6 +47,7 @@ func NewSession(token string) (*discordgo.Session, error) {
 	}
 	s.Identify.Intents = discordgo.IntentsGuilds |
 		discordgo.IntentsGuildMessages |
+		discordgo.IntentsGuildMessageReactions |
 		discordgo.IntentsMessageContent
 	return s, nil
 }

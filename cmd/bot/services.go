@@ -22,6 +22,7 @@ import (
 	"github.com/6586x57890143/peregrine/internal/plugins/images"
 	"github.com/6586x57890143/peregrine/internal/plugins/ingest"
 	"github.com/6586x57890143/peregrine/internal/plugins/repair"
+	"github.com/6586x57890143/peregrine/internal/plugins/tuning"
 	"github.com/6586x57890143/peregrine/internal/plugins/voicenote"
 	"github.com/6586x57890143/peregrine/internal/safety"
 	"github.com/6586x57890143/peregrine/internal/storage"
@@ -72,7 +73,7 @@ func registerServices(
 	// between the reply path and the autonomous poster, which is why it is built here rather
 	// than owned by either.
 	memories := generate.NewMemories(0)
-	speaker := generate.New(store, generate.Options{
+	dials := generate.Options{
 		MaxNGram:           cfg.MaxNGram,
 		MinWords:           cfg.MinWords,
 		MaxWords:           cfg.MaxWords,
@@ -84,8 +85,28 @@ func registerServices(
 		MinDistinctAuthors: cfg.MinDistinctAuthors,
 		PromptRelevance:    cfg.PromptRelevanceBoost,
 		RoastChance:        cfg.RoastChance,
-	})
+	}
+	speaker := generate.New(store, dials)
 	emoji := core.SessionEmoji(session)
+
+	// The tuning export. Named as a variable before the features that record into it,
+	// because three of them take it: the reactor, the autonomous poster and the health
+	// report. It is a real service with a nil-safe off state rather than a nil interface, so
+	// nothing downstream has to know whether PEREGRINE_TUNING_DIR was set.
+	//
+	// The SAME dials the generator was built with go into it, deliberately: an archive that
+	// recorded output without recording the numbers that produced it cannot be compared to
+	// the next one, which is the entire point of exporting anything.
+	tuningSvc := tuning.New(session, tuning.Options{
+		Dir:              cfg.TuningDir,
+		Rotate:           cfg.TuningRotate,
+		Keep:             cfg.TuningKeep,
+		Sample:           cfg.TuningSample,
+		EngagementWindow: cfg.TuningEngagementWindow,
+		TrackMax:         cfg.TuningTrackMax,
+		Version:          cfg.Version,
+		Dials:            dials,
+	})
 
 	// The word-game dictionary. Deliberately not fatal: word games are one optional feature,
 	// and taking the whole bot down because a 64 KB word list would not load meant an
@@ -134,7 +155,7 @@ func registerServices(
 		AllowChannels:       cfg.AutonomousPostChannels,
 		AdminUserID:         cfg.AdminUserID,
 	})
-	autopostSvc := autopost.New(guard, speaker, memories, tracker, resolver, emoji, autopost.Options{
+	autopostSvc := autopost.New(guard, speaker, memories, tracker, resolver, emoji, tuningSvc, autopost.Options{
 		Enabled:             cfg.EnableAutonomousPost,
 		Tick:                cfg.AutonomousPostTick,
 		SkipChance:          cfg.AutonomousSkipChance,
@@ -164,6 +185,7 @@ func registerServices(
 		Images:   imagesSvc,
 		Games:    gamesSvc,
 		Voice:    voiceSvc,
+		Recorder: tuningSvc,
 		Options: chat.Options{
 			SelfMention:  cfg.SelfMention,
 			RoastChance:  cfg.RoastChance,
@@ -204,7 +226,7 @@ func registerServices(
 		Every: cfg.BackupTick,
 		Keep:  cfg.BackupKeep,
 	})
-	healthSvc := health.New(store, dispatcher, gate, health.SessionLatency(session), health.Options{
+	healthSvc := health.New(store, dispatcher, gate, health.SessionLatency(session), tuningSvc, health.Options{
 		StatusTick:  cfg.StatusTick,
 		LatencyTick: latencyTick,
 		Threshold:   latencyThreshold,
@@ -213,6 +235,11 @@ func registerServices(
 	// Registration order, and it is behaviour rather than taste. See the note above this
 	// function: chat goes last among the message-handling features because its Init arms the
 	// gateway handler, and health goes last overall so its Shutdown report is the final word.
+	// FIRST, so it shuts down LAST. Shutdown runs in reverse registration order, and the
+	// export has to outlive everything that records into it: a flush that happened before
+	// the reactor stopped would lose the last replies, which are the ones an operator
+	// investigating a shutdown most wants.
+	registry.Register(tuningSvc)
 	registry.Register(aggroSvc)
 	registry.Register(imagesSvc)
 	registry.Register(gamesSvc)
