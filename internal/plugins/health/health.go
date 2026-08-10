@@ -91,8 +91,15 @@ type Service struct {
 	gate     Gate
 	latency  Latency
 	reporter Reporter
+	presence Presence
+	topics   Topics
 	opts     Options
 	logger   *slog.Logger
+
+	// presenceAt is the round-robin cursor for the status line. Only the status loop touches
+	// it, and there is one status loop, so it needs no lock.
+	presenceAt   int
+	presenceOpts PresenceOptions
 
 	// Previous counter values, so the report can carry deltas. Only the status loop touches
 	// them, and there is one status loop, so they need no lock.
@@ -104,10 +111,30 @@ type Service struct {
 	cancelLoops context.CancelFunc
 }
 
-// New builds the service. A nil Reporter means nothing wants the status as data, which is
-// the case whenever the tuning export is off.
-func New(store *storage.Store, queue Queue, gate Gate, latency Latency, reporter Reporter, opts Options) *Service {
-	return &Service{store: store, queue: queue, gate: gate, latency: latency, reporter: reporter, opts: opts}
+// Deps are the collaborators. A struct because the constructor reached seven positional
+// arguments, three of them optional interfaces, which is where argument-order bugs live.
+type Deps struct {
+	Store   *storage.Store
+	Queue   Queue
+	Gate    Gate
+	Latency Latency
+
+	// Reporter takes the status as data. Nil whenever the tuning export is off.
+	Reporter Reporter
+
+	// Presence sets the status line, and Topics supplies the occasional corpus word for it.
+	// Either may be nil, which turns off that half rather than failing.
+	Presence Presence
+	Topics   Topics
+}
+
+// New builds the service.
+func New(d Deps, opts Options, presence PresenceOptions) *Service {
+	return &Service{
+		store: d.Store, queue: d.Queue, gate: d.Gate, latency: d.Latency,
+		reporter: d.Reporter, presence: d.Presence, topics: d.Topics,
+		opts: opts, presenceOpts: presence,
+	}
 }
 
 func (s *Service) Name() string { return "health" }
@@ -194,6 +221,10 @@ func (s *Service) reportStatus() {
 	if s.reporter != nil {
 		s.reporter.Snapshot(st, dropped.total, learnRejected.total, emitRejected.total, s.gate.Paused())
 	}
+
+	// The status line, from the counts this pass already paid for. No second page walk, no
+	// second loop, and no second interval to configure: the rotation IS the status tick.
+	s.updatePresence(st)
 
 	// One record with everything, rather than a line per subsystem. An operator comparing two
 	// reports wants them adjacent.

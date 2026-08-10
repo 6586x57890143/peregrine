@@ -2,12 +2,12 @@ package wordgame
 
 import (
 	"encoding/json"
-	"fmt"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"github.com/6586x57890143/peregrine/internal/corpus"
 )
 
 // Leaderboard is the weekly win tally.
@@ -63,15 +63,25 @@ func NewLeaderboard(now time.Time) *Leaderboard {
 
 // StartOfWeekUTC is the Monday 00:00 UTC that the week containing t began at.
 //
-// Exported because the chat leaderboard in the corpus filters user stats by the same
-// boundary, and the two disagreeing would mean a player's messages counted for a week the
-// leaderboard was not showing.
-func StartOfWeekUTC(t time.Time) time.Time {
-	t = t.UTC()
-	daysSinceMonday := (int(t.Weekday()) - int(time.Monday) + 7) % 7
-	y, m, d := t.Date()
-	return time.Date(y, m, d-daysSinceMonday, 0, 0, 0, 0, time.UTC)
-}
+// AN ALIAS FOR corpus.StartOfWeekUTC, not a second implementation, and the difference is the
+// whole point of it being here at all.
+//
+// This package carried its own copy until M21a: same answer, different arithmetic, in a
+// package that imported nothing. corpus's own doc comment says that function "exists here
+// precisely so that two consumers cannot hold two different answers" and records that it had
+// three implementations before M11c, so this was a fourth that the collapse missed. The two
+// happened to agree, which is exactly why nothing failed and nothing found it.
+//
+// It matters now rather than in principle. The leaderboard command renders the word-game
+// tally and the chat tally as two halves of ONE embed, and the second filters user stats by
+// corpus.StartOfWeekUTC while this decides when the first resets. Two boards under one
+// heading, promising one reset time, computed from two functions is finding 28's shape with
+// a user-visible failure attached: a player's messages counting for a week the board is not
+// showing.
+//
+// Kept as an alias rather than deleted so callers of this package do not have to import
+// corpus to ask a question this package answers.
+func StartOfWeekUTC(t time.Time) time.Time { return corpus.StartOfWeekUTC(t) }
 
 // AddWin records a win.
 func (l *Leaderboard) AddWin(userID, username string) {
@@ -117,6 +127,15 @@ func (l *Leaderboard) MaybeReset(now time.Time) bool {
 	return true
 }
 
+// NextReset is when the current week ends.
+//
+// Derived from the same boundary MaybeReset compares against, so the board cannot promise a
+// reset at a different moment from the one that happens. Those were two separate calculations
+// before, one from the host clock and one from NTP (finding 17).
+func (l *Leaderboard) NextReset(now time.Time) time.Time {
+	return StartOfWeekUTC(now).AddDate(0, 0, 7)
+}
+
 // WeekStart reports the Monday the current tally began.
 func (l *Leaderboard) WeekStart() time.Time {
 	l.mu.Lock()
@@ -143,6 +162,156 @@ func (l *Leaderboard) Entries() []Entry {
 		}
 		return out[i].Username < out[j].Username
 	})
+	return out
+}
+
+// Scores returns each player's win count by user ID.
+//
+// By ID rather than by name, and that is the whole shape of the M21a fix. The command used to
+// build a map keyed by RESOLVED DISPLAY NAME, which cost one REST call per player before
+// anything was sorted and threw the IDs away in the process. Two people with the same nickname
+// merged into one row, and the viewer's own position became unaskable, because the only thing
+// that identifies a viewer is their ID.
+func (l *Leaderboard) Scores() map[string]int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	out := make(map[string]int, len(l.scores))
+	for id, e := range l.scores {
+		out[id] = e.Wins
+	}
+	return out
+}
+
+// Row is one line of a rendered board.
+//
+// Name is deliberately empty when Rank produces it: ranking is done on scores alone and the
+// caller fills in names for the handful of rows that will actually be shown.
+type Row struct {
+	Rank   int
+	UserID string
+	Name   string
+	Score  int
+}
+
+// Board is a ranked tally plus where the viewer stands in it.
+type Board struct {
+	// Top is the leading rows, at most the requested count.
+	Top []Row
+
+	// You is the viewer's own row when they have a score but are NOT in Top. Nil when they
+	// are already shown above or have no score at all.
+	//
+	// This is the eleventh slot: ranks 1 to 10 as usual, and then the viewer's real position
+	// under a divider, so somebody sitting at 18th can see it without scrolling a board that
+	// does not go that far.
+	You *Row
+
+	// Unranked is true when the viewer has no score this week. Reported rather than omitted,
+	// because a missing row is indistinguishable from a bug.
+	Unranked bool
+
+	// Players is how many people have any score at all, which is what makes a rank legible:
+	// 18th of 20 and 18th of 300 are different news.
+	Players int
+}
+
+// Rank turns raw scores into a Board.
+//
+// # Competition ranking, computed from scores alone
+//
+// A rank is one plus the number of people strictly ahead, so equal scores share a rank and the
+// answer does not depend on any tie-break. That matters more than it looks: it means the
+// viewer's rank can be computed WITHOUT resolving a single name, which is the entire reason
+// this command stopped costing one Discord request per weekly talker.
+//
+// Ties are ordered by user ID for display. That is arbitrary but stable, and stability is the
+// requirement: an unstable order made the ranking shuffle between two identical invocations,
+// which reads as the bot being wrong about who is winning. Ordering ties by NAME would be
+// prettier and would put the names back on the critical path, which is the cost this whole
+// change exists to remove.
+func Rank(scores map[string]int, viewerID string, top int) Board {
+	if top <= 0 {
+		top = 10
+	}
+
+	rows := make([]Row, 0, len(scores))
+	for id, score := range scores {
+		if score <= 0 {
+			continue
+		}
+		rows = append(rows, Row{UserID: id, Score: score})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Score != rows[j].Score {
+			return rows[i].Score > rows[j].Score
+		}
+		return rows[i].UserID < rows[j].UserID
+	})
+
+	// One pass assigning competition ranks: the rank only moves when the score does.
+	rank := 0
+	for i := range rows {
+		if i == 0 || rows[i].Score != rows[i-1].Score {
+			rank = i + 1
+		}
+		rows[i].Rank = rank
+	}
+
+	board := Board{Players: len(rows)}
+	if len(rows) > top {
+		board.Top = append(board.Top, rows[:top]...)
+	} else {
+		board.Top = append(board.Top, rows...)
+	}
+
+	if viewerID == "" {
+		return board
+	}
+	for i := range rows {
+		if rows[i].UserID != viewerID {
+			continue
+		}
+		if i >= len(board.Top) {
+			you := rows[i]
+			board.You = &you
+		}
+		return board
+	}
+	board.Unranked = true
+	return board
+}
+
+// NamesNeeded is every user ID that will be rendered, which is at most eleven per board.
+//
+// The point of the whole rewrite: the caller resolves names for exactly this list rather than
+// for every person who spoke this week. On a server with two hundred weekly talkers that is
+// eleven Discord lookups instead of two hundred, and the two hundred were sequential and
+// rate-limited.
+func (b Board) NamesNeeded() []string {
+	out := make([]string, 0, len(b.Top)+1)
+	for _, r := range b.Top {
+		out = append(out, r.UserID)
+	}
+	if b.You != nil {
+		out = append(out, b.You.UserID)
+	}
+	return out
+}
+
+// WithNames returns the board with Name filled in from a resolver.
+func (b Board) WithNames(resolve func(userID string) string) Board {
+	out := b
+	out.Top = make([]Row, len(b.Top))
+	for i, r := range b.Top {
+		r.Name = resolve(r.UserID)
+		out.Top[i] = r
+	}
+	if b.You != nil {
+		you := *b.You
+		you.Name = resolve(you.UserID)
+		out.You = &you
+	}
 	return out
 }
 
@@ -192,84 +361,19 @@ func (l *Leaderboard) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// Format renders the tally for Discord.
+// The two text renderers that used to live here are GONE as of M21a: Format built a fenced
+// code block with a fixed-width Rank/Player/Wins table, and FormatChatLeaderboard did the same
+// for message counts.
 //
-// The next-reset timestamp is derived from the same week boundary the reset uses, so the
-// board cannot promise a reset at a different moment from the one that happens. Those were
-// two separate calculations before, one from the host clock and one from NTP.
-func (l *Leaderboard) Format(now time.Time) string {
-	entries := l.Entries()
-	nextReset := StartOfWeekUTC(now).AddDate(0, 0, 7)
-
-	var b strings.Builder
-	b.WriteString("🏆 **Weekly Word Scramble Leaderboard** 🏆\n")
-	fmt.Fprintf(&b, "Resets <t:%d:R>\n", nextReset.Unix())
-
-	if len(entries) == 0 {
-		b.WriteString("The leaderboard is empty. Be the first to win a game!")
-		return b.String()
-	}
-
-	b.WriteString("```\n")
-	b.WriteString("Rank | Player          | Wins\n")
-	b.WriteString("-----+-----------------+------\n")
-
-	crowns := []string{"🥇", "🥈", "🥉"}
-	for i, e := range entries {
-		if i >= 10 {
-			break
-		}
-		rank := fmt.Sprintf("%-3s", fmt.Sprintf("%d.", i+1))
-		if i < len(crowns) {
-			// Emoji are roughly two columns wide, so one trailing space fills the
-			// three-column rank field rather than the two %-3s would add.
-			rank = crowns[i] + " "
-		}
-		fmt.Fprintf(&b, "%-3s | %-15s | %4d\n", rank, TruncateRunes(e.Username, 15), e.Wins)
-	}
-	b.WriteString("```")
-	return b.String()
-}
-
-// FormatChatLeaderboard renders the message-count board, which is a different tally: it
-// counts messages sent rather than games won, and is populated whether or not the scramble
-// game runs.
-func FormatChatLeaderboard(scores map[string]int) string {
-	type row struct {
-		name string
-		n    int
-	}
-	rows := make([]row, 0, len(scores))
-	for name, n := range scores {
-		rows = append(rows, row{name: name, n: n})
-	}
-	sort.Slice(rows, func(i, j int) bool {
-		if rows[i].n != rows[j].n {
-			return rows[i].n > rows[j].n
-		}
-		return rows[i].name < rows[j].name
-	})
-
-	var b strings.Builder
-	b.WriteString("💬 **Weekly Chat Leaderboard** 💬\n")
-	if len(rows) == 0 {
-		b.WriteString("Nobody has said anything yet this week.")
-		return b.String()
-	}
-
-	b.WriteString("```\n")
-	b.WriteString("Rank | Player          | Msgs\n")
-	b.WriteString("-----+-----------------+------\n")
-	for i, r := range rows {
-		if i >= 10 {
-			break
-		}
-		fmt.Fprintf(&b, "%-3s | %-15s | %4d\n",
-			fmt.Sprintf("%d.", i+1), TruncateRunes(r.name, 15), r.n)
-	}
-	b.WriteString("```")
-	return b.String()
-}
+// They are deleted rather than kept alongside the embed, because a second renderer nobody
+// calls is the shape this repo keeps finding dead (findings 34 and 37 in the seed ladder, the
+// duplicate index in finding 28). Rendering lives in internal/plugins/games now, which is the
+// package that may import discordgo; what this package owns is the RANKING, which needs no
+// Discord at all and is what Rank and Board above are.
+//
+// The layout was also actively worse on the device most people read it on. A fenced code block
+// does not wrap on a phone, so the table scrolled off the side, and the column alignment it
+// spent effort on was invisible to whoever was scrolling.
 
 // TruncateRunes shortens s to at most max RUNES, appending three dots when it had to cut.
 //

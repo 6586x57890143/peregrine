@@ -131,8 +131,19 @@ type Config struct {
 	// variables, and are gone entirely as of M7b: clustering is deleted rather than
 	// rebuilt, so there is no milestone left to defer them to (SPEC.md section 8,
 	// findings 27 and 29).
-	StatusTick      time.Duration // PEREGRINE_STATUS_TICK
-	LeaderboardTick time.Duration // PEREGRINE_LEADERBOARD_CHECK_TICK
+	StatusTick time.Duration // PEREGRINE_STATUS_TICK
+
+	// The Discord presence line, rotated on the status tick. There is no interval of its own,
+	// because the numbers it shows come from the page walk that tick already pays for.
+	//
+	// PresenceCorpusWordChance is how often the line quotes a WORD FROM THE CORPUS instead of
+	// reporting a count. That is user-typed text on public display, so it goes through the
+	// emit gate like every other emission and falls back to a count when the gate refuses it.
+	// Zero disables the variant entirely, for an operator who does not want the bot's status
+	// to be user-derived at all.
+	EnablePresence           bool          // PEREGRINE_ENABLE_PRESENCE
+	PresenceCorpusWordChance float64       // PEREGRINE_PRESENCE_CORPUS_WORD_CHANCE
+	LeaderboardTick          time.Duration // PEREGRINE_LEADERBOARD_CHECK_TICK
 
 	// Engagement: bird aggro.
 	AggroTick     time.Duration // PEREGRINE_AGGRO_TICK
@@ -392,6 +403,13 @@ func Load() (*Config, error) {
 		MessageQueue:   l.intVal("PEREGRINE_MESSAGE_QUEUE", 256, 1, 100_000),
 
 		StatusTick: l.dur("PEREGRINE_STATUS_TICK", 5*time.Minute, time.Minute, 24*time.Hour),
+
+		// On by default, unlike almost everything else here, because it is the one feature in
+		// this bot whose failure mode is purely cosmetic: it cannot ping, cannot post, and
+		// says nothing an operator has to answer for. A blank status line on a bot that is
+		// running is a small lie an operator has to work to see through.
+		EnablePresence:           l.boolVal("PEREGRINE_ENABLE_PRESENCE", true),
+		PresenceCorpusWordChance: l.float("PEREGRINE_PRESENCE_CORPUS_WORD_CHANCE", 0.25, 0, 1),
 
 		LeaderboardTick: l.dur("PEREGRINE_LEADERBOARD_CHECK_TICK", time.Hour, time.Minute, 24*time.Hour),
 

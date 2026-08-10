@@ -503,6 +503,66 @@ The engine is `internal/markov` as of M7a. Read `SPEC.md` §5 for the full speci
 
 **Custom emote output had never worked, and M3 fixed the cause.** The `:shortcode:` resolver walks `s.State.Guilds`, and the session never requested `IntentsGuilds`, so that slice was always empty and the resolver had never once succeeded. In a meme server the server's own emotes are most of the register, so this was an engagement bug before it was a performance bug. `core.NewSession` now requests the intent. The state cache it populates is what M10 uses to replace the per-message REST `s.Channel` call for the NSFW check; that call site is still REST today. Emote-bearing output has a golden-sample check as of M7a, now that it is possible at all.
 
+## The leaderboard, and the presence line
+
+**`!leaderboard` was slow for one specific reason and it was not the corpus.** It resolved a
+display name for **every** user in the week's stats before sorting anything, through
+`chat.displayName`, which was an uncached `GuildMember` REST GET with a `User` fallback. On a
+server with two hundred weekly talkers that is two hundred-odd sequential, rate-limited
+requests to render twenty rows. `names.NewCachedSession` had existed since M18 for exactly
+this shape and this was the last call site in the module that never got it.
+
+**Rank first, resolve names second.** `wordgame.Rank` is competition ranking (one plus the
+number of people strictly ahead) computed from scores alone, so it needs no names at all, and
+`Board.NamesNeeded` is at most eleven per board. `TestTheLeaderboardResolvesOnlyTheNamesItRenders`
+counts resolver calls, because a behavioural test on the rendered board passes just as happily
+with two hundred lookups behind it. The resolver is memoized across both boards, so somebody on
+each costs one lookup.
+
+**The board keeps user IDs end to end**, which fixed a real defect as well as the speed: it
+used to be `map[displayName]int`, so two people with the same nickname merged into one row, and
+"your rank" was unaskable because the only thing identifying a viewer is their ID.
+
+**Ties order by user ID, not by name.** Arbitrary but stable, and stability is the requirement:
+an unstable order made the ranking shuffle between two identical invocations. Ordering by name
+would be prettier and would put the names back on the critical path, which is the cost this
+change exists to remove.
+
+**`Guard.SendEmbed` runs `CheckEmit` over EVERY text field**, walking the struct rather than
+naming the two fields anybody remembers. Nicknames are user-controlled, so a blocklisted word
+in a field value is exactly as much of an incident as one in the description, and which of them
+it landed in is an accident of how the caller built the embed. Names render as plain text and
+never as `<@id>`: Discord documents embed mentions as not notifying, which is very likely true
+and is precisely the kind of undocumented-adjacent reading `allowedMentions` refuses to lean
+on.
+
+**`Guard.Presence` is content-gated and deliberately NOT pause-gated.** Gated on content
+because the line may quote a corpus word, which is public output with no conversation around it
+and therefore the autonomous poster's category of risk. Not pause-gated because presence
+carries no channel content and cannot ping, so freezing it during an incident buys nothing and
+costs the operator their only sign the process is alive. That is `Unreact`'s asymmetry, made
+for the same kind of reason. A refused corpus word falls back to a count rather than leaving
+the line frozen.
+
+**The presence line has no loop and no interval of its own.** `health.reportStatus` already
+reads `storage.Status` on a ticker, and that page walk is expensive enough to be why the status
+line is on a ticker at all (finding 11). One walk, two consumers. The rotation is round robin
+rather than random, because a random draw repeats and a line that shows the same fact twice
+running reads as a bot that has stopped updating.
+
+**`Reader.ScanTopics` is bounded by the caller and filters nothing.** Storage is the bottom
+layer and must not learn what a word means, so the stop-word and length filters live in
+`health`. The scan starts from a random letter, because the single most frequent non-stop word
+in a corpus never changes and a status line built from it would say the same thing forever.
+
+**There was a FOURTH `StartOfWeekUTC`.** `corpus`'s own doc comment says the function lives
+there "precisely so that two consumers cannot hold two different answers" and records that it
+had three implementations before M11c; `internal/wordgame` still carried a fourth, with
+different arithmetic and the same answer, which is why nothing failed and nothing found it. It
+matters now rather than in principle: the command renders the word-game tally and the chat
+tally as two halves of one embed promising one reset time, and the second filters stats by
+`corpus.StartOfWeekUTC`. It is an alias now.
+
 ## Safety model
 
 `SPEC.md` §4 is the full threat model. Assume users actively try to make the bot say gross or borderline illegal things, and that **the operator carries the consequences of whatever it posts**. Four rules follow, and each exists because of a specific hole.

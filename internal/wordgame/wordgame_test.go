@@ -3,6 +3,7 @@ package wordgame
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"os"
 	"strings"
@@ -592,7 +593,7 @@ func TestLeaderboardMarshalsUnderTheLock(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_ = l.Format(time.Now())
+			_ = l.Scores()
 			_ = l.Entries()
 		}()
 	}
@@ -664,43 +665,177 @@ func TestLeaderboardEntriesAreStablyOrdered(t *testing.T) {
 	}
 }
 
-func TestFormatIsReadableWhenEmptyAndWhenFull(t *testing.T) {
-	now := time.Date(2024, 6, 5, 12, 0, 0, 0, time.UTC)
-
-	empty := NewLeaderboard(now).Format(now)
-	if !strings.Contains(empty, "empty") {
-		t.Errorf("empty board does not say so: %q", empty)
+// Ranking has to work from SCORES ALONE, with no name resolution anywhere in it. That is what
+// took the leaderboard command from one Discord request per weekly talker down to at most
+// eleven per board: a rank is one plus the number of people strictly ahead, and nobody's
+// nickname is part of that sum.
+func TestRankNeedsNoNamesAndUsesCompetitionRanking(t *testing.T) {
+	scores := map[string]int{
+		"a": 10,
+		"b": 7,
+		"c": 7, // tied with b
+		"d": 3,
+		"e": 0, // no score at all, so not a player
 	}
 
-	l := NewLeaderboard(now)
-	for i := range 15 {
-		id := "u" + string(rune('a'+i))
-		for range 15 - i {
-			l.AddWin(id, "player"+string(rune('a'+i)))
+	board := Rank(scores, "", 10)
+
+	if board.Players != 4 {
+		t.Errorf("Players = %d, want 4: a zero score is not a placing", board.Players)
+	}
+	if len(board.Top) != 4 {
+		t.Fatalf("Top has %d rows, want 4: %+v", len(board.Top), board.Top)
+	}
+
+	wantRanks := map[string]int{"a": 1, "b": 2, "c": 2, "d": 4}
+	for _, row := range board.Top {
+		if row.Rank != wantRanks[row.UserID] {
+			t.Errorf("%s ranked %d, want %d: equal scores share a rank and the next one skips",
+				row.UserID, row.Rank, wantRanks[row.UserID])
 		}
-	}
-	full := l.Format(now)
-	if strings.Count(full, "\n") > 20 {
-		t.Errorf("the board shows more than the top ten:\n%s", full)
-	}
-	// The next reset is derived from the same boundary MaybeReset uses, so the promise and
-	// the behaviour cannot disagree.
-	nextReset := StartOfWeekUTC(now).AddDate(0, 0, 7)
-	if !strings.Contains(full, itoa(nextReset.Unix())) {
-		t.Errorf("the board does not show the same reset time the reset uses:\n%s", full)
+		if row.Name != "" {
+			t.Errorf("%s came out of Rank with a name already set; ranking must not resolve one",
+				row.UserID)
+		}
 	}
 }
 
-func itoa(n int64) string {
-	if n == 0 {
-		return "0"
+// THE ELEVENTH SLOT. Somebody outside the top ten gets their own row with their real rank, so
+// they can see where they stand without the board having to reach that far.
+func TestABoardCarriesTheViewersOwnRowWhenTheyAreOutsideTheTop(t *testing.T) {
+	scores := map[string]int{}
+	for i := range 30 {
+		// Descending scores, so user 00 is first and user 29 is last.
+		scores[fmt.Sprintf("u%02d", i)] = 100 - i
 	}
-	var buf [24]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
+
+	board := Rank(scores, "u17", 10)
+
+	if len(board.Top) != 10 {
+		t.Fatalf("Top has %d rows, want 10", len(board.Top))
 	}
-	return string(buf[i:])
+	if board.You == nil {
+		t.Fatal("the viewer sits at 18th and got no row of their own")
+	}
+	if board.You.Rank != 18 {
+		t.Errorf("viewer rank = %d, want 18", board.You.Rank)
+	}
+	if board.You.UserID != "u17" {
+		t.Errorf("viewer row is %s, want u17", board.You.UserID)
+	}
+	if board.Unranked {
+		t.Error("a viewer with a score was reported as unranked")
+	}
+}
+
+// Somebody already on the board does not get a duplicate row, because they can see themselves.
+func TestAViewerInsideTheTopGetsNoSecondRow(t *testing.T) {
+	scores := map[string]int{"a": 10, "b": 9, "c": 8}
+
+	board := Rank(scores, "b", 10)
+
+	if board.You != nil {
+		t.Errorf("a viewer already shown at rank %d got a duplicate row", board.You.Rank)
+	}
+	if board.Unranked {
+		t.Error("a viewer on the board was reported as unranked")
+	}
+}
+
+// A viewer with nothing this week is REPORTED rather than omitted. A missing row is
+// indistinguishable from a bug, and "you have none" is a real answer to what was asked.
+func TestAViewerWithNoScoreIsReportedAsUnranked(t *testing.T) {
+	board := Rank(map[string]int{"a": 3}, "nobody", 10)
+
+	if !board.Unranked {
+		t.Error("a viewer with no score was not reported as unranked")
+	}
+	if board.You != nil {
+		t.Error("a viewer with no score got a row")
+	}
+
+	// And with no viewer at all, neither is claimed.
+	anonymous := Rank(map[string]int{"a": 3}, "", 10)
+	if anonymous.Unranked || anonymous.You != nil {
+		t.Error("a board with no viewer claimed something about one")
+	}
+}
+
+// NamesNeeded is the whole performance argument in one method: at most eleven lookups per
+// board rather than one per person who spoke this week.
+func TestNamesNeededIsBoundedByWhatIsRendered(t *testing.T) {
+	scores := map[string]int{}
+	for i := range 200 {
+		scores[fmt.Sprintf("u%03d", i)] = 200 - i
+	}
+
+	board := Rank(scores, "u150", 10)
+	needed := board.NamesNeeded()
+
+	if len(needed) != 11 {
+		t.Errorf("NamesNeeded returned %d ids for a 200-player board, want 11 (ten rows plus "+
+			"the viewer). Resolving more than this is the cost M21a exists to remove", len(needed))
+	}
+
+	// And filling them in touches nothing else.
+	calls := 0
+	named := board.WithNames(func(id string) string {
+		calls++
+		return "name-" + id
+	})
+	if calls != 11 {
+		t.Errorf("WithNames resolved %d names, want 11", calls)
+	}
+	if named.Top[0].Name == "" || named.You == nil || named.You.Name == "" {
+		t.Error("WithNames left a rendered row without a name")
+	}
+	// The original is untouched, so a caller cannot be surprised by an aliased slice.
+	if board.Top[0].Name != "" {
+		t.Error("WithNames mutated the board it was called on")
+	}
+}
+
+// Ties have to order the same way twice. An unstable order made the ranking shuffle between
+// two identical invocations, which reads as the bot being wrong about who is winning.
+func TestTiedRowsOrderStably(t *testing.T) {
+	scores := map[string]int{"z": 5, "a": 5, "m": 5, "q": 5}
+
+	first := Rank(scores, "", 10)
+	for range 20 {
+		again := Rank(scores, "", 10)
+		for i := range first.Top {
+			if first.Top[i].UserID != again.Top[i].UserID {
+				t.Fatalf("tied rows shuffled between calls: %v then %v",
+					ids(first.Top), ids(again.Top))
+			}
+		}
+	}
+}
+
+func ids(rows []Row) []string {
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.UserID)
+	}
+	return out
+}
+
+// The promised reset and the reset that happens come from one boundary, so they cannot
+// disagree. They were two calculations before, one from the host clock and one from NTP.
+func TestNextResetAgreesWithTheResetThatHappens(t *testing.T) {
+	now := time.Date(2024, 6, 5, 12, 0, 0, 0, time.UTC) // a Wednesday
+	l := NewLeaderboard(now)
+
+	next := l.NextReset(now)
+	if next != StartOfWeekUTC(now).AddDate(0, 0, 7) {
+		t.Fatalf("NextReset = %v, which is not one week past the boundary MaybeReset compares", next)
+	}
+
+	// One second before the promised reset, nothing happens. One second after, it does.
+	if l.MaybeReset(next.Add(-time.Second)) {
+		t.Error("the board reset before the moment it promised")
+	}
+	if !l.MaybeReset(next.Add(time.Second)) {
+		t.Error("the board did not reset at the moment it promised")
+	}
 }

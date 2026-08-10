@@ -42,6 +42,7 @@ import (
 // smaller import in exchange for an adapter whose only job was copying an ID.
 type Guard interface {
 	Send(channelID, content string) (*discordgo.Message, bool)
+	SendEmbed(channelID string, embed *discordgo.MessageEmbed) (*discordgo.Message, bool)
 	Delete(channelID, messageID string) bool
 }
 
@@ -263,7 +264,10 @@ func (s *Service) Guess(channelID, messageID, content, authorID, displayName str
 func (s *Service) Command(cmd, channelID, authorID string, names func(userID string) string) bool {
 	switch cmd {
 	case "!leaderboard":
-		s.postLeaderboard(channelID, names)
+		// The author's ID reaches the board, which is what makes the eleventh slot possible:
+		// showing somebody their own rank requires knowing which of the rows is theirs, and
+		// the only thing that identifies them is their ID.
+		s.postLeaderboard(channelID, authorID, names)
 		return true
 	case "!wordgame":
 		// Only a command when word games are available at all. With the feature off it is
@@ -396,24 +400,64 @@ func (s *Service) maybeReset() {
 // Deliberately NOT gated on the feature flag. The chat half reads the stats bucket, which is
 // populated on every message regardless of whether the scramble game runs, so the command is
 // useful with word games off.
-func (s *Service) postLeaderboard(channelID string, names func(userID string) string) {
-	var scores map[string]int
+func (s *Service) postLeaderboard(channelID, viewerID string, names func(userID string) string) {
+	var chatScores map[string]int
 	if err := s.store.View(func(r *storage.Reader) error {
 		var err error
-		scores, err = weeklyScores(r)
+		chatScores, err = weeklyScores(r)
 		return err
 	}); err != nil {
 		log.Printf("[LEADERBOARD] Error loading user stats: %v", err)
-		s.guard.Send(channelID, "Could not generate chat leaderboard.")
+		s.guard.Send(channelID, "Could not generate the leaderboard.")
 		return
 	}
 
-	named := make(map[string]int, len(scores))
-	for userID, score := range scores {
-		named[names(userID)] = score
-	}
+	// RANK FIRST, RESOLVE NAMES SECOND, and that order is the entire performance fix.
+	//
+	// This used to resolve a display name for EVERY user in the week's stats before sorting
+	// anything, through an uncached GuildMember REST GET with a User fallback. On a server
+	// with two hundred weekly talkers that was two hundred-odd sequential, rate-limited
+	// requests to render twenty rows, and the command took long enough that people assumed
+	// the bot had ignored them.
+	//
+	// A rank is one plus the number of people strictly ahead, so it needs no names at all.
+	// Only the rows that are actually displayed need one, which is at most eleven per board.
+	//
+	// It also fixes a real defect rather than only the speed: the old code keyed the board by
+	// resolved NAME, so two people with the same nickname merged into one row.
+	now := time.Now()
+	wins := wordgame.Rank(s.board.Scores(), viewerID, leaderboardRows)
+	chat := wordgame.Rank(chatScores, viewerID, leaderboardRows)
 
-	s.guard.Send(channelID, s.board.Format(time.Now())+"\n\n"+wordgame.FormatChatLeaderboard(named))
+	// Memoized across BOTH boards, so somebody who is on the word-game board and the chat
+	// board costs one lookup rather than two. In practice that is most of the overlap.
+	resolve := memoize(names)
+	wins = wins.WithNames(resolve)
+	chat = chat.WithNames(resolve)
+
+	embed := leaderboardEmbed(wins, chat, s.board.NextReset(now), leaderboardFooter(wins, chat))
+	if _, ok := s.guard.SendEmbed(channelID, embed); !ok {
+		// The guard has already logged whether this was a refusal or a failure. Said here as
+		// well because a command that produced nothing is a question the operator will be
+		// asked, and silence on the reply path is the bug finding 32 was about.
+		log.Printf("[LEADERBOARD] the board was not sent in %s", channelID)
+	}
+}
+
+// memoize wraps a name resolver so each user is looked up at most once.
+//
+// Not concurrency-safe, and does not need to be: one command invocation resolves its own
+// board on one goroutine. A mutex here would be structure with no failure mode behind it.
+func memoize(resolve func(userID string) string) func(string) string {
+	cache := map[string]string{}
+	return func(userID string) string {
+		if name, ok := cache[userID]; ok {
+			return name
+		}
+		name := resolve(userID)
+		cache[userID] = name
+		return name
+	}
 }
 
 // weeklyScores returns each user's message count for the current week.

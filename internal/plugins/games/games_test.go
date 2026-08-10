@@ -16,6 +16,7 @@ import (
 	"github.com/6586x57890143/peregrine/internal/channels"
 	"github.com/6586x57890143/peregrine/internal/core"
 	"github.com/6586x57890143/peregrine/internal/dbtest"
+	"github.com/6586x57890143/peregrine/internal/storage"
 	"github.com/6586x57890143/peregrine/internal/wordgame"
 )
 
@@ -26,8 +27,25 @@ func snowflake(n int) string {
 type fakeGuard struct {
 	mu      sync.Mutex
 	sent    []string
+	embeds  []*discordgo.MessageEmbed
 	deletes []string
 	refuse  bool
+}
+
+func (g *fakeGuard) SendEmbed(_ string, embed *discordgo.MessageEmbed) (*discordgo.Message, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.refuse {
+		return nil, false
+	}
+	g.embeds = append(g.embeds, embed)
+	return &discordgo.Message{ID: snowflake(880000 + len(g.embeds))}, true
+}
+
+func (g *fakeGuard) posted() []*discordgo.MessageEmbed {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]*discordgo.MessageEmbed(nil), g.embeds...)
 }
 
 func (g *fakeGuard) Send(_, content string) (*discordgo.Message, bool) {
@@ -320,8 +338,11 @@ func TestTheLeaderboardCommandWorksWithTheGameOff(t *testing.T) {
 	if consumed := s.Command("!leaderboard", "c1", snowflake(42), noNames); !consumed {
 		t.Error("!leaderboard was not consumed with word games off")
 	}
-	if posts := guard.posts(); len(posts) != 1 {
-		t.Errorf("posts = %v, want one leaderboard message", posts)
+	// An embed now, not a code block. The board is deliberately NOT gated on the feature
+	// flag: its chat half reads the stats bucket, which is populated whether or not the
+	// scramble game runs.
+	if embeds := guard.posted(); len(embeds) != 1 {
+		t.Errorf("got %d leaderboard embeds, want 1", len(embeds))
 	}
 }
 
@@ -356,3 +377,129 @@ func TestIntervalModePicksAChannelWithTraffic(t *testing.T) {
 }
 
 func noNames(userID string) string { return userID }
+
+// ------------------------------------------------------- the leaderboard, M21a
+
+// THE REGRESSION THIS ROW EXISTS TO PREVENT.
+//
+// !leaderboard used to resolve a display name for EVERY user in the week's stats before
+// sorting anything, through an uncached GuildMember REST GET with a User fallback. On a server
+// with two hundred weekly talkers that was two hundred-odd sequential, rate-limited requests
+// to render twenty rows, and it took long enough that people assumed the bot had ignored them.
+//
+// Counting the resolver calls is the only way to pin it. A behavioural test on the rendered
+// board passes just as happily with two hundred lookups behind it.
+func TestTheLeaderboardResolvesOnlyTheNamesItRenders(t *testing.T) {
+	s, guard, _, _ := fixture(t, enabled())
+
+	// Two hundred players on the word-game board, all with distinct scores.
+	for i := range 200 {
+		id := snowflake(1000 + i)
+		for range 200 - i {
+			s.board.AddWin(id, "player")
+		}
+	}
+
+	var calls int
+	names := func(userID string) string {
+		calls++
+		return "name-" + userID
+	}
+
+	// The viewer sits well outside the top ten, so their own row is resolved too.
+	s.Command("!leaderboard", "c1", snowflake(1150), names)
+
+	// Ten rows plus the viewer on the word-game board. The chat board is empty in this
+	// fixture, so it needs none.
+	const want = 11
+	if calls > want {
+		t.Errorf("resolved %d names to render %d rows. Before M21a this was one lookup per "+
+			"weekly talker, which is the whole reason the command was slow", calls, want)
+	}
+	if len(guard.posted()) != 1 {
+		t.Fatalf("got %d embeds, want 1", len(guard.posted()))
+	}
+}
+
+// Somebody who appears on both boards is one person and costs one lookup, not two.
+func TestANameOnBothBoardsIsResolvedOnce(t *testing.T) {
+	s, _, _, _ := fixture(t, enabled())
+
+	viewer := snowflake(500)
+	s.board.AddWin(viewer, "player")
+
+	// The same person also has chat activity.
+	if err := s.store.Update(func(w *storage.Writer) error {
+		return w.IncUserStat(viewer, time.Now())
+	}); err != nil {
+		t.Fatalf("seeding a chat stat: %v", err)
+	}
+
+	seen := map[string]int{}
+	s.Command("!leaderboard", "c1", viewer, func(userID string) string {
+		seen[userID]++
+		return "name"
+	})
+
+	if seen[viewer] != 1 {
+		t.Errorf("the viewer was resolved %d times across two boards, want 1", seen[viewer])
+	}
+}
+
+// The eleventh slot, end to end: somebody at 18th sees 18th.
+func TestTheBoardShowsTheViewerTheirOwnRank(t *testing.T) {
+	s, guard, _, _ := fixture(t, enabled())
+
+	for i := range 30 {
+		id := snowflake(2000 + i)
+		for range 30 - i {
+			s.board.AddWin(id, "player")
+		}
+	}
+
+	viewer := snowflake(2017) // eighteenth by score
+	s.Command("!leaderboard", "c1", viewer, func(userID string) string { return "user-" + userID })
+
+	embeds := guard.posted()
+	if len(embeds) != 1 {
+		t.Fatalf("got %d embeds, want 1", len(embeds))
+	}
+	value := embeds[0].Fields[0].Value
+	if !strings.Contains(value, "18.") {
+		t.Errorf("the viewer sits at 18th and the board does not show it:\n%s", value)
+	}
+	if !strings.Contains(value, "user-"+viewer) {
+		t.Errorf("the viewer's own row is missing:\n%s", value)
+	}
+}
+
+// A viewer with nothing this week is told so rather than left to wonder. A missing row is
+// indistinguishable from a bug.
+func TestTheBoardTellsAViewerWithNoScoreThatTheyHaveNone(t *testing.T) {
+	s, guard, _, _ := fixture(t, enabled())
+	s.board.AddWin(snowflake(3001), "somebody")
+
+	s.Command("!leaderboard", "c1", snowflake(9999), func(userID string) string { return "n" })
+
+	embeds := guard.posted()
+	if len(embeds) != 1 {
+		t.Fatalf("got %d embeds, want 1", len(embeds))
+	}
+	if !strings.Contains(embeds[0].Fields[0].Value, "no wins this week") {
+		t.Errorf("a viewer with no wins is not told so:\n%s", embeds[0].Fields[0].Value)
+	}
+}
+
+// The board goes through SendEmbed, which is what applies the emit gate to every text field
+// and suppresses mentions. A refused send is reported rather than silently producing nothing.
+func TestARefusedBoardIsNotRetriedAsPlainText(t *testing.T) {
+	s, guard, _, _ := fixture(t, enabled())
+	guard.refuse = true
+
+	if consumed := s.Command("!leaderboard", "c1", snowflake(1), noNames); !consumed {
+		t.Error("!leaderboard was not consumed when the guard refused it")
+	}
+	if got := guard.posts(); len(got) != 0 {
+		t.Errorf("a refused embed fell back to a plain message: %v", got)
+	}
+}
