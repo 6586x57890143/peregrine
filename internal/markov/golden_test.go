@@ -24,88 +24,6 @@ import (
 // It asserts almost nothing on purpose. The assertions that do belong here are the
 // mechanical ones, and they live in the tests below it.
 
-// goldenCorpus is a small fixed corpus in the register the bot actually lives in:
-// short, meme-heavy, several authors, some deliberate repetition, an emote shortcode
-// and a name.
-//
-// Several authors matters structurally rather than cosmetically. The author-diversity
-// gate is on in production, so a single-author fixture would generate nothing and the
-// harness would print blank lines forever.
-func goldenCorpus() *fakeCorpus {
-	f := newFake()
-
-	lines := []struct{ author, text string }{
-		{"alice", "the bird is loose again " + EndToken},
-		{"bob", "the bird is loose in the server " + EndToken},
-		{"carol", "the bird is on the roof " + EndToken},
-		{"alice", "someone please contain the bird " + EndToken},
-		{"dave", "the bird knows what it did " + EndToken},
-		{"bob", "bird moment " + EndToken},
-		{"carol", "bird moment " + EndToken},
-		{"alice", "this is peak bird behaviour " + EndToken},
-		{"dave", "peak bird behaviour honestly " + EndToken},
-		{"bob", "ratio ratio ratio " + EndToken},
-		{"carol", "ratio ratio ratio " + EndToken},
-		{"alice", "greg said the bird was fine " + EndToken},
-		{"bob", "greg is coping " + EndToken},
-		{"dave", "greg is coping hard " + EndToken},
-		{"carol", "absolutely cringe behaviour from greg " + EndToken},
-		// Lexicon words verbatim, from two authors so they clear the diversity gate.
-		// The lexicon matches whole tokens, so "coping" does NOT trigger the "cope"
-		// entry: real chat inflects and the lexicon does not, which is a tuning
-		// problem for M7b's persona layer rather than a defect in the mechanism.
-		{"alice", "greg is cope " + EndToken},
-		{"bob", "greg is cope " + EndToken},
-		{"carol", "greg is cringe " + EndToken},
-		{"dave", "greg is cringe " + EndToken},
-		{"alice", "greg is a clown " + EndToken},
-		{"eve", "greg is a clown " + EndToken},
-		{"alice", ":birdstare: what is happening " + EndToken},
-		{"bob", ":birdstare: the server is doomed " + EndToken},
-		{"dave", "the server is doomed lmao " + EndToken},
-		{"carol", "everything is fine actually " + EndToken},
-		{"alice", "nothing is fine actually " + EndToken},
-	}
-
-	// Learn each line twice from two different authors where the fixture repeats it, so
-	// the shared phrases clear a diversity threshold of 2 and the one-off phrases do
-	// not. That asymmetry is the interesting part to read in the output.
-	for _, l := range lines {
-		f.learn(5, l.author, l.text)
-	}
-	for _, l := range lines {
-		if strings.Contains(l.text, "bird") {
-			f.learn(5, "eve", l.text)
-		}
-	}
-
-	f.names["greg"] = true
-
-	// A few associations, so the topic terms have something to say.
-	//
-	// THE POSITIONS ARE REALISTIC RATHER THAN ALL 0.5, and that is load-bearing now. Seed
-	// selection prefers an association that tends to appear EARLY, because it is choosing where
-	// a sentence starts, and a fixture where every word claims to sit dead centre cannot show
-	// whether that works. These mirror where each word actually falls in the lines above:
-	// "greg" opens messages, "loose" and "coping" sit mid-clause, "doomed" ends them.
-	for _, a := range []struct {
-		word, assoc string
-		pos         float64
-	}{
-		{"bird", "loose", 0.65}, {"bird", "roof", 0.85}, {"bird", "moment", 0.5},
-		{"bird", "server", 0.8}, {"bird", "greg", 0.0},
-		{"greg", "coping", 0.7}, {"greg", "cringe", 0.7}, {"greg", "clown", 0.85},
-		{"server", "doomed", 0.9},
-	} {
-		for range 4 {
-			f.addTopicWord(a.word, a.assoc, a.pos)
-			f.addNameTopic(a.word, a.assoc, a.pos)
-		}
-	}
-
-	return f
-}
-
 // generate is ONE attempt, mirroring legacy.generateSentenceAttempt: seed selection, the
 // length model, the dead-end jump. generateReply below adds the retry and the floor that
 // legacy.generateSentenceWithContext adds, and that is the function the harness prints.
@@ -221,9 +139,7 @@ func generate(g *Generator, prompt string, persona Persona) []string {
 		}
 	}
 
-	if !chose {
-		s.Sentence = TrimDangling(s.Sentence)
-	}
+	s.Sentence = TrimDangling(s.Sentence, chose)
 	return s.Sentence
 }
 
@@ -264,7 +180,12 @@ func generateReply(g *Generator, prompt string, persona Persona, styled bool) st
 
 func TestGenerateGolden(t *testing.T) {
 	f := goldenCorpus()
-	prompts := []string{"the bird", "greg is", "the server is", "bird moment", "greg", "what about greg"}
+
+	// The sweep covers the shapes that produced the live failures this milestone is about,
+	// not a list of convenient prompts. In order: the exact failing case (a name behind a
+	// question), a bare name, a two-word prompt with nothing to work from, two names at
+	// once, a name the prompt asks ABOUT, and two controls with no name in them at all.
+	prompts := goldenPrompts()
 
 	for _, temp := range []float64{0.7, 1.0, 1.6, 2.5} {
 		for _, topK := range []int{0, 8, 40} {
