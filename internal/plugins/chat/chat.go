@@ -153,6 +153,7 @@ type Service struct {
 	games    Games
 	voice    Voice
 	recorder Recorder
+	members  names.Session
 	opts     Options
 
 	dispatcher *core.Dispatcher
@@ -189,7 +190,15 @@ type Deps struct {
 	Games    Games
 	Voice    Voice
 	Recorder Recorder
-	Options  Options
+
+	// Members resolves guild members for the leaderboard's display names. In production it is
+	// names.NewCachedSession over the same session, because discordgo's GuildMember is an
+	// unconditional REST GET and this was the last call site in the module without the cache
+	// M18 added for exactly this shape. Nil falls back to the state cache and the User
+	// lookup, which is what the tests use.
+	Members names.Session
+
+	Options Options
 }
 
 // New builds the reactor.
@@ -202,7 +211,7 @@ func New(d Deps) *Service {
 		session: d.Session, store: d.Store, gate: d.Gate, guard: d.Guard,
 		learner: d.Learner, speaker: d.Speaker, memories: d.Memories, emoji: d.Emoji,
 		activity: d.Activity, aggro: d.Aggro, images: d.Images, games: d.Games,
-		voice: d.Voice, recorder: recorder, opts: d.Options,
+		voice: d.Voice, recorder: recorder, members: d.Members, opts: d.Options,
 	}
 }
 
@@ -496,23 +505,64 @@ func commandFor(content string) string {
 // displayName resolves a user ID to the best available name: guild nickname, then username,
 // then the raw ID.
 //
+// Three sources, cheapest first, and the order is the point.
+//
+//  1. The gateway state cache, which costs NOTHING. discordgo already holds members it has
+//     seen, and the leaderboard is asking about people who have just been talking, so this
+//     answers most of it.
+//  2. s.members, which in production is names.NewCachedSession: bounded, with a TTL, and
+//     shared with the ingest and mention paths. discordgo's GuildMember is an unconditional
+//     REST GET with no state-cache check, which is why that wrapper exists at all (M18). This
+//     call site never got it until M21a and was the last uncached one.
+//  3. A plain User lookup for somebody who has left the guild.
+//
 // The ID fallback is deliberate rather than an error path. A leaderboard that omits whoever
 // has left the server silently loses entries, and one that fails entirely because of a single
 // departed member is worse than one showing a number for them.
 func (s *Service) displayName(guildID, userID string) string {
-	if member, err := s.session.GuildMember(guildID, userID); err == nil && member != nil {
-		if member.Nick != "" {
-			return member.Nick
-		}
-		if member.User != nil {
-			return member.User.Username
+	if s.session != nil && s.session.State != nil {
+		if member, err := s.session.State.Member(guildID, userID); err == nil && member != nil {
+			if name := memberName(member); name != "" {
+				return name
+			}
 		}
 	}
-	if user, err := s.session.User(userID); err == nil && user != nil {
-		return user.Username
+	if s.members != nil {
+		if member, err := s.members.GuildMember(guildID, userID); err == nil && member != nil {
+			if name := memberName(member); name != "" {
+				return name
+			}
+		}
+	}
+	if s.session != nil {
+		if user, err := s.session.User(userID); err == nil && user != nil {
+			return user.Username
+		}
 	}
 	log.Printf("[LEADERBOARD] Could not resolve a name for user ID %s", userID)
 	return userID
+}
+
+// memberName picks the best spelling off a member, or "" when it carries none.
+//
+// GlobalName before Username, which is the order names.Spellings uses and the reason it exists:
+// since Discord usernames became lowercase handles, the global display name is the one most
+// people actually type and recognise. Three sites hand-built this before M14 and all three
+// threw it away.
+func memberName(m *discordgo.Member) string {
+	if m == nil {
+		return ""
+	}
+	if m.Nick != "" {
+		return m.Nick
+	}
+	if m.User == nil {
+		return ""
+	}
+	if m.User.GlobalName != "" {
+		return m.User.GlobalName
+	}
+	return m.User.Username
 }
 
 // stepAggro hands the message to the aggro feature.

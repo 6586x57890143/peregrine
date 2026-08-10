@@ -47,6 +47,7 @@ package discordguard
 
 import (
 	"log/slog"
+	"strings"
 
 	"github.com/bwmarrin/discordgo"
 )
@@ -69,6 +70,12 @@ type Session interface {
 	ChannelMessageDelete(channelID, messageID string, options ...discordgo.RequestOption) error
 	MessageReactionAdd(channelID, messageID, emojiID string, options ...discordgo.RequestOption) error
 	MessageReactionRemove(channelID, messageID, emojiID, userID string, options ...discordgo.RequestOption) error
+
+	// UpdateStatusComplex is the presence line. It is a GATEWAY send rather than a REST
+	// call, and it is here for the same reason everything else is: it is text the bot puts
+	// in front of the whole server, so the one place that knows how to gate text should be
+	// the one place that sets it.
+	UpdateStatusComplex(usd discordgo.UpdateStatusData) error
 }
 
 // EmitGate is the outbound half of internal/safety. *safety.Gate satisfies it.
@@ -187,6 +194,121 @@ func (g *Guard) SendReply(channelID, content string, ref *discordgo.MessageRefer
 		return nil, false
 	}
 	return msg, true
+}
+
+// SendEmbed posts an embed, gated and suppressed exactly like a plain send.
+//
+// # The gate reads every text field, not the description
+//
+// An embed is still the bot speaking, and its text is still assembled from things people
+// typed: the leaderboard interpolates Discord nicknames, which are user-controlled and can
+// contain anything. So CheckEmit runs over the concatenation of every field that renders,
+// because a rule applied to the description and not to a field value is the same shape as a
+// rule applied at thirteen of fourteen send sites.
+//
+// # Embeds are documented not to ping, and that is not why mentions are suppressed here
+//
+// AllowedMentions is set exactly as it is for a plain message. Discord's documentation says
+// mentions inside an embed do not notify, and that may well hold forever, but it is precisely
+// the kind of reading this package's allowedMentions comment refuses to depend on: the same
+// argument was available for discordgo's "a zero value allows no mentions", which is true of
+// the field being present and not of its value. Setting it costs one struct.
+func (g *Guard) SendEmbed(channelID string, embed *discordgo.MessageEmbed) (*discordgo.Message, bool) {
+	if embed == nil {
+		return nil, false
+	}
+	if !g.permit(channelID, embedText(embed), "send-embed") {
+		return nil, false
+	}
+
+	msg, err := g.session.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
+		Embeds:          []*discordgo.MessageEmbed{embed},
+		AllowedMentions: allowedMentions(),
+	})
+	if err != nil {
+		g.log.Error("discord embed send failed", "channel", channelID, "err", err)
+		return nil, false
+	}
+	return msg, true
+}
+
+// embedText is everything in an embed that renders as words, for the gate.
+//
+// Built by walking the struct rather than by naming the two fields anybody remembers. A
+// blocklisted word in a field value is exactly as much of an incident as one in the
+// description, and the difference between them is which part of the struct somebody happened
+// to use.
+func embedText(e *discordgo.MessageEmbed) string {
+	var b strings.Builder
+	write := func(s string) {
+		if s == "" {
+			return
+		}
+		b.WriteString(s)
+		b.WriteByte('\n')
+	}
+
+	write(e.Title)
+	write(e.Description)
+	if e.Author != nil {
+		write(e.Author.Name)
+	}
+	if e.Footer != nil {
+		write(e.Footer.Text)
+	}
+	for _, f := range e.Fields {
+		if f == nil {
+			continue
+		}
+		write(f.Name)
+		write(f.Value)
+	}
+	return b.String()
+}
+
+// Presence sets the bot's status line.
+//
+// Routed through the guard so that the structural test has something to point at and so the
+// call is logged, which is the same argument Delete makes: every Discord call has one place
+// that knows about it.
+//
+// # It is content-gated and NOT pause-gated, and both halves are deliberate
+//
+// Gated on content, because the caller may put a word from the corpus in here. A status line
+// derived from user text is public output with no reply chain around it and no human context,
+// which makes it the same category of risk as the autonomous poster rather than a lower one.
+// A caller passing only its own numbers pays a cheap check it cannot fail.
+//
+// NOT gated on the pause switch, and this is the asymmetry Unreact already makes. Presence
+// carries no channel content and cannot ping anybody, so suppressing it during an incident
+// buys nothing and costs the operator their only sign the process is still alive: a bot with
+// a frozen status line and no messages looks like a bot that has died, at exactly the moment
+// somebody needs to know which of the two they have. The caller that wants a corpus word in
+// there is the one that has to care, and it does: CheckEmit still refuses it.
+func (g *Guard) Presence(text string) bool {
+	if text != "" && !g.gate.CheckEmit(text) {
+		// The gate has already logged the category and the rule and deliberately not the
+		// text. The caller falls back to something it composed itself.
+		return false
+	}
+
+	if err := g.session.UpdateStatusComplex(discordgo.UpdateStatusData{
+		Status: "online",
+		Activities: []*discordgo.Activity{{
+			Name: text,
+			// Watching, because everything peregrine can honestly say about itself is an
+			// observation: how much it has read and how many people it knows. "Playing" would
+			// be a claim about a game that does not exist.
+			Type: discordgo.ActivityTypeWatching,
+		}},
+	}); err != nil {
+		// Info rather than Error, matching Delete and the reactions: a presence update that
+		// fails is cosmetic, the gateway retries on the next tick, and alarming about it
+		// trains an operator to stop reading the log.
+		g.log.Info("discord presence update failed", "err", err)
+		return false
+	}
+	return true
 }
 
 // Edit replaces the content of a message the bot already sent.

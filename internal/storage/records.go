@@ -141,6 +141,44 @@ func (w *Writer) IncTopic(word string) error {
 // candidate at every step of every generated sentence.
 func (r *Reader) TotalTopicCount() uint64 { return r.counter(metaTopicTotal) }
 
+// ScanTopics walks the vocabulary forward from a key, calling fn until it returns false or
+// limit words have been visited.
+//
+// BOUNDED BY THE CALLER, which is the only reason a scan is acceptable here at all. The topic
+// bucket is one key per distinct word, so it reaches tens of thousands of entries on a real
+// corpus, and an unbounded walk of it is the shape finding 11 records: Bucket.Stats() in a
+// loop condition, once per message. This is a sequential cursor scan over eight-byte values
+// with a hard stop, and its one caller runs on the status ticker rather than on any hot path.
+//
+// The caller supplies `from` so it can start somewhere other than the beginning. Starting
+// always at the first key would make every answer a word beginning with a digit or an "a".
+//
+// No filtering happens here, deliberately. Deciding that a word is a stop word or too short
+// is internal/text's job, and storage is the bottom layer: it must not learn what a word means.
+func (r *Reader) ScanTopics(from string, limit int, fn func(word string, count uint64) bool) {
+	if limit <= 0 || fn == nil {
+		return
+	}
+	b := r.bucket(bucketTopic)
+	if b == nil {
+		return
+	}
+
+	c := b.Cursor()
+	k, v := c.Seek([]byte(from))
+	for range limit {
+		if k == nil {
+			return
+		}
+		// The key is only valid for the life of the transaction, so it is converted rather
+		// than handed out. That is the same rule every other accessor here follows.
+		if !fn(string(k), decodeUint64(v)) {
+			return
+		}
+		k, v = c.Next()
+	}
+}
+
 // TopicWord returns a word-to-association co-occurrence record.
 func (r *Reader) TopicWord(word, assoc string) (corpus.TopicAssoc, error) {
 	return r.assoc(bucketTopicWord, word, assoc)
