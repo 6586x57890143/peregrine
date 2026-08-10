@@ -88,7 +88,7 @@ func generate(g *Generator, prompt string, persona Persona) []string {
 		Persona:      persona,
 		Prefix:       append([]string{}, words...),
 		Sentence:     append([]string{}, words...),
-		CurrentTopic: seed,
+		CurrentTopic: SeedTopic(seed),
 	}
 	for _, w := range promptWords {
 		s.PromptSet[w] = struct{}{}
@@ -173,7 +173,19 @@ func generateReply(g *Generator, prompt string, persona Persona, styled bool) st
 
 	out := strings.Join(best, " ")
 	if styled {
-		out = g.Style(out, persona, false)
+		// aboutName mirrors the production caller, which passes whether the prompt named
+		// anybody. It was hardcoded false, so the StyleChanceName branch at 0.65 had never
+		// once appeared in a printed sample: the harness could not see the persona layer on
+		// exactly the replies where it fires hardest. Finding 35's closing lesson again, an
+		// instrument that silently omits a code path.
+		aboutName := false
+		for _, w := range strings.Fields(prompt) {
+			if g.corpus.IsName(w) {
+				aboutName = true
+				break
+			}
+		}
+		out = g.Style(out, persona, aboutName)
 	}
 	return out
 }

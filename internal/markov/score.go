@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	"github.com/6586x57890143/peregrine/internal/corpus"
-	"github.com/6586x57890143/peregrine/internal/text"
 )
 
 // EndToken is the sentinel the corpus stores for the end of a message.
@@ -243,6 +242,26 @@ func (g *Generator) heuristics(s *Step, c candidate, assoc assocCache) float64 {
 		logit += w.TopicGravity * math.Tanh(gravity/4.0)
 	}
 
+	// THE PERSON'S OWN VOCABULARY, which had no logit at all (SPEC.md section 8, finding 42).
+	//
+	// s.NameAssoc's keys ARE the words the corpus has seen people use about this person. The
+	// block below walks a SECOND hop out of them, looking up each key in TopicWordsFor and
+	// scoring the candidate for co-occurring with that, and until now the second hop was the
+	// only name-association term there was. So "cope" being what the server says about greg
+	// moved no candidate, while a word that merely co-occurs with "cope" did.
+	//
+	// Compare TopicGravity above: that is the same one-hop question asked of a prompt word,
+	// at 0.70. A name is more specific than any one word in the message, so this sits just
+	// above it, and below PromptName at 0.90 because naming the person is more direct still.
+	//
+	// Costs no I/O: NameAssoc is already on the Step, and this is a map lookup.
+	if d, ok := s.NameAssoc[tok]; ok {
+		pos := math.Exp(-math.Abs(s.Position-d.MeanPosition()) * 4.0)
+		if e := math.Sqrt(float64(d.Count)) * pos; e > 0 {
+			logit += w.NameTopic * math.Tanh(e/3.0)
+		}
+	}
+
 	// Name association: the same idea for topics tied to a recognized name, applied
 	// hierarchically, the name's position gating the word's.
 	var nameScore float64
@@ -311,13 +330,26 @@ func (g *Generator) heuristics(s *Step, c candidate, assoc assocCache) float64 {
 		logit += w.RecentContext
 	}
 
-	// Prompt gravity: similarity between the sentence fragment and the prompt.
-	if s.Prompt != "" {
-		fragment := strings.Join(s.Prefix, " ") + " " + tok
-		if sim := text.Similarity(fragment, s.Prompt); sim > 0.05 {
-			logit += w.PromptGravity * sim
-		}
-	}
+	// PROMPT GRAVITY IS GONE, and it was three things at once, none of them what it claimed
+	// (SPEC.md section 8, finding 43).
+	//
+	// It computed a Jaccard index between the sentence so far plus this candidate, and the
+	// prompt. Within one step the prefix is IDENTICAL for every candidate, so most of that
+	// number was a constant, and a constant added to every logit cancels in the softmax. What
+	// actually varied was two things. First, whether the candidate is a prompt word, worth
+	// about 0.09 logits at typical sizes, which duplicates the PromptRelevance term four lines
+	// up that pays 0.6 for exactly that. Second, whether the candidate is ALREADY in the
+	// prefix, worth about 0.02, because a repeat does not grow the union: it paid a candidate
+	// for doing the thing Repetition, ImmediateRepeat and BigramRepeat all exist to punish.
+	//
+	// It was also the most expensive term in the loop, joining the whole prefix and
+	// re-tokenizing the entire prompt through a regex once per candidate per step.
+	//
+	// text.Similarity went with it, having no other caller. Its own doc comment described
+	// rejecting a sentence that is too close to the prompt, which no caller has ever done, and
+	// that gap is its own small evidence the term was never doing the job it was named for. A
+	// parrot check, if one is ever wanted, belongs on the finished sentence where it is one
+	// call rather than one per candidate.
 
 	// Repetition. Gentle on purpose: memetic repetition is the register, so this is
 	// meant to suppress stuttering rather than to flatten a deliberate cadence.

@@ -14,6 +14,7 @@ import (
 	"github.com/6586x57890143/peregrine/internal/generate"
 	"github.com/6586x57890143/peregrine/internal/learn"
 	"github.com/6586x57890143/peregrine/internal/plugins/aggro"
+	"github.com/6586x57890143/peregrine/internal/plugins/assocfill"
 	"github.com/6586x57890143/peregrine/internal/plugins/autopost"
 	"github.com/6586x57890143/peregrine/internal/plugins/backup"
 	"github.com/6586x57890143/peregrine/internal/plugins/chat"
@@ -185,6 +186,19 @@ func registerServices(
 		ChannelConcurrency: cfg.IngestChannelConcurrency,
 		BatchDelay:         cfg.IngestBatchDelay,
 	})
+	// The one-shot association re-walk. Registered unconditionally and gated inside Start,
+	// so an operator turning it on is a restart rather than a different binary, and so the
+	// service can report what it decided.
+	assocSvc := assocfill.New(session, store, learner, assocfill.Options{
+		Enabled: cfg.AssocBackfill,
+		Before:  cfg.AssocBackfillBefore,
+		// Gentler than the live pass on purpose: this walk has no deadline and the bot
+		// does, so it yields REST budget rather than competing for it.
+		GuildConcurrency:   1,
+		ChannelConcurrency: 2,
+		BatchDelay:         time.Second,
+		Retry:              time.Hour,
+	})
 	backupSvc := backup.New(store, backup.Options{
 		Dir:   cfg.BackupDir,
 		Every: cfg.BackupTick,
@@ -206,6 +220,10 @@ func registerServices(
 	registry.Register(voiceSvc)
 	registry.Register(reactor)
 	registry.Register(ingestSvc)
+	// After ingest, so a restart that resumes both starts the live pass first: the walk that
+	// keeps the corpus current matters more than the one repairing history, and they compete
+	// for the same REST budget.
+	registry.Register(assocSvc)
 	registry.Register(backupSvc)
 	registry.Register(healthSvc)
 	return nil

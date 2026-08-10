@@ -388,3 +388,72 @@ func (l *Learner) ngrams(w *storage.Writer, words []string, author names.User) (
 	}
 	return total, nil
 }
+
+// Associations writes ONLY the two co-occurrence indexes, for a message that was learned
+// before the finding-33 fix landed.
+//
+// # Why a second entry point exists at all
+//
+// The package comment says every path into the corpus goes through Message and not to add a
+// second one, so this needs a reason rather than a convenience. Finding 33 repaired the
+// WRITER: the backfill passed no author, associate returned early on an empty name set, and
+// every historical message therefore wrote neither index. Repairing the writer does not
+// repair the data, and the data is not re-derivable: the corpus stores n-grams and counts and
+// never message text, while associations need original word sequences with positions. So the
+// only way back is to re-read Discord, and re-reading through Message would count every
+// n-gram a second time (finding 13).
+//
+// The general lesson, recorded as finding 46: a fix to a writer is not a fix to the data, and
+// whether the data is re-derivable is a property of the layout that has to be checked before
+// the fix is called done.
+//
+// # What it deliberately does NOT write
+//
+// No n-grams, because they are already correct and writing them again is finding 13. No
+// history entry, because the dedup window is capped at PEREGRINE_MAX_HISTORY and filling it
+// with old message IDs would evict the live entries that stop real double-learning. No
+// messages-learned counter and no topic counts, both of which are already correct because
+// they are written OUTSIDE associate's guard. No weekly stats, which would double every
+// user's count. And no names.Record, because that bumps Name.Count on every call: the
+// historical pass already recorded these people, so this resolves canonical names by READING
+// through names.Canonical instead.
+//
+// # The gate is called here, literally
+//
+// Not through a shared helper, and not by the caller. A gate at one of two entry points is
+// not a gate, which is A1's whole lesson, and the AST test in this package requires every
+// exported method taking a *storage.Writer to contain this call in its own body. A helper
+// would be one hop that test has to follow, and the next refactor makes it two.
+func (l *Learner) Associations(w *storage.Writer, msg string, author names.User, mentioned []names.User) error {
+	msg = strings.TrimSpace(l.mentionPattern().ReplaceAllString(msg, ""))
+	msg = names.Substitute(msg, mentioned)
+	if msg == "" {
+		return nil
+	}
+
+	if v := l.gate.CheckLearn(msg); !v.Allowed {
+		return nil
+	}
+
+	words := text.Tokenize(msg)
+	if len(words) == 0 {
+		return nil
+	}
+	words = append(words, EndToken)
+
+	// Canonical names by READING. See above: names.Record would inflate Name.Count for
+	// people the historical pass already recorded.
+	canonical := make(map[string]struct{}, len(mentioned)+1)
+	for _, u := range mentioned {
+		if name, ok := names.Canonical(&w.Reader, u.Username); ok {
+			canonical[name] = struct{}{}
+		}
+	}
+	if author.Username != "" {
+		if name, ok := names.Canonical(&w.Reader, author.Username); ok {
+			canonical[name] = struct{}{}
+		}
+	}
+
+	return l.associate(w, words, canonical)
+}

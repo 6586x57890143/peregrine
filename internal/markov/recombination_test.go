@@ -76,10 +76,16 @@ func sweepSamples(t *testing.T) []string {
 			p.MinDistinctAuthors = 2
 
 			for _, prompt := range goldenPrompts() {
-				g := New(f, p, seeded(0xC0FFEE, 0xBADF00D))
-				for range 3 {
-					if line := generateReply(g, prompt, PersonaNeutral, false); line != "" {
-						out = append(out, line)
+				// STYLED AND UNSTYLED BOTH, because the persona post-pass is a producer of
+				// words like any other and the sweep could not see it. Style appends and
+				// splices AFTER TrimDangling has run, so a sample that skips it cannot say
+				// whether the finished string is well formed.
+				for _, styled := range []bool{false, true} {
+					g := New(f, p, seeded(0xC0FFEE, 0xBADF00D))
+					for range 3 {
+						if line := generateReply(g, prompt, PersonaNeutral, styled); line != "" {
+							out = append(out, line)
+						}
 					}
 				}
 			}
@@ -252,7 +258,14 @@ func TestGoldenSamplesReadAsReplies(t *testing.T) {
 	// asserting it as a limit would silently put this test in disagreement with
 	// PEREGRINE_MAX_WORDS. The distribution below is what says whether the mode is right, and
 	// it is logged rather than asserted because that is an operator's judgement.
-	maxWords := testParams().MaxWords
+	//
+	// MaxWords bounds GENERATION, and the persona post-pass appends filler to the finished
+	// string afterwards, so the posted message can legitimately exceed it. The allowance is
+	// derived from the longest filler this package can actually add rather than guessed,
+	// because a hardcoded slack would silently stop matching if a longer meta-comment were
+	// added. That is worth stating: the two numbers are about different things and reading
+	// MaxWords as a bound on what lands in the channel would be wrong.
+	maxWords := testParams().MaxWords + longestFiller()
 
 	var lengths []int
 	var tooLong, dangling []string
@@ -340,4 +353,20 @@ func goldenPrompts() []string {
 		"the bird",
 		"the server is",
 	}
+}
+
+// longestFiller is the most words the persona post-pass can add to a finished sentence.
+//
+// Derived from the filler sets rather than hardcoded, so that adding a longer meta-comment
+// cannot silently make the length assertion above stop matching what Style can produce.
+func longestFiller() int {
+	longest := 0
+	for _, set := range [][]string{openers, closers, interjections, metaComments} {
+		for _, f := range set {
+			if n := len(strings.Fields(f)); n > longest {
+				longest = n
+			}
+		}
+	}
+	return longest
 }

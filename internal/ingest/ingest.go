@@ -102,6 +102,15 @@ type Options struct {
 
 	// PageSize is how many messages to request per call, capped at Discord's 100.
 	PageSize int
+
+	// Until stops a channel's walk at the first message created at or after this instant.
+	//
+	// The zero value means no bound, which is every caller except the association re-walk.
+	// That pass exists to repair messages learned BEFORE a fix deployed (finding 46), and
+	// bounding it is what makes it purely additive: walking only what predates the fix
+	// double-counts nothing, needs no bucket dropped, and leaves an interrupted pass as
+	// monotone progress rather than a corpus worse than it started.
+	Until time.Time
 }
 
 func (o Options) withDefaults() Options {
@@ -275,16 +284,29 @@ func (in *Ingester) channel(ctx context.Context, ch *discordgo.Channel, guildID 
 			break
 		}
 
+		reachedBound := false
 		for _, m := range reversed(batch) {
 			if m.Author == nil || m.Author.Bot || m.Timestamp.IsZero() {
 				st.Skipped++
 				continue
+			}
+			// The Until bound, checked per message rather than per page because a page
+			// straddles it. Everything from here on is newer than the bound and belongs to
+			// whoever set it, so stop without advancing the mark past this point.
+			if !in.opts.Until.IsZero() && !m.Timestamp.Before(in.opts.Until) {
+				reachedBound = true
+				break
 			}
 			if err := in.learner.Learn(m, guildID); err != nil {
 				st.Errors++
 				continue
 			}
 			st.Learned++
+			newest = m.ID
+		}
+
+		if reachedBound {
+			break
 		}
 
 		newest = newestInBatch

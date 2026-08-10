@@ -1644,3 +1644,88 @@ func TestAddingTheCursorBucketDidNotBreakAnExistingCorpus(t *testing.T) {
 		t.Fatalf("View: %v", err)
 	}
 }
+
+// TestANewCorpusIsMarkedAlreadyBackfilled.
+//
+// The association re-walk repairs messages learned before a fix deployed (finding 46). A
+// corpus created after that fix has nothing older to repair, so it must never walk. Deciding
+// that in Open rather than in the service means it does not depend on an operator remembering
+// to unset an environment variable after wiping the volume, and Open is the only place that
+// knows the file is new.
+func TestANewCorpusIsMarkedAlreadyBackfilled(t *testing.T) {
+	s := dbtest.Store(t)
+
+	var state string
+	if err := s.View(func(r *storage.Reader) error {
+		state = r.AssocBackfillState()
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if state != storage.AssocBackfillDone {
+		t.Errorf("a fresh corpus reports assoc backfill state %q, want %q: it would otherwise "+
+			"re-read all of Discord history looking for messages that cannot exist",
+			state, storage.AssocBackfillDone)
+	}
+}
+
+// TestTheAssociationCursorIsIndependentOfTheIngestCursor.
+//
+// The two passes read the same channels for opposite reasons: ingest asks what is NEW and must
+// never rewind, the re-walk asks what is OLD and finishes. Sharing one mark would let either
+// move the other's, and moving the ingest mark backwards re-learns everything between, which
+// is finding 13.
+func TestTheAssociationCursorIsIndependentOfTheIngestCursor(t *testing.T) {
+	s := dbtest.Store(t)
+	const channel = "c1"
+
+	newer, older := snowflake(5000), snowflake(1000)
+
+	if err := s.Update(func(w *storage.Writer) error {
+		if err := w.SetCursor(channel, newer); err != nil {
+			return err
+		}
+		return w.SetAssocCursor(channel, older)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.View(func(r *storage.Reader) error {
+		if got := r.Cursor(channel); got != newer {
+			t.Errorf("ingest cursor = %q, want %q: the association pass moved it", got, newer)
+		}
+		if got := r.AssocCursor(channel); got != older {
+			t.Errorf("association cursor = %q, want %q", got, older)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestTheAssociationCursorRefusesToRewind, for the same reason SetCursor does: a batch
+// processed out of order would otherwise have its associations counted twice.
+func TestTheAssociationCursorRefusesToRewind(t *testing.T) {
+	s := dbtest.Store(t)
+	const channel = "c1"
+
+	newer, older := snowflake(5000), snowflake(1000)
+
+	if err := s.Update(func(w *storage.Writer) error {
+		if err := w.SetAssocCursor(channel, newer); err != nil {
+			return err
+		}
+		return w.SetAssocCursor(channel, older)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.View(func(r *storage.Reader) error {
+		if got := r.AssocCursor(channel); got != newer {
+			t.Errorf("association cursor rewound to %q, want it held at %q", got, newer)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
