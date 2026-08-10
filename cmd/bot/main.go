@@ -24,6 +24,7 @@ import (
 
 	"github.com/6586x57890143/peregrine/internal/config"
 	"github.com/6586x57890143/peregrine/internal/core"
+	"github.com/6586x57890143/peregrine/internal/learn"
 	"github.com/6586x57890143/peregrine/internal/maintenance"
 	"github.com/6586x57890143/peregrine/internal/safety"
 	"github.com/6586x57890143/peregrine/internal/storage"
@@ -161,6 +162,23 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 			log.Error("closing corpus", "err", err)
 		}
 	}()
+
+	// STAMP WHICH GENERATION OF THE WRITE PATH IS ABOUT TO RUN, before anything writes.
+	//
+	// This is the boundary a future history repair measures itself against: everything older
+	// than the first run of the generation that fixed a writer bug went through the broken
+	// path, and everything newer did not. Recording it costs one idempotent key and removes
+	// the need for an operator to remember a deploy timestamp, which is the part of the M17
+	// design that did not survive contact with a second repair (SPEC.md section 8, finding 46).
+	//
+	// Here rather than in storage.Open because storage is the bottom layer and must not import
+	// learn; here rather than in the learner because a stamp that depends on a message arriving
+	// is a stamp that a quiet server never writes.
+	if err := store.Update(func(w *storage.Writer) error {
+		return w.RecordLearnGeneration(learn.Generation, time.Now())
+	}); err != nil {
+		return fmt.Errorf("recording learn generation: %w", err)
+	}
 
 	// The safety gate, built before the session so a bad ruleset stops the process
 	// before it can connect to anything.

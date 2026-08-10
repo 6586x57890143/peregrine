@@ -33,22 +33,23 @@ import (
 // legacy then aliased, pointing the dependency the wrong way round: an algorithm
 // package owning storage-layer names (SPEC.md section 2). They live here now.
 const (
-	bucketNgram       = "ngram"        // <prefix> NUL <next>            -> count u64 | authors u32
-	bucketNgramAuth   = "ngram_auth"   // <prefix> NUL <next> NUL <uid>  -> presence
-	bucketKNSucc      = "kn_succ"      // <prefix>                       -> N1+(prefix .)
-	bucketKNPre       = "kn_pre"       // <token> NUL <context>          -> presence
-	bucketKNPreCount  = "kn_pre_n"     // <token>                        -> N1+(. token)
-	bucketTopic       = "topic"        // <word>                         -> count u64
-	bucketTopicWord   = "topic_word"   // <word> NUL <assoc>             -> count u64 | posSum f64
-	bucketNameTopic   = "name_topic"   // <name> NUL <topic>             -> count u64 | posSum f64
-	bucketName        = "name"         // <name key>                     -> JSON corpus.Name
-	bucketHistory     = "history"      // <snowflake be64>               -> unix nano
-	bucketImage       = "image"        // <msgID be64> NUL <url>         -> author be64
-	bucketStats       = "stats"        // <user id>                      -> JSON corpus.WeeklyStat
-	bucketLeaderfoo   = "leaderboard"  // fixed key                      -> JSON
-	bucketCursor      = "cursor"       // <channel id>                   -> snowflake be64
-	bucketAssocCursor = "assoc_cursor" // <channel id>                 -> snowflake be64
-	bucketMeta        = "meta"         // schema_version, counters
+	bucketNgram      = "ngram"         // <prefix> NUL <next>            -> count u64 | authors u32
+	bucketNgramAuth  = "ngram_auth"    // <prefix> NUL <next> NUL <uid>  -> presence
+	bucketKNSucc     = "kn_succ"       // <prefix>                       -> N1+(prefix .)
+	bucketKNPre      = "kn_pre"        // <token> NUL <context>          -> presence
+	bucketKNPreCount = "kn_pre_n"      // <token>                        -> N1+(. token)
+	bucketTopic      = "topic"         // <word>                         -> count u64
+	bucketTopicWord  = "topic_word"    // <word> NUL <assoc>             -> count u64 | posSum f64
+	bucketNameTopic  = "name_topic"    // <name> NUL <topic>             -> count u64 | posSum f64
+	bucketName       = "name"          // <name key>                     -> JSON corpus.Name
+	bucketHistory    = "history"       // <snowflake be64>               -> unix nano
+	bucketImage      = "image"         // <msgID be64> NUL <url>         -> author be64
+	bucketStats      = "stats"         // <user id>                      -> JSON corpus.WeeklyStat
+	bucketLeaderfoo  = "leaderboard"   // fixed key                      -> JSON
+	bucketCursor     = "cursor"        // <channel id>                   -> snowflake be64
+	bucketRepairCurs = "repair_cursor" // <job> NUL <channel id>        -> snowflake be64
+	bucketLearnGen   = "learn_gen"     // <generation be64>              -> unix nano
+	bucketMeta       = "meta"          // schema_version, counters
 )
 
 // allBuckets is the set Open creates. Listed once so adding a bucket cannot forget
@@ -63,7 +64,7 @@ var allBuckets = []string{
 	bucketNgram, bucketNgramAuth, bucketKNSucc, bucketKNPre, bucketKNPreCount,
 	bucketTopic, bucketTopicWord, bucketNameTopic, bucketName,
 	bucketHistory, bucketImage, bucketStats, bucketLeaderfoo,
-	bucketCursor, bucketAssocCursor, bucketMeta,
+	bucketCursor, bucketRepairCurs, bucketLearnGen, bucketMeta,
 }
 
 // Meta keys.
@@ -74,22 +75,35 @@ const (
 	metaMessagesLearned = "count:messages_learned"
 	metaTopicTotal      = "count:topic_total"
 
-	// metaAssocBackfill records whether the one-shot association re-walk has run.
+	// metaRepairPrefix names one repair job's completion marker, as
+	// "repair:<job name>". Per job rather than one shared key, because two repairs finish
+	// at different times and a shared marker would let one declare the other done.
 	//
-	// Values are "" (never run), "running" and "done". See finding 46: the association
-	// indexes are the one thing in this layout that cannot be rebuilt from the corpus,
-	// because associations need original word sequences with positions and the corpus
-	// stores n-grams and counts.
-	metaAssocBackfill = "assoc_backfill"
+	// See finding 46: the association indexes are the one thing in this layout that cannot
+	// be rebuilt from the corpus, because associations need original word sequences with
+	// positions and the corpus stores n-grams and counts. Any future index built from
+	// message STRUCTURE rather than message content has the same property, which is why
+	// this is a prefix and not a single key.
+	metaRepairPrefix = "repair:"
 )
 
-// Assoc backfill states, exported so the service and the storage layer cannot disagree
-// about the spelling of a value one writes and the other reads.
+// RepairState is how far one repair job has got.
+//
+// A NAMED TYPE rather than a bare string, because the M17 version took any string and wrote
+// it raw: a typo became a state no reader recognized, and the job then silently never
+// completed. An invalid value should not be spellable.
+type RepairState string
+
 const (
-	AssocBackfillPending = ""
-	AssocBackfillRunning = "running"
-	AssocBackfillDone    = "done"
+	RepairPending RepairState = ""
+	RepairRunning RepairState = "running"
+	RepairDone    RepairState = "done"
 )
+
+// Valid reports whether a state is one this package writes.
+func (s RepairState) Valid() bool {
+	return s == RepairPending || s == RepairRunning || s == RepairDone
+}
 
 // SchemaVersion is the on-disk layout this binary understands.
 //
@@ -164,15 +178,16 @@ func (s *Store) initialize() error {
 			if err := meta.Put([]byte(metaSchemaVersion), encodeUint64(SchemaVersion)); err != nil {
 				return err
 			}
-			// A BRAND NEW CORPUS IS ALREADY BACKFILLED, decided here rather than by the
-			// service, because it is a property of the file and this is the one place that
-			// knows the file is new. Every message a fresh corpus will ever learn goes
-			// through the fixed writer, so there is nothing older than the fix to walk, and
-			// relying on an operator to unset an environment variable after a wipe is how a
-			// pointless full-history re-read gets run on every new deploy.
-			if err := meta.Put([]byte(metaAssocBackfill), []byte(AssocBackfillDone)); err != nil {
-				return err
-			}
+			// NO SPECIAL CASE FOR A FRESH CORPUS ANY MORE, and its deletion is the point
+			// of the learn-generation stamp rather than a regression.
+			//
+			// M17 stamped a new file as "association backfill already done" right here, so a
+			// fresh deploy would not walk all of Discord looking for messages that cannot
+			// exist. That worked and it was a second mechanism answering a question the
+			// first one now answers: cmd/bot records the current learn generation on the
+			// first open, so a repair bounded at "when generation N began" gets a boundary
+			// equal to this file's own birth and finds nothing. One mechanism, no special
+			// case, and it generalizes to the next repair instead of only this one.
 
 		case decodeUint64(stored) == SchemaVersion:
 

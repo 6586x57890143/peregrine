@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -186,6 +187,20 @@ func pairKey(a, b string) ([]byte, error) {
 	key = append(key, sep)
 	key = append(key, b...)
 	return key, nil
+}
+
+// splitPairKey recovers both halves of a <a> NUL <b> key.
+//
+// Unlike splitNgramKey it cannot take the first half's length from the caller, because a
+// ForEach over the whole bucket does not know it. That is safe here for the same reason
+// pairKey is: assertNoNul refuses a NUL in either half at write time, so the FIRST separator
+// is the only separator and the split is unambiguous.
+func splitPairKey(key []byte) (string, string, bool) {
+	i := bytes.IndexByte(key, sep)
+	if i < 0 {
+		return "", "", false
+	}
+	return string(key[:i]), string(key[i+1:]), true
 }
 
 // encodeNgram packs a count and a distinct-author count into a fixed 12 bytes.
