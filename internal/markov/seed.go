@@ -89,6 +89,13 @@ var seedBudget = [numSeedTiers]float64{
 	tierRecent:      4.0,
 }
 
+// recalledNameDiscount is how much less a person the channel was recently discussing is worth
+// than one this message actually named.
+//
+// Within the same tier rather than a tier of their own, so recall cannot outrank presence
+// however faded the conversation is, and so adding it costs no budget from anything else.
+const recalledNameDiscount = 0.5
+
 // assocEvidenceShare splits a candidate's within-tier score between how well attested the
 // association is and how well the word works as an OPENING. The remainder goes to position.
 const assocEvidenceShare = 0.6
@@ -222,11 +229,26 @@ type SeedInput struct {
 	// PromptWords are the tokenized prompt, in order, already normalized.
 	PromptWords []string
 
-	// RecentWords are the decayed conversation context, the weakest tier.
-	RecentWords []string
+	// RecentMessages is the conversation context, ONE ENTRY PER MESSAGE and oldest first.
+	//
+	// Per message rather than one flat slice, because this tier forms n-gram windows and a
+	// window spanning two messages is a phrase nobody said. The previous encoding was worse
+	// than merely flat: it expressed recency by REPEATING each token in place, so almost every
+	// window was a doubled word and the genuine bigrams survived only at repetition
+	// boundaries. One encoding served two consumers that needed opposite things, and it threw
+	// away what each of them read (SPEC.md section 8, finding 48).
+	RecentMessages [][]string
 
 	// Names are the canonical recognized names in the prompt.
 	Names []string
+
+	// RecalledNames are people the channel was recently talking about who are NOT in the
+	// current message.
+	//
+	// They reach the association tiers and nothing else. Deliberately not the name seed tier
+	// and not PromptNames: seeding at, or naming, somebody nobody just mentioned reads as a
+	// non-sequitur rather than as memory.
+	RecalledNames []string
 
 	// NameTokens is every SPELLING of a recognized name that appeared in the prompt, surface
 	// form and canonical form both.
@@ -266,38 +288,7 @@ func (g *Generator) collectSeedCands(in SeedInput, fromPrompt map[string]struct{
 	maxN := max(g.params.MaxNGram-1, 1)
 
 	// Tier 1: n-grams from the prompt, longest first, and single prompt words at n == 1.
-	for n := maxN; n >= 1; n-- {
-		for i := 0; i+n <= len(in.PromptWords); i++ {
-			key := strings.Join(in.PromptWords[i:i+n], " ")
-
-			// A LONE FUNCTION WORD IS NOT A SEED. Starting a reply on "is" or "of" or "the"
-			// can only produce something that reads as though its first half went missing:
-			// the golden samples had "is peak bird behaviour honestly" and "what it did".
-			//
-			// Only this tier can do it, because the association indexes exclude stop words on
-			// the write side, so this is the one place the check belongs. Multi-word keys are
-			// exempt deliberately: "the bird" and "the server is" open perfectly well, and it
-			// is the word standing alone that is the problem.
-			if n == 1 && text.IsStopWord(key) {
-				continue
-			}
-
-			// AND A SEED MAY NOT OPEN ON A CONJUNCTION, whatever its length. The rule
-			// above only catches a lone function word, so the prompt "greg and lachy are
-			// both" still offered the window "and lachy are", which generated "and lachy
-			// are you know what i am going to lose it". A conjunction promises a clause
-			// that was never there, which is the same damage as the lone stop word one
-			// line up, arriving through a window the length exemption let past.
-			if !text.CanOpenSentence(in.PromptWords[i]) {
-				continue
-			}
-
-			if g.corpus.HasSuccessors(key) {
-				cands.add(tierPromptNgram, key, float64(n))
-				fromPrompt[key] = struct{}{}
-			}
-		}
-	}
+	g.addWindows(cands, tierPromptNgram, in.PromptWords, maxN, fromPrompt)
 
 	// Tier 2: the recognized name ITSELF, so a reply can start at the person rather than only
 	// somewhere near them.
@@ -315,7 +306,16 @@ func (g *Generator) collectSeedCands(in SeedInput, fromPrompt map[string]struct{
 		}
 	}
 
-	// Tier 3: topics associated with a recognized name.
+	// Tier 3: topics associated with a name.
+	//
+	// RECALLED NAMES REACH THIS TIER AND NOT TIER 2, which is the whole rule about memory of
+	// people. What the channel was recently discussing should colour what the bot talks about;
+	// starting a reply AT somebody nobody just mentioned, or naming them outright, reads as a
+	// non-sequitur rather than as memory. So recall steers and never seeds, exactly as the
+	// referenced message does.
+	//
+	// They share the tier's budget rather than getting one of their own, at a discount, so
+	// somebody named right now always outranks somebody named five messages ago.
 	for _, name := range in.Names {
 		assoc, err := g.corpus.NameTopicsFor(name)
 		if err != nil {
@@ -323,6 +323,15 @@ func (g *Generator) collectSeedCands(in SeedInput, fromPrompt map[string]struct{
 		}
 		for topic, d := range assoc {
 			cands.add(tierNameTopic, topic, assocScore(d))
+		}
+	}
+	for _, name := range in.RecalledNames {
+		assoc, err := g.corpus.NameTopicsFor(name)
+		if err != nil {
+			continue
+		}
+		for topic, d := range assoc {
+			cands.add(tierNameTopic, topic, recalledNameDiscount*assocScore(d))
 		}
 	}
 
@@ -360,16 +369,64 @@ func (g *Generator) collectSeedCands(in SeedInput, fromPrompt map[string]struct{
 	}
 
 	// Recent conversation, the floor.
-	for n := maxN; n >= 1; n-- {
-		for i := 0; i+n <= len(in.RecentWords); i++ {
-			key := strings.Join(in.RecentWords[i:i+n], " ")
-			if g.corpus.HasSuccessors(key) {
-				cands.add(tierRecent, key, float64(n))
-			}
-		}
+	//
+	// One message at a time, so a window cannot span two of them: joining the tail of one
+	// message to the head of the next produces a phrase nobody said, and the old flat slice
+	// had no boundary in it at all.
+	for _, msg := range in.RecentMessages {
+		g.addWindows(cands, tierRecent, msg, maxN, nil)
 	}
 
 	return cands
+}
+
+// addWindows offers every n-gram window of words to one tier, longest first.
+//
+// # Why this is shared rather than written twice (SPEC.md section 8, finding 47)
+//
+// The prompt tier had two rules about what may OPEN a reply, and the recent tier had neither,
+// so conversation memory could seed a sentence on "is" or "and" while the identical window from
+// the prompt was refused. That is finding 28's shape: two statements of one rule, differing
+// only in what one of them forgot. The rules belong to the question "may a reply start here",
+// which is not a property of where the words came from.
+//
+// fromPrompt may be nil. It is filled only for prompt-derived candidates, which are exempt from
+// the author-diversity gate at draw time, because echoing somebody's own words back is not
+// poisoning. Recent-conversation candidates are NOT exempt: they are things other people said,
+// and the corpus has to attest them like anything else.
+func (g *Generator) addWindows(cands *seedCands, tier seedTier, words []string, maxN int, fromPrompt map[string]struct{}) {
+	for n := maxN; n >= 1; n-- {
+		for i := 0; i+n <= len(words); i++ {
+			key := strings.Join(words[i:i+n], " ")
+
+			// A LONE FUNCTION WORD IS NOT A SEED. Starting a reply on "is" or "of" or "the"
+			// can only produce something that reads as though its first half went missing:
+			// the golden samples had "is peak bird behaviour honestly" and "what it did".
+			//
+			// Multi-word keys are exempt deliberately: "the bird" and "the server is" open
+			// perfectly well, and it is the word standing alone that is the problem.
+			if n == 1 && text.IsStopWord(key) {
+				continue
+			}
+
+			// AND A SEED MAY NOT OPEN ON A CONJUNCTION, whatever its length. The rule above
+			// only catches a lone function word, so the prompt "greg and lachy are both" still
+			// offered the window "and lachy are", which generated "and lachy are you know what
+			// i am going to lose it". A conjunction promises a clause that was never there,
+			// which is the same damage as the lone stop word one line up, arriving through a
+			// window the length exemption let past.
+			if !text.CanOpenSentence(words[i]) {
+				continue
+			}
+
+			if g.corpus.HasSuccessors(key) {
+				cands.add(tier, key, float64(n))
+				if fromPrompt != nil {
+					fromPrompt[key] = struct{}{}
+				}
+			}
+		}
+	}
 }
 
 // twoHop returns transitively associated words with decayed weights.
@@ -384,9 +441,10 @@ func (g *Generator) collectSeedCands(in SeedInput, fromPrompt map[string]struct{
 func (g *Generator) twoHop(in SeedInput) map[string]float64 {
 	out := map[string]float64{}
 
-	sources := make([]string, 0, len(in.PromptWords)+len(in.Names))
+	sources := make([]string, 0, len(in.PromptWords)+len(in.Names)+len(in.RecalledNames))
 	sources = append(sources, in.PromptWords...)
 	sources = append(sources, in.Names...)
+	sources = append(sources, in.RecalledNames...)
 
 	seen := map[string]struct{}{}
 	for _, s := range sources {

@@ -321,7 +321,7 @@ func DefaultWeights() Weights {
 		IsName:          0.25,
 		PromptName:      0.90,
 		Persona:         0.80,
-		RecentContext:   0.25,
+		RecentContext:   0.45,
 		Repetition:      -0.55,
 		RepetitionCap:   -2.20,
 		ImmediateRepeat: -2.50,

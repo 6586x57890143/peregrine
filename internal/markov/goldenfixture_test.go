@@ -293,3 +293,31 @@ func fixtureMessages() []fixtureMessage {
 		{"carol", []string{"alexiane"}, "the bird is starting drama again"},
 	}
 }
+
+// distinctiveWords is the vocabulary that identifies one person rather than the server.
+//
+// # Why this is data rather than a list inside the test
+//
+// The prompt-responsiveness gate asks whether a reply is about the person the prompt named,
+// and it can only answer that with tokens that actually discriminate. Keeping the sets here,
+// next to the messages they were derived from, is what stops the gate and the corpus drifting:
+// a person's lines change and their distinctive words change with them, in one place.
+//
+// # What is deliberately NOT here, and why that is the hard part
+//
+// The fixture is built on shared idioms, so most of its vocabulary is shared ON PURPOSE:
+// "coping" and "malding" attach to greg, lachy, nurock and the bridges; "queue" bridges ranked
+// and sleep; "cold" and "cooked" bridge pizza and drama; "at this hour", "moment", "peak",
+// "someone please contain" and "bird" run through everybody. Those are what make recombination
+// possible, and a gate scoring them would be measuring the bridges and calling it relevance.
+//
+// So each set below is only the words that belong to ONE person's lines.
+func distinctiveWords() map[string][]string {
+	return map[string][]string{
+		"greg":     {"cringe", "clown", "cope"},
+		"lachy":    {"sleep", "sleeps", "awake"},
+		"beezle":   {"pizza", "ordered", "eats"},
+		"alexiane": {"drama", "ratioed", "starting"},
+		"nurock":   {"hardstuck", "ranked", "lost"},
+	}
+}

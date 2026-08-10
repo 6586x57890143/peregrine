@@ -123,7 +123,7 @@ func TestGenerateFromALearnedCorpus(t *testing.T) {
 		"the server is doomed honestly",
 	)
 
-	got, _, err := g.Sentence("the bird is", false, nil, nil)
+	got, _, err := g.Sentence(Request{Prompt: "the bird is"})
 	if err != nil {
 		t.Fatalf("Sentence: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestGenerationHonoursTheConfiguredAuthorGate(t *testing.T) {
 	teach(t, s, l, "poisoner", 500, lines...)
 
 	for range 30 {
-		got, _, err := g.Sentence("the bird should", false, nil, nil)
+		got, _, err := g.Sentence(Request{Prompt: "the bird should"})
 		if err != nil {
 			t.Fatalf("Sentence: %v", err)
 		}
@@ -186,7 +186,7 @@ func TestGenerationAllowsWhatTwoAuthorsSaid(t *testing.T) {
 
 	found := false
 	for range 30 {
-		got, _, err := g.Sentence("the bird is", false, nil, nil)
+		got, _, err := g.Sentence(Request{Prompt: "the bird is"})
 		if err != nil {
 			t.Fatalf("Sentence: %v", err)
 		}
@@ -215,7 +215,7 @@ func TestAMixedCasePromptFindsTheCorpus(t *testing.T) {
 		"the bird is loose and it is bad",
 	)
 
-	got, _, err := g.Sentence("The BIRD Is", false, nil, nil)
+	got, _, err := g.Sentence(Request{Prompt: "The BIRD Is"})
 	if err != nil {
 		t.Fatalf("Sentence: %v", err)
 	}
@@ -229,7 +229,7 @@ func TestAMixedCasePromptFindsTheCorpus(t *testing.T) {
 func TestAnEmptyCorpusIsQuietAndDoesNotHang(t *testing.T) {
 	_, _, g := fixture(t, defaults())
 
-	got, outcome, err := g.Sentence("anything at all", false, nil, nil)
+	got, outcome, err := g.Sentence(Request{Prompt: "anything at all"})
 	if err != nil {
 		t.Fatalf("Sentence on an empty corpus: %v", err)
 	}
@@ -256,7 +256,7 @@ func TestBelowTwoWordsIsSilence(t *testing.T) {
 	teach(t, s, l, "u1", 300, "roof")
 
 	for range 20 {
-		got, outcome, err := g.Sentence("nothing", false, nil, nil)
+		got, outcome, err := g.Sentence(Request{Prompt: "nothing"})
 		if err != nil {
 			t.Fatalf("Sentence: %v", err)
 		}
@@ -283,20 +283,20 @@ func TestBelowTwoWordsIsSilence(t *testing.T) {
 func TestMemoryIsPerChannel(t *testing.T) {
 	ms := NewMemories(0)
 
-	ms.For("channel-a").Add("alpha bravo charlie")
-	ms.For("channel-b").Add("delta echo foxtrot")
+	ms.For("channel-a").Add("alpha bravo charlie", nil)
+	ms.For("channel-b").Add("delta echo foxtrot", nil)
 
-	a := strings.Join(ms.For("channel-a").WeightedWords(), " ")
-	b := strings.Join(ms.For("channel-b").WeightedWords(), " ")
+	a := ms.For("channel-a").Weights()
+	b := ms.For("channel-b").Weights()
 
-	if !strings.Contains(a, "alpha") {
-		t.Errorf("channel-a lost its own context: %q", a)
+	if a["alpha"] == 0 {
+		t.Errorf("channel-a lost its own context: %v", a)
 	}
-	if strings.Contains(a, "delta") {
-		t.Errorf("channel-a sees channel-b's context: %q", a)
+	if a["delta"] != 0 {
+		t.Errorf("channel-a sees channel-b's context: %v", a)
 	}
-	if strings.Contains(b, "alpha") {
-		t.Errorf("channel-b sees channel-a's context: %q", b)
+	if b["alpha"] != 0 {
+		t.Errorf("channel-b sees channel-a's context: %v", b)
 	}
 }
 
@@ -306,36 +306,90 @@ func TestMemoryIsBounded(t *testing.T) {
 	ms := NewMemories(10)
 
 	for i := range 100 {
-		ms.For(fmt.Sprintf("channel-%03d", i)).Add("something")
+		ms.For(fmt.Sprintf("channel-%03d", i)).Add("something", nil)
 	}
 	if got := ms.Len(); got > 10 {
 		t.Errorf("remembering %d channels against a bound of 10", got)
 	}
 	// The most recently touched survives, which is what makes eviction useful rather than
 	// arbitrary.
-	if got := ms.For("channel-099").WeightedWords(); len(got) == 0 {
+	if got := ms.For("channel-099").Weights(); len(got) == 0 {
 		t.Error("the channel touched last was evicted")
 	}
 }
 
-// TestMemoryDecaysOlderMessages. Repetition is the weighting mechanism, because the consumer
-// is a bag-of-words feature set that cannot take a weight.
+// TestMemoryDecaysOlderMessages.
+//
+// The weight is a real number now rather than a repeat count. It used to be expressed by
+// REPEATING each token in the returned slice, which the scorer then collapsed to a set and
+// discarded entirely, so a word from the fiftieth-oldest message scored what a word from the
+// newest one did (finding 48).
 func TestMemoryDecaysOlderMessages(t *testing.T) {
 	m := &Memory{}
-	m.Add("oldest")
+	m.Add("oldest", nil)
 	for range 10 {
-		m.Add("filler")
+		m.Add("filler", nil)
 	}
-	m.Add("newest")
+	m.Add("newest", nil)
 
-	words := m.WeightedWords()
-	counts := map[string]int{}
-	for _, w := range words {
-		counts[w]++
+	w := m.Weights()
+	if w["newest"] <= w["oldest"] {
+		t.Errorf("newest weighs %.4f and oldest %.4f; recent context must weigh more",
+			w["newest"], w["oldest"])
 	}
-	if counts["newest"] <= counts["oldest"] {
-		t.Errorf("newest appears %d times and oldest %d; recent context must weigh more",
-			counts["newest"], counts["oldest"])
+	if w["newest"] > 1.0 {
+		t.Errorf("newest weighs %.4f, above 1.0: the scorer multiplies its weight by this and "+
+			"relies on the bound to stay inside its own weight", w["newest"])
+	}
+}
+
+// TestMemoryMessagesKeepTheirBoundaries is the other half of finding 48.
+//
+// The seed's recent tier forms n-gram windows over these, and a window spanning two messages
+// is a phrase nobody said. The old flat slice had no boundary in it at all, and the repetition
+// that encoded weight made almost every window a doubled word besides.
+func TestMemoryMessagesKeepTheirBoundaries(t *testing.T) {
+	m := &Memory{}
+	m.Add("alpha bravo", nil)
+	m.Add("charlie delta", nil)
+
+	msgs := m.Messages()
+	if len(msgs) != 2 {
+		t.Fatalf("got %d messages, want 2", len(msgs))
+	}
+	for _, msg := range msgs {
+		for i, w := range msg.Words {
+			if i > 0 && w == msg.Words[i-1] {
+				t.Errorf("message %v repeats a token in place, which destroys its bigrams", msg.Words)
+			}
+		}
+	}
+	if msgs[0].Decay >= msgs[1].Decay {
+		t.Errorf("older message decay %.4f is not below the newer %.4f", msgs[0].Decay, msgs[1].Decay)
+	}
+}
+
+// TestMemoryRecallsWhoWasDiscussed, bounded and decayed, because the consumer pays a corpus
+// lookup per name on the reply path.
+func TestMemoryRecallsWhoWasDiscussed(t *testing.T) {
+	m := &Memory{}
+	m.Add("what about greg", []string{"greg"})
+	m.Add("and lachy too", []string{"lachy"})
+
+	got := m.Names()
+	if len(got) == 0 {
+		t.Fatal("nobody was recalled from two messages that named people")
+	}
+	if got[0] != "lachy" {
+		t.Errorf("most recent recalled name is %q, want lachy", got[0])
+	}
+
+	// Faded past the floor, so they stop being what the conversation is about.
+	for range 20 {
+		m.Add("unrelated chatter", nil)
+	}
+	if names := m.Names(); len(names) != 0 {
+		t.Errorf("names %v survived twenty intervening messages", names)
 	}
 }
 
@@ -343,7 +397,7 @@ func TestMemoryDecaysOlderMessages(t *testing.T) {
 func TestMemoryIsBoundedPerChannel(t *testing.T) {
 	m := &Memory{}
 	for i := range 500 {
-		m.Add(fmt.Sprintf("message-%d", i))
+		m.Add(fmt.Sprintf("message-%d", i), nil)
 	}
 	m.mu.Lock()
 	n := len(m.entries)

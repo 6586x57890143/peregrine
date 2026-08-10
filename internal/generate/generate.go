@@ -139,26 +139,58 @@ func (o Outcome) String() string {
 	return "unknown"
 }
 
-// Sentence generates a reply to prompt, steered by mem, and returns "" with a reason when
-// there is nothing worth saying.
+// Request is everything generation needs from a caller.
+//
+// A struct rather than parameters because three context inputs arrived at once in M19 and the
+// call was already four wide. Six positional arguments, three of them optional and two of them
+// strings, is where argument-order bugs live.
+type Request struct {
+	// Prompt is what the bot is answering: the message addressed to it, with mention markup
+	// already substituted for names.
+	Prompt string
+
+	// Context is the message being REPLIED TO, when there is one.
+	//
+	// THE RULE, and it is the whole of how context differs from prompt: the referenced message
+	// says what we are talking about, the prompt says what was said to me. Only the prompt may
+	// SEED, both may STEER. So this reaches the topic and association terms and never
+	// PromptSet or the prompt seed tier, because starting a reply on a third party's phrasing
+	// is answering the wrong message.
+	//
+	// It is never learned here. It is already in the corpus under its own message ID.
+	Context string
+
+	// ContextNames are canonical names the referenced message named, including its author.
+	ContextNames []string
+
+	// Roast selects the persona.
+	Roast bool
+
+	// Memory is the channel's conversation memory, or nil.
+	Memory *Memory
+
+	// Emoji resolves :shortcode: tokens against the guild.
+	Emoji EmojiResolver
+}
+
+// Sentence generates a reply to req.Prompt and returns "" with a reason when there is nothing
+// worth saying.
 //
 // Returning empty is a normal outcome rather than a failure: an empty corpus, a young one
 // where the author-diversity gate refuses everything, or a dead-ended seed all produce it.
 // The caller stays silent, which is what this bot does anyway whenever it decides not to
 // answer. What the caller must NOT do is stay silent in the log as well: the bot's silence
 // is a feature and the operator's is a bug.
-func (g *Generator) Sentence(prompt string, roast bool, mem *Memory, emoji EmojiResolver) (string, Outcome, error) {
+func (g *Generator) Sentence(req Request) (string, Outcome, error) {
 	// No <START> sentinel here any more, and it was never a fallback in the first place. The
 	// learn path only ever appends <end> and never prepends a start token, so nothing in the
 	// corpus follows "<START>": tiers 1 and 5 could not match it, and seed selection already
 	// fell through to FirstPrefix exactly as it does for an empty prompt. It was a token that
 	// looked like it did something.
+	prompt, roast, emoji := req.Prompt, req.Roast, req.Emoji
 	promptWords := text.Tokenize(prompt)
 
-	var recentWords []string
-	if mem != nil {
-		recentWords = mem.WeightedWords()
-	}
+	ctx := newContext(req)
 
 	var (
 		sentence        []string
@@ -196,7 +228,7 @@ func (g *Generator) Sentence(prompt string, roast bool, mem *Memory, emoji Emoji
 		// are the ones storage has cheap answers for.
 		const attempts = 3
 		for i := range attempts {
-			words, found := g.attempt(r, promptWords, recentWords, prompt, roast)
+			words, found := g.attempt(r, promptWords, ctx, prompt, roast)
 			if len(words) > len(sentence) {
 				sentence, recognizedNames = words, found
 			}
@@ -241,7 +273,7 @@ func (g *Generator) Sentence(prompt string, roast bool, mem *Memory, emoji Emoji
 
 // attempt drives one sentence out of the engine and returns it with the names it
 // recognized in the prompt.
-func (g *Generator) attempt(r *storage.Reader, promptWords, recentWords []string, prompt string, roast bool) ([]string, []string) {
+func (g *Generator) attempt(r *storage.Reader, promptWords []string, ctx steerContext, prompt string, roast bool) ([]string, []string) {
 	engine := markov.New(r, g.opts.Params(), nil)
 
 	var recognized []string
@@ -274,7 +306,7 @@ func (g *Generator) attempt(r *storage.Reader, promptWords, recentWords []string
 	// behaviour: the ids only ever existed to key maps within one attempt, they were never
 	// persisted, and the engine's Corpus interface speaks in strings. Nothing may persist
 	// an interner id, and having none here is the strongest form of that.
-	coreTopics := make(map[string]float64, len(promptWords))
+	coreTopics := make(map[string]float64, len(promptWords)+len(ctx.topics))
 	for _, word := range promptWords {
 		if text.IsStopWord(word) {
 			continue
@@ -282,8 +314,28 @@ func (g *Generator) attempt(r *storage.Reader, promptWords, recentWords []string
 		coreTopics[word] = math.Log(float64(r.TopicCount(word)) + 1)
 	}
 
+	// THE STEERING TOPICS, discounted, and never added to PromptSet.
+	//
+	// This is the referenced message plus what the channel has recently been about. It is what
+	// answers a two-word prompt like "bro what" with something the conversation was actually
+	// concerned with, instead of from nowhere. Discounted because context should colour a reply
+	// rather than decide it: the failure guarded against is the bot answering the conversation
+	// instead of the person who just spoke to it.
+	//
+	// A word already in the prompt keeps its prompt weight, which is higher by construction.
+	for word, weight := range ctx.topics {
+		if _, isPrompt := coreTopics[word]; isPrompt {
+			continue
+		}
+		coreTopics[word] = contextTopicWeight * weight * math.Log(float64(r.TopicCount(word))+1)
+	}
+
+	// The name associations, from the people this message named AND the people the channel was
+	// recently discussing. Both reach the scorer's name terms; only the first reaches the name
+	// seed tier and PromptNames, which is what keeps recall from making the bot address
+	// somebody who is not here.
 	assoc := make(map[string]corpus.TopicAssoc)
-	for _, nm := range recognized {
+	for _, nm := range append(append([]string(nil), recognized...), ctx.names...) {
 		key := text.LowerExceptURLs(nm)
 		found, err := r.NameTopicsFor(key)
 		if err != nil {
@@ -300,11 +352,19 @@ func (g *Generator) attempt(r *storage.Reader, promptWords, recentWords []string
 
 	// Seed selection is the engine's, and the two-hop tier inside it is what replaces the
 	// concept-cluster tier that had never once fired (finding 29).
+	// RecalledNames are people the channel was recently discussing who are NOT in this
+	// message. They reach the association tiers only: seeding at, or naming, somebody nobody
+	// just mentioned reads as a non-sequitur rather than as memory.
+	recentMessages := make([][]string, 0, len(ctx.messages))
+	for _, m := range ctx.messages {
+		recentMessages = append(recentMessages, m.Words)
+	}
 	seedIn := markov.SeedInput{
-		PromptWords: promptWords,
-		RecentWords: recentWords,
-		Names:       recognized,
-		NameTokens:  nameTokens,
+		PromptWords:    promptWords,
+		RecentMessages: recentMessages,
+		Names:          recognized,
+		RecalledNames:  ctx.names,
+		NameTokens:     nameTokens,
 	}
 	seed := engine.Seed(seedIn)
 	if seed == "" {
@@ -322,21 +382,34 @@ func (g *Generator) attempt(r *storage.Reader, promptWords, recentWords []string
 	// below 40% progress, a discard-and-retry, and a 30 + rand(15) loop bound. The target
 	// is sampled per sentence and skewed short, and the engine shifts the end-token logit
 	// against it, so there is a single answer to how long this should be (finding G7).
+	// The graded recency the scorer reads. Built here rather than in newContext because it is
+	// the only consumer that wants a flat token map; the seed tier wants the messages kept
+	// apart, and one encoding serving both is what finding 48 was.
+	recentWeights := make(map[string]float64)
+	for _, m := range ctx.messages {
+		for _, w := range m.Words {
+			lw := text.LowerExceptURLs(w)
+			if m.Decay > recentWeights[lw] {
+				recentWeights[lw] = m.Decay
+			}
+		}
+	}
+
 	length := markov.NewLength(markov.DefaultSource{}, g.opts.MinWords, g.opts.MaxWords)
 
 	step := &markov.Step{
-		Prefix:       append([]string{}, words...),
-		Sentence:     append([]string{}, words...),
-		Prompt:       prompt,
-		PromptSet:    wordSet(promptWords),
-		RecentSet:    wordSet(recentWords),
-		Used:         make(map[string]int, length.Max),
-		Ngrams:       make(map[string]struct{}, length.Max*3),
-		Length:       length,
-		CoreTopics:   coreTopics,
-		CurrentTopic: markov.SeedTopic(seed),
-		NameAssoc:    assoc,
-		PromptNames:  promptNames,
+		Prefix:        append([]string{}, words...),
+		Sentence:      append([]string{}, words...),
+		Prompt:        prompt,
+		PromptSet:     wordSet(promptWords),
+		RecentWeights: recentWeights,
+		Used:          make(map[string]int, length.Max),
+		Ngrams:        make(map[string]struct{}, length.Max*3),
+		Length:        length,
+		CoreTopics:    coreTopics,
+		CurrentTopic:  markov.SeedTopic(seed),
+		NameAssoc:     assoc,
+		PromptNames:   promptNames,
 	}
 	if roast {
 		step.Persona = markov.PersonaRoast
@@ -421,5 +494,63 @@ func wordSet(words []string) map[string]struct{} {
 	for _, w := range words {
 		out[text.LowerExceptURLs(w)] = struct{}{}
 	}
+	return out
+}
+
+// steerContext is everything that STEERS a reply without being allowed to seed it.
+//
+// Assembled once per Sentence rather than per attempt, because the three re-seed attempts share
+// a transaction and would otherwise recompute the same maps three times.
+//
+// The name is deliberate: every field here reaches the topic and association terms, and none of
+// them reaches PromptSet or the prompt seed tier. That is the one rule the reply chain and the
+// conversation memory both obey, and keeping them in one struct is what makes it checkable.
+type steerContext struct {
+	// words are the referenced message's tokens plus the channel's recent topic words.
+	topics map[string]float64
+
+	// messages are the remembered messages, one entry each, for the recent seed tier.
+	messages []RecentMessage
+
+	// names are people recently discussed who are NOT in the current message.
+	names []string
+}
+
+// contextTopicWeight discounts steering topics against the prompt's own.
+//
+// The prompt's core topics enter at log(count+1), which for a real corpus is single digits.
+// Steering topics enter at their decay times this, so the newest referenced message is worth
+// about a third of a prompt word and a faded one much less. Context should colour a reply, not
+// decide it: the failure this guards against is the bot answering the conversation instead of
+// the person who just spoke to it.
+const contextTopicWeight = 0.35
+
+func newContext(req Request) steerContext {
+	out := steerContext{topics: map[string]float64{}}
+
+	// The referenced message, at full strength among the steering signals: it is the single
+	// most specific statement of what this exchange is about.
+	for _, w := range text.Tokenize(req.Context) {
+		if text.IsStopWord(w) {
+			continue
+		}
+		out.topics[w] = 1.0
+	}
+	out.names = append(out.names, req.ContextNames...)
+
+	if req.Memory == nil {
+		return out
+	}
+
+	// The channel's running subject, at its decayed weight. This is what answers a two-word
+	// prompt like "bro what" with something the channel was actually talking about.
+	for w, decay := range req.Memory.TopicWords() {
+		if decay > out.topics[w] {
+			out.topics[w] = decay
+		}
+	}
+	out.messages = req.Memory.Messages()
+
+	out.names = append(out.names, req.Memory.Names()...)
 	return out
 }

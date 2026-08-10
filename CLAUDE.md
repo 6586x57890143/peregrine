@@ -362,6 +362,38 @@ Then `internal/plugins/{chat,aggro,images,games,autopost}`, each a `core.Service
 
 **Shutdown reports once more, before the wait.** That final line is where an operator reading a container's last output finds out whether the queue had been full, and putting it before the wait means a stuck loop cannot cost it.
 
+### Context: only the prompt may seed, both may steer
+
+`generate.Request` carries three things beyond the prompt, and they all obey one rule:
+**the referenced message says what we are talking about, the prompt says what was said to me.
+Only the prompt may SEED, both may STEER.** So the reply chain, the channel's recent topic
+words and recalled names reach `CoreTopics` and the association tiers, and none of them reaches
+`PromptSet` or the prompt seed tier. Starting a reply on a third party's phrasing is answering
+the wrong message, and naming somebody nobody just mentioned reads as a non-sequitur rather than
+as memory.
+
+**The referenced message is never learned here.** It is already in the corpus under its own
+message ID, and learning it again would count its n-grams twice. The bot's own messages are also
+excluded as context, because its output already re-enters through `selfLearn` and feeding it
+back as well is a loop that makes each reply more like the last.
+
+**`Memory` has one accessor per question, and that is not tidiness.** It used to expose one flat
+slice with each token repeated to express recency, which the scorer collapsed to a set
+(discarding the weighting) while the seed tier read word order (which the repetition destroyed).
+One encoding, two consumers, and it threw away what each of them needed (finding 48). `Weights`,
+`Messages`, `Names` and `TopicWords` are those four questions.
+
+**Memory now contains the bot's own replies and substitutes mentions before storing.** The bot
+was the one participant in every exchange absent from the channel's record of it, and raw
+`<@123>` markup reached the recent tier as tokens that match nothing.
+
+**A repair to the harness is part of any change to what generation reads.** Three times now a
+context path has been invisible to the golden samples: M14 found `SeedInput` built with no
+`Names`, M16 found `Style` called with `aboutName` hardcoded false, M19 found no conversation
+memory at all. An instrument that silently omits a code path reports on a bot that does not
+exist. The harness transcript also uses only bridge vocabulary, never a word from
+`distinctiveWords`, or criterion 7 would be measuring the instrument against itself.
+
 ### The reactor, and the consume contract
 
 `chat.handle` runs a table of named steps in `internal/plugins/chat/chat.go`, each returning whether it **consumed** the message. The runner stops at the first one that does.
