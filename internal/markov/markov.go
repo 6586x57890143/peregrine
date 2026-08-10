@@ -210,7 +210,24 @@ type Weights struct {
 	// many topics pile on.
 	TopicGravity float64
 
-	// NameAssoc is the same idea for topics associated with a recognized name.
+	// NameTopic rewards a candidate that IS a word people say about the person under
+	// discussion. One hop from the name, where NameAssoc below is two.
+	//
+	// Above TopicGravity because a name is more specific than any one word in the message,
+	// and below PromptName because naming the person is a more direct answer than describing
+	// them. The three together are the ladder: name the person, then say what people say
+	// about them, then say something adjacent to that.
+	NameTopic float64
+
+	// NameAssoc is the TRANSITIVE version: a candidate that co-occurs with something that
+	// co-occurs with the name.
+	//
+	// It came down from 0.45 when NameTopic was added, and the arithmetic is the reason. A
+	// candidate that is both one hop and two hops from the name now collects both terms, and
+	// at 0.75 + 0.45 that is 1.20 on one axis, above PromptName at 0.90: a merely associated
+	// word would outrank the person's actual name. At 0.30 the ceiling is 1.05, which is
+	// defensible, because a word tied to the person both directly and transitively really is
+	// about as good as naming them.
 	NameAssoc float64
 
 	// CurrentTopic nudges toward staying inside the topic the sentence started in.
@@ -238,9 +255,6 @@ type Weights struct {
 
 	// RecentContext nudges toward words from the recent conversation.
 	RecentContext float64
-
-	// PromptGravity rewards similarity between the sentence so far and the prompt.
-	PromptGravity float64
 
 	// Repetition, ImmediateRepeat, Bigram and Trigram are penalties, so they are
 	// negative. They are deliberately gentle: memetic repetition is the desired
@@ -270,9 +284,22 @@ type Weights struct {
 	Connective float64
 
 	// StyleChance and StyleChanceName are the probability that the persona post-pass
-	// adds filler, the second when the reply is about a recognized person. A reply
-	// about someone specific is the one most worth making sharper, which is legacy's
-	// judgement and is kept.
+	// adds filler, the second when the reply is about a recognized person.
+	//
+	// StyleChanceName came down from 0.65 in M16, and the reason is worth recording because
+	// it looks like a taste change and is not. Legacy's judgement was that a reply about
+	// somebody specific is the one most worth sharpening, and that was right WHEN NOTHING
+	// ELSE MADE THE REPLY ABOUT THE PERSON: filler was carrying it. M15's seed budgets and
+	// this milestone's NameTopic logit do that job now, so the filler no longer has to.
+	//
+	// The arithmetic also made 0.65 unreachable as a probability. Roast multiplies by 1.3 and
+	// the length factor by up to 1.3, so a long roast reply about a named person reached
+	// 1.098 and filler was CERTAIN rather than likely. Capping last is necessary but not
+	// sufficient; a cap that binds is a number chosen wrong. At 0.45 the same reply lands at
+	// 0.76 and the cap never binds.
+	//
+	// StyleChance deliberately did NOT move in the same change, so that a before-and-after
+	// golden read attributes the difference to one number rather than two.
 	StyleChance     float64
 	StyleChanceName float64
 }
@@ -287,14 +314,14 @@ type Weights struct {
 func DefaultWeights() Weights {
 	return Weights{
 		TopicGravity:    0.70,
-		NameAssoc:       0.45,
+		NameTopic:       0.75,
+		NameAssoc:       0.30,
 		CurrentTopic:    0.35,
 		Significance:    0.20,
 		IsName:          0.25,
 		PromptName:      0.90,
 		Persona:         0.80,
 		RecentContext:   0.25,
-		PromptGravity:   0.80,
 		Repetition:      -0.55,
 		RepetitionCap:   -2.20,
 		ImmediateRepeat: -2.50,
@@ -305,7 +332,7 @@ func DefaultWeights() Weights {
 		EndLateCap:      1.80,
 		Connective:      0.15,
 		StyleChance:     0.35,
-		StyleChanceName: 0.65,
+		StyleChanceName: 0.45,
 	}
 }
 

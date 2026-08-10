@@ -3,6 +3,8 @@ package markov
 import (
 	"strings"
 	"testing"
+
+	"github.com/6586x57890143/peregrine/internal/corpus"
 )
 
 // TestAuthorDiversityGateRefusesAPhraseOneAuthorRepeated is the pin for A6, and it is
@@ -165,7 +167,7 @@ func TestHeuristicsAreBoundedEvenUnderPiledUpEvidence(t *testing.T) {
 	// is unbounded again.
 	w := DefaultWeights()
 	ceiling := w.TopicGravity + w.NameAssoc + w.CurrentTopic + w.Significance +
-		w.IsName + w.PromptName + w.Persona + w.RecentContext + w.PromptGravity +
+		w.IsName + w.PromptName + w.NameTopic + w.Persona + w.RecentContext +
 		g.params.PromptRelevance + w.Connective
 
 	if got > ceiling {
@@ -281,5 +283,125 @@ func TestThePromptNameOutscoresABystander(t *testing.T) {
 		t.Errorf("the person under discussion scored %.4f against a bystander's %.4f. Both are "+
 			"learned names, so IsName cannot separate them and only PromptName can",
 			subject, bystander)
+	}
+}
+
+// TestNameTopicRewardsAWordSaidAboutThePerson is the pin for finding 42.
+//
+// The fixture is built so ONLY the new term can move the candidate, and the exclusions are
+// stated because SPEC.md section 5.4 records three tests that had to be corrected for passing
+// for the wrong reason. "cope" is a word associated with the name; it is NOT a prompt word,
+// NOT associated with any prompt word, and NOT reachable at two hops from the name, so
+// TopicGravity, PromptRelevance, PromptName and NameAssoc are all zero on it.
+func TestNameTopicRewardsAWordSaidAboutThePerson(t *testing.T) {
+	f := newFake()
+	for _, a := range []string{"alice", "bob"} {
+		f.learn(5, a, "greg is cope")
+		f.learn(5, a, "greg is fine")
+	}
+	f.names["greg"] = true
+
+	g := New(f, testParams(), seeded(1, 2))
+
+	step := newStep([]string{"greg", "is"})
+	step.Position = 0.5
+	// The direct association, and nothing else: no TopicWordsFor entry anywhere, so the
+	// two-hop NameAssoc block cannot reach "cope" at all.
+	step.NameAssoc = map[string]corpus.TopicAssoc{"cope": {Count: 9, PosSum: 9 * 0.5}}
+
+	assoc := g.loadAssoc(step)
+	withTerm := g.heuristics(step, candidate{token: "cope"}, assoc)
+	control := g.heuristics(step, candidate{token: "fine"}, assoc)
+
+	if withTerm <= control {
+		t.Errorf("a word directly associated with the name scored %.4f against %.4f for one "+
+			"that is not, so the direct name term is doing nothing", withTerm, control)
+	}
+
+	// And it must be the new term rather than something else: zeroing it collapses the gap.
+	g.weights.NameTopic = 0
+	if got := g.heuristics(step, candidate{token: "cope"}, assoc); got != control {
+		t.Errorf("with NameTopic zeroed the two candidates still differ (%.4f vs %.4f), so this "+
+			"test is measuring some other term", got, control)
+	}
+}
+
+// TestNameTermsTogetherStayUnderPromptName.
+//
+// A candidate that is both one hop and two hops from the name collects NameTopic AND
+// NameAssoc. At 0.75 + 0.45 that would be 1.20, above PromptName at 0.90, which would mean a
+// merely associated word outranks the person's actual name. This is why NameAssoc came down
+// to 0.30 in the same change rather than later.
+func TestNameTermsTogetherStayUnderPromptName(t *testing.T) {
+	w := DefaultWeights()
+	if ceiling := w.NameTopic + w.NameAssoc; ceiling > w.PromptName+0.20 {
+		t.Errorf("the two name-association terms sum to %.2f against PromptName at %.2f: a word "+
+			"merely associated with somebody would outrank naming them", ceiling, w.PromptName)
+	}
+	if w.NameTopic <= w.NameAssoc {
+		t.Errorf("the direct name term (%.2f) does not outrank its transitive form (%.2f), so "+
+			"the ladder finding 42 exists to create is not there", w.NameTopic, w.NameAssoc)
+	}
+	if w.NameTopic <= w.TopicGravity {
+		t.Errorf("the direct name term (%.2f) does not outrank one hop from an ordinary prompt "+
+			"word (%.2f), though a name is more specific than any one word", w.NameTopic, w.TopicGravity)
+	}
+}
+
+// TestCurrentTopicFiresOnAMultiWordSeed is the pin for finding 44, and it fails against a
+// Step whose CurrentTopic is the raw seed.
+//
+// topic_word is keyed by single words, so TopicWordsFor("greg is coping") returns an empty
+// non-nil map: it passes the nil guard in heuristics and never matches. Seeds are multi-word
+// for roughly nine sentences in ten, so the 0.35 term was silently absent.
+func TestCurrentTopicFiresOnAMultiWordSeed(t *testing.T) {
+	f := newFake()
+	for _, a := range []string{"alice", "bob"} {
+		f.learn(5, a, "greg is coping about it")
+	}
+	for range 4 {
+		f.addTopicWord("coping", "queue", 0.5)
+	}
+
+	const seed = "greg is coping"
+	if topic := SeedTopic(seed); topic != "coping" {
+		t.Fatalf("SeedTopic(%q) = %q, want the last content word", seed, topic)
+	}
+
+	g := New(f, testParams(), seeded(1, 2))
+	step := newStep([]string{"greg", "is", "coping"})
+	step.CurrentTopic = SeedTopic(seed)
+	assoc := g.loadAssoc(step)
+
+	with := g.heuristics(step, candidate{token: "queue"}, assoc)
+
+	// The same Step with the raw seed, which is what the code used to do.
+	raw := newStep([]string{"greg", "is", "coping"})
+	raw.CurrentTopic = seed
+	without := g.heuristics(raw, candidate{token: "queue"}, g.loadAssoc(raw))
+
+	if with <= without {
+		t.Errorf("CurrentTopic scored %.4f from the reduced topic against %.4f from the raw "+
+			"multi-word seed; the term is still dead", with, without)
+	}
+}
+
+// TestSeedTopicHandlesTheEdges.
+func TestSeedTopicHandlesTheEdges(t *testing.T) {
+	cases := map[string]string{
+		"":                  "",
+		"greg":              "greg",
+		"the bird is loose": "loose",
+		// All function words: returning the last beats returning the whole phrase, which
+		// is guaranteed to miss.
+		"of the": "the",
+		// Trailing function words are skipped in favour of the last CONTENT word, because
+		// that is the word whose associations describe the sentence.
+		"coping about the": "coping",
+	}
+	for seed, want := range cases {
+		if got := SeedTopic(seed); got != want {
+			t.Errorf("SeedTopic(%q) = %q, want %q", seed, got, want)
+		}
 	}
 }

@@ -334,7 +334,7 @@ func (g *Generator) attempt(r *storage.Reader, promptWords, recentWords []string
 		Ngrams:       make(map[string]struct{}, length.Max*3),
 		Length:       length,
 		CoreTopics:   coreTopics,
-		CurrentTopic: seed,
+		CurrentTopic: markov.SeedTopic(seed),
 		NameAssoc:    assoc,
 		PromptNames:  promptNames,
 	}

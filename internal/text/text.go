@@ -72,35 +72,6 @@ func Shortcode(token string) (string, bool) {
 	return m[1], true
 }
 
-// Similarity is a Jaccard index over token sets: the size of the intersection
-// over the size of the union. Used to reject a generated sentence that is too
-// close to the prompt, which reads as the bot parroting rather than replying.
-func Similarity(a, b string) float64 {
-	setA := tokenSet(a)
-	setB := tokenSet(b)
-
-	inter := 0
-	for w := range setA {
-		if _, ok := setB[w]; ok {
-			inter++
-		}
-	}
-	union := len(setA) + len(setB) - inter
-	if union == 0 {
-		return 0
-	}
-	return float64(inter) / float64(union)
-}
-
-func tokenSet(s string) map[string]struct{} {
-	tokens := Tokenize(s)
-	set := make(map[string]struct{}, len(tokens))
-	for _, w := range tokens {
-		set[w] = struct{}{}
-	}
-	return set
-}
-
 // EmojiResolver turns a :shortcode: into a Discord emote reference such as
 // <a:name:id>, or returns false if the guild has no such emote.
 //
