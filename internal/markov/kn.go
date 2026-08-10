@@ -283,6 +283,11 @@ func (m *model) enumerate(ctxs []string) ([]candidate, error) {
 	}
 	pool := make(map[string]seen)
 
+	// survivors is how many pooled candidates the author-diversity gate will actually
+	// admit. See the break condition below for why the floor is measured on this and not
+	// on len(pool).
+	survivors := 0
+
 	for _, ctx := range ctxs {
 		o, err := m.stats(ctx)
 		if err != nil {
@@ -324,9 +329,24 @@ func (m *model) enumerate(ctxs []string) ([]candidate, error) {
 			}
 			pool[s.Token] = seen{count: s.Count, authors: s.Authors}
 			added++
+			if m.g.admits(s.Token, s.Authors) {
+				survivors++
+			}
 		}
 
-		if len(pool) >= minCandidates || len(pool) >= candidateCap {
+		// THE FLOOR COUNTS SURVIVORS, NOT CANDIDATES, and that distinction is the whole
+		// point of the line. It used to be len(pool), so enumeration stopped as soon as
+		// five continuations existed and the author-diversity gate then deleted most of
+		// them a moment later: on the golden fixture a prefix that stopped at the floor
+		// handed the sampler two candidates, where one that happened to keep backing off
+		// handed it fourteen. A floor whose survivors the next function throws away is
+		// not a floor, and it failed silently because the output still varied a little.
+		//
+		// Backing off further is not relaxing the gate. Every candidate admitted here
+		// still passed it; enumeration simply keeps looking at lower orders until enough
+		// have. When no order supplies any, the set is empty and the step is a dead end,
+		// exactly as before.
+		if survivors >= minCandidates || len(pool) >= candidateCap {
 			break
 		}
 	}

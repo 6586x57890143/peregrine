@@ -51,50 +51,73 @@ import (
 // runs n down to 1 and had already added exactly those keys at 30.0, and add() keeps the
 // maximum. It could never win. Deleted rather than fixed: the question it asked was already
 // answered one tier up, which is finding 28's shape.
+// seedTier identifies where a candidate came from. HIGHEST PRECEDENCE FIRST: a key that
+// qualifies under two tiers is counted in the earlier one.
+//
+// tierName precedes tierPromptNgram deliberately, and getting that order backwards would
+// make the name tier empty on exactly the prompts it exists for: a recognized name is almost
+// always also a prompt unigram, so the prompt tier would claim it and the name tier's budget
+// would go unspent. That is finding 34's lesson restated for budgets, which said that a
+// weight below the tier already covering your keys is not a weak preference but no
+// preference.
+type seedTier int
+
 const (
-	// weightPromptNgram is scaled by n, so a longer prompt n-gram outranks a shorter
-	// one, and a single prompt word enters here at 30.0. This is the tier that knows what
-	// the user actually said.
-	weightPromptNgram = 30.0
-
-	// weightNameSeed starts the sentence AT the person rather than near them.
-	//
-	// ABOVE a single prompt word (30.0) and below a two-word prompt phrase (60.0), which is
-	// the whole of the reasoning: who a message is about is more specific than any one word
-	// in it, but a phrase somebody actually typed carries what they said AND who they meant.
-	//
-	// It has to clear 30.0 to do anything at all, because a recognized name is usually also a
-	// prompt word and would otherwise be dominated by tier 1 for the same token, exactly as
-	// weightPromptWord was. A weight below the tier that already covers your keys is not a
-	// weak preference, it is no preference.
-	weightNameSeed = 40.0
-
-	// The association tiers, strongest claim first. What a name is about beats what a word
-	// co-occurs with, which beats where a name's topics tend to sit, which beats a
-	// second-hop association. Each spans [base, base+assocSpread).
-	weightNameTopic      = 18.0
-	weightTopicWord      = 12.0
-	weightNamePositional = 8.0
-
-	// weightTwoHop replaces the cluster tier. Lowest of the association tiers on purpose: a
-	// transitive claim is weaker than a direct one even before the decay applies.
-	weightTwoHop = 4.0
-
-	// weightRecent is the fallback floor, scaled by n like the prompt tier.
-	weightRecent = 1.0
-
-	// assocSpread is how far evidence and position may move a candidate WITHIN its tier.
-	// Small enough that the bands do not touch, which is what makes the ladder above true
-	// rather than nominal.
-	assocSpread = 3.0
-
-	// assocEvidenceShare splits assocSpread between how well attested an association is and
-	// how well the word works as an OPENING. The remainder goes to position.
-	assocEvidenceShare = 0.6
+	tierName seedTier = iota
+	tierPromptNgram
+	tierNameTopic
+	tierTopicWord
+	tierTwoHop
+	tierRecent
+	numSeedTiers
 )
 
-// assocWeight bounds a tier's within-tier bonus so it cannot escape the tier, and splits it
-// between evidence and position.
+// seedBudget is the share of the draw each tier may spend, and it replaces the per-candidate
+// weights this file used to carry.
+//
+// # Why budgets rather than weights (SPEC.md section 8, finding 36)
+//
+// drawSeed samples proportional to weight over ALL candidates, so a tier's influence is its
+// weight TIMES ITS CANDIDATE COUNT, and the counts are wildly unequal. The prompt tier
+// contributes one candidate per n-gram window, about eighteen for a seven-word prompt, while
+// the name tier contributes exactly one. At the old weights that was 1350 against 40, so a
+// recognized name won the draw 4.57% of the time against a documented position above every
+// association tier. The old comment reasoned pairwise ("above a single prompt word at 30,
+// below a two-word phrase at 60"), which is true of one candidate against one candidate and
+// says nothing about the draw.
+//
+// The general form is worth keeping: A BOUNDED WEIGHT IS NOT A BOUNDED INFLUENCE WHEN THE
+// NUMBER OF CANDIDATES CARRYING IT IS UNBOUNDED. That generalizes finding 34, which bounded
+// a candidate within its tier, to bounding the tier itself.
+//
+// Read the numbers as a sentence: half the draw is what the user typed, a quarter is the
+// person the message is about, an eighth is what people say about that person, and the rest
+// is association and recency.
+//
+// AN EMPTY TIER SPENDS NOTHING, which makes this self-correcting as the corpus fills. With
+// the association indexes starved, as they are in production today (finding 45), a
+// name-bearing prompt gives the name tier 50/150 = 33%; once the indexes are populated the
+// same constants give 50/200 = 25%. Roughly one reply in three now, settling to one in four,
+// with no constant changing.
+var seedBudget = [numSeedTiers]float64{
+	tierName:        50.0,
+	tierPromptNgram: 100.0,
+	tierNameTopic:   25.0,
+	tierTopicWord:   15.0,
+	tierTwoHop:      6.0,
+	tierRecent:      4.0,
+}
+
+// assocEvidenceShare splits a candidate's within-tier score between how well attested the
+// association is and how well the word works as an OPENING. The remainder goes to position.
+const assocEvidenceShare = 0.6
+
+// assocScore is a candidate's score WITHIN its tier, in [1.0, 2.0].
+//
+// A RATIO NOW, NOT A BAND. Keeping candidates inside a band was assocSpread's job, and
+// per-tier budgets took that job over completely: a candidate cannot leave a tier it is
+// normalized into. So assocSpread is deleted rather than kept, and the deletion is not a
+// regression of finding 34 but its generalization.
 //
 // EVIDENCE is tanh of sqrt(count) rather than bare sqrt(count). The shape still rewards the
 // first few co-occurrences steeply and flattens after, which is the right curve, but it
@@ -112,10 +135,82 @@ const (
 // that normally opens sentences reads as a restart there, while a word that normally closes
 // them ends the sentence abruptly. Opening and continuing want opposite ends of the same
 // number.
-func assocWeight(base float64, d corpus.TopicAssoc) float64 {
+func assocScore(d corpus.TopicAssoc) float64 {
 	evidence := math.Tanh(math.Sqrt(float64(d.Count)) / 4.0)
 	early := 1.0 - d.MeanPosition()
-	return base + assocSpread*(assocEvidenceShare*evidence+(1.0-assocEvidenceShare)*early)
+	return 1.0 + assocEvidenceShare*evidence + (1.0-assocEvidenceShare)*early
+}
+
+// seedCands collects candidates per tier and normalizes each tier onto its budget.
+type seedCands struct {
+	byTier [numSeedTiers]map[string]float64 // key -> within-tier score
+	tierOf map[string]seedTier
+}
+
+func newSeedCands() *seedCands {
+	c := &seedCands{tierOf: map[string]seedTier{}}
+	for i := range c.byTier {
+		c.byTier[i] = map[string]float64{}
+	}
+	return c
+}
+
+// add records a candidate, keeping the highest-precedence tier that claims it and, within a
+// tier, the highest score. Both rules match what the old flat add() did; only the accounting
+// changed.
+func (c *seedCands) add(t seedTier, key string, score float64) {
+	if key == "" || score <= 0 {
+		return
+	}
+	if prev, ok := c.tierOf[key]; ok {
+		if prev < t {
+			return
+		}
+		if prev > t {
+			delete(c.byTier[prev], key)
+		}
+	}
+	c.tierOf[key] = t
+	if existing, ok := c.byTier[t][key]; !ok || score > existing {
+		c.byTier[t][key] = score
+	}
+}
+
+// drop removes a candidate entirely, for the attestation redraw.
+func (c *seedCands) drop(key string) {
+	if t, ok := c.tierOf[key]; ok {
+		delete(c.byTier[t], key)
+		delete(c.tierOf, key)
+	}
+}
+
+// weights turns the per-tier scores into the absolute weights the draw uses.
+//
+// Each non-empty tier gets exactly its budget, split in proportion to within-tier scores.
+// Recomputed after every drop rather than adjusted in place, which is what makes a rejected
+// candidate's share go to NOBODY instead of being donated across every tier: if the name
+// tier's only candidate fails attestation, the name tier should contribute zero, not hand a
+// quarter of the draw to the prompt tier.
+func (c *seedCands) weights() map[string]float64 {
+	out := make(map[string]float64, len(c.tierOf))
+	for t := range c.byTier {
+		scores := c.byTier[t]
+		if len(scores) == 0 {
+			continue
+		}
+		var total float64
+		for _, s := range scores {
+			total += s
+		}
+		if total <= 0 {
+			continue
+		}
+		budget := seedBudget[t]
+		for k, s := range scores {
+			out[k] = budget * s / total
+		}
+	}
+	return out
 }
 
 // Two-hop bounds. Constants rather than knobs for the same reason as the enumeration
@@ -168,23 +263,24 @@ type SeedInput struct {
 // string: the caller knows whether it would rather fall back to a prompt word or say
 // nothing, and this does not.
 func (g *Generator) Seed(in SeedInput) string {
-	cands := map[string]float64{}
-
 	// The candidates that came from what the user typed. Exempt from the author-diversity
 	// gate below, because echoing somebody's own words back is not poisoning.
 	fromPrompt := map[string]struct{}{}
 
-	add := func(key string, weight float64) {
-		if key == "" || weight <= 0 {
-			return
-		}
-		// Highest wins rather than accumulating. A word that qualifies under two tiers
-		// is not twice as good a seed, and summing would let the low tiers gang up on a
-		// prompt n-gram, which is the one tier that knows what the user said.
-		if existing, ok := cands[key]; !ok || weight > existing {
-			cands[key] = weight
-		}
-	}
+	return g.drawAttestedSeed(g.collectSeedCands(in, fromPrompt), fromPrompt)
+}
+
+// collectSeedCands runs every tier and returns the unnormalized candidates.
+//
+// Separate from Seed so a test can assert that every tier actually contributes something.
+// Two tiers have now been found dead by reading rather than by a failing test (findings 34
+// and 37), and the reason a behavioural test could not catch either is that a shadowed tier
+// changes no output at all: its keys are already present at a higher weight.
+//
+// fromPrompt is filled in as a side effect, because whether a candidate came from what the
+// user typed is decided by which tier produced it and is needed by the attestation exemption.
+func (g *Generator) collectSeedCands(in SeedInput, fromPrompt map[string]struct{}) *seedCands {
+	cands := newSeedCands()
 
 	maxN := max(g.params.MaxNGram-1, 1)
 
@@ -205,8 +301,18 @@ func (g *Generator) Seed(in SeedInput) string {
 				continue
 			}
 
+			// AND A SEED MAY NOT OPEN ON A CONJUNCTION, whatever its length. The rule
+			// above only catches a lone function word, so the prompt "greg and lachy are
+			// both" still offered the window "and lachy are", which generated "and lachy
+			// are you know what i am going to lose it". A conjunction promises a clause
+			// that was never there, which is the same damage as the lone stop word one
+			// line up, arriving through a window the length exemption let past.
+			if !text.CanOpenSentence(in.PromptWords[i]) {
+				continue
+			}
+
 			if g.corpus.HasSuccessors(key) {
-				add(key, float64(n)*weightPromptNgram)
+				cands.add(tierPromptNgram, key, float64(n))
 				fromPrompt[key] = struct{}{}
 			}
 		}
@@ -223,7 +329,7 @@ func (g *Generator) Seed(in SeedInput) string {
 	// corpus that needs it most, since almost nothing has two distinct authors yet.
 	for _, token := range in.NameTokens {
 		if g.corpus.HasSuccessors(token) {
-			add(token, weightNameSeed)
+			cands.add(tierName, token, 1.0)
 			fromPrompt[token] = struct{}{}
 		}
 	}
@@ -235,7 +341,7 @@ func (g *Generator) Seed(in SeedInput) string {
 			continue
 		}
 		for topic, d := range assoc {
-			add(topic, assocWeight(weightNameTopic, d))
+			cands.add(tierNameTopic, topic, assocScore(d))
 		}
 	}
 
@@ -247,40 +353,42 @@ func (g *Generator) Seed(in SeedInput) string {
 		}
 		for other, d := range assoc {
 			if other != word && d.Count > 1 {
-				add(other, assocWeight(weightTopicWord, d))
+				cands.add(tierTopicWord, other, assocScore(d))
 			}
 		}
 	}
 
-	// Tier 5: topics of the most recent name, restricted to ones the chain can continue
-	// from. Narrower than tier 2 and weighted lower, which is why both exist.
-	if len(in.Names) > 0 {
-		last := in.Names[len(in.Names)-1]
-		if assoc, err := g.corpus.NameTopicsFor(last); err == nil {
-			for topic, d := range assoc {
-				if g.corpus.HasSuccessors(topic) {
-					add(topic, assocWeight(weightNamePositional, d))
-				}
-			}
-		}
+	// THE NAME-POSITIONAL TIER IS GONE, and it never once decided anything (SPEC.md
+	// section 8, finding 37). It read NameTopicsFor for the most recent name at
+	// weightNamePositional 8.0, but the tier above already added every one of those keys,
+	// from the identical TopicAssoc, at weightNameTopic 18.0, and add() keeps the maximum.
+	// It is weightPromptWord at 15.0 sitting under tier 1 at 30.0 all over again, which
+	// finding 34 recorded and M14 deleted, reintroduced by the same respacing that deleted
+	// it. Its one distinguishing feature, the HasSuccessors filter, is redundant too:
+	// attested() already requires a successor with enough authors, which implies having
+	// successors at all, for every non-prompt candidate whenever MinDistinctAuthors > 0.
+	//
+	// Deleted rather than reweighted, per finding 28: a tier that asks a question another
+	// tier already answers is a duplicate however different its filter looks. Under budgets
+	// it would have been worse than dead, since it would spend a share of the draw on
+	// candidates that duplicate another tier.
+
+	// The two-hop expansion, replacing the concept-cluster tier.
+	for word, score := range g.twoHop(in) {
+		cands.add(tierTwoHop, word, score)
 	}
 
-	// Tier 6: the two-hop expansion, replacing the concept-cluster tier.
-	for word, weight := range g.twoHop(in) {
-		add(word, weight)
-	}
-
-	// Tier 7: recent conversation, the floor.
+	// Recent conversation, the floor.
 	for n := maxN; n >= 1; n-- {
 		for i := 0; i+n <= len(in.RecentWords); i++ {
 			key := strings.Join(in.RecentWords[i:i+n], " ")
 			if g.corpus.HasSuccessors(key) {
-				add(key, float64(n)*weightRecent)
+				cands.add(tierRecent, key, float64(n))
 			}
 		}
 	}
 
-	return g.drawAttestedSeed(cands, fromPrompt)
+	return cands
 }
 
 // twoHop returns transitively associated words with decayed weights.
@@ -316,7 +424,7 @@ func (g *Generator) twoHop(in SeedInput) map[string]float64 {
 				if !g.corpus.HasSuccessors(second.word) {
 					continue
 				}
-				w := assocWeight(weightTwoHop, second.assoc) * twoHopDecay
+				w := assocScore(second.assoc) * twoHopDecay
 				if existing, ok := out[second.word]; !ok || w > existing {
 					out[second.word] = w
 				}
@@ -433,9 +541,9 @@ func (g *Generator) drawSeed(cands map[string]float64) string {
 // Checked on the DRAWN candidate rather than filtered up front, deliberately: attestation is a
 // Successors scan, and there can be hundreds of candidates on a busy prompt. A bounded redraw
 // costs a handful of scans on the reply path where filtering would cost one per candidate.
-func (g *Generator) drawAttestedSeed(cands map[string]float64, prompt map[string]struct{}) string {
+func (g *Generator) drawAttestedSeed(cands *seedCands, prompt map[string]struct{}) string {
 	if g.params.MinDistinctAuthors <= 0 {
-		return g.drawSeed(cands)
+		return g.drawSeed(cands.weights())
 	}
 
 	// Enough attempts to get past a few unattested candidates, few enough that a corpus
@@ -444,7 +552,12 @@ func (g *Generator) drawAttestedSeed(cands map[string]float64, prompt map[string
 	// outcome an empty corpus produces.
 	const attempts = 8
 	for range attempts {
-		seed := g.drawSeed(cands)
+		// Re-derived per attempt rather than adjusted in place. A rejected candidate must
+		// forfeit its share to NOBODY: if the name tier's only candidate fails attestation
+		// the name tier should contribute zero, where deleting from a flat weight map would
+		// silently donate a quarter of the draw to the prompt tier instead.
+		weights := cands.weights()
+		seed := g.drawSeed(weights)
 		if seed == "" {
 			return ""
 		}
@@ -457,8 +570,8 @@ func (g *Generator) drawAttestedSeed(cands map[string]float64, prompt map[string
 		if g.attested(seed) {
 			return seed
 		}
-		delete(cands, seed)
-		if len(cands) == 0 {
+		cands.drop(seed)
+		if len(cands.tierOf) == 0 {
 			return ""
 		}
 	}
@@ -678,25 +791,60 @@ func (g *Generator) attested(word string) bool {
 	return false
 }
 
-// TrimDangling removes trailing function words from a sentence that stopped because it ran
-// out of chain rather than because it chose to end.
+// TrimDangling removes trailing function words that leave a sentence hanging.
 //
-// The two endings are not the same claim, which is why this takes the caller's word for
-// which one happened rather than guessing. An end sentinel means somebody really did finish
-// a message at that word, and in this register that is worth keeping even when it looks
-// abrupt. A dead end means the chain simply had nowhere to go, and stopping on "back to
-// the" or "what's the point of even a" reads as the bot being cut off mid-thought, which is
-// the same class of damage as the seam Jump was making.
+// It trims in two bands, and the difference between them is the whole content of this
+// function.
 //
-// Same asymmetry attested() already makes about EndToken: what the corpus witnessed somebody
-// do is evidence, and what generation merely ran into is not.
+// THE UNCONDITIONAL BAND is text.IsDanglingTail: prepositions, conjunctions, determiners and
+// auxiliaries. These are trimmed whether or not the model chose to end, and that
+// unconditionality is a correction to the rule below rather than an exception to it.
+//
+// THE CONDITIONAL BAND is every other function word, trimmed only when the sentence ran out
+// of chain. An end sentinel means somebody really did finish a message on that word, and in
+// this register that is worth keeping even when it looks abrupt: "i am going to lose it"
+// ends on a stop word and is exactly right.
+//
+// # Why the first band had to be carved out of the second
+//
+// The original rule was the asymmetry attested() makes about EndToken: what the corpus
+// witnessed somebody do is evidence, what generation merely ran into is not. That is right
+// about the token and wrong about the construction, and golden samples are what showed it.
+// Nearly a third of replies ended on a trailing preposition, all of them protected by this
+// exemption. "about" is followed by the sentinel in the corpus by two different authors,
+// because two people ended a message with "what are you talking about" - so the corpus
+// attests that "about" can end a message, and generation cashed that attestation in on
+// "nurock is coping about", where the phrase never arrives.
+//
+// The attestation is recorded on the token; the thing that made it true was the construction,
+// and the composite key layout does not carry it. So the honest fix is to say which function
+// words can close a sentence at all, which is what text.IsDanglingTail is.
 //
 // It will trim a sentence down to nothing if that is all it was, and that is fine: the
-// caller has a floor below which it posts nothing at all.
-func TrimDangling(sentence []string) []string {
+// caller has a floor below which it posts nothing at all, and saying less is the right
+// direction for a failure that reads as a malfunction.
+func TrimDangling(sentence []string, choseEnd bool) []string {
 	end := len(sentence)
-	for end > 0 && text.IsStopWord(sentence[end-1]) {
-		end--
+	for end > 0 {
+		last := sentence[end-1]
+		prev := ""
+		if end > 1 {
+			prev = sentence[end-2]
+		}
+
+		// An UNGOVERNED PRONOUN is the second thing the end-token attestation licensed
+		// wrongly, and for the same reason: "i am going to lose it" and "greg and lachy
+		// are you" both end on a pronoun, and only the word in front of it says which is
+		// a sentence and which is a fragment.
+		if text.IsDanglingTail(last) || !text.IsGovernedPronoun(prev, last) {
+			end--
+			continue
+		}
+		if !choseEnd && text.IsStopWord(last) {
+			end--
+			continue
+		}
+		break
 	}
 	return sentence[:end]
 }
