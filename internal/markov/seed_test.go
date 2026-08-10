@@ -142,7 +142,7 @@ func TestSeedIsDeterministicUnderASeededSource(t *testing.T) {
 		g := New(f, testParams(), seeded(11, 13))
 		out := make([]string, 0, 40)
 		for range 40 {
-			out = append(out, g.Seed(SeedInput{PromptWords: []string{"the"}, RecentWords: []string{"alpha", "beta"}}))
+			out = append(out, g.Seed(SeedInput{PromptWords: []string{"the"}, RecentMessages: [][]string{[]string{"alpha", "beta"}}}))
 		}
 		return out
 	}
@@ -816,10 +816,10 @@ func TestEverySeedTierProducesASurvivingCandidate(t *testing.T) {
 	g := New(f, testParams(), seeded(1, 2))
 
 	in := SeedInput{
-		PromptWords: strings.Fields("bird what do you know about greg"),
-		RecentWords: strings.Fields("the queue is cooked honestly"),
-		Names:       []string{"greg"},
-		NameTokens:  []string{"greg"},
+		PromptWords:    strings.Fields("bird what do you know about greg"),
+		RecentMessages: [][]string{strings.Fields("the queue is cooked honestly")},
+		Names:          []string{"greg"},
+		NameTokens:     []string{"greg"},
 	}
 
 	c := g.collectSeedCands(in, map[string]struct{}{})
@@ -832,5 +832,103 @@ func TestEverySeedTierProducesASurvivingCandidate(t *testing.T) {
 			t.Errorf("tier %q contributed no candidate, so it cannot decide anything and is "+
 				"either dead or shadowed by a higher tier (findings 34 and 37)", names[tier])
 		}
+	}
+}
+
+// TestTheRecentTierHasTheSameOpenerRulesAsThePrompt is the pin for finding 47.
+//
+// The prompt tier refused a lone function word and refused any window opening on a conjunction;
+// the recent tier had neither check, so conversation memory could seed a reply on "is" or
+// "and" while the identical window from the prompt was refused. The two are now one function,
+// because the rule belongs to the question "may a reply start here", which is not a property
+// of where the words came from.
+func TestTheRecentTierHasTheSameOpenerRulesAsThePrompt(t *testing.T) {
+	f := newFake()
+	for _, a := range []string{"alice", "bob"} {
+		f.learn(5, a, "is loose in the server")
+		f.learn(5, a, "and lachy are both here")
+		f.learn(5, a, "lachy is malding again")
+	}
+
+	g := New(f, testParams(), seeded(11, 13))
+	in := SeedInput{
+		RecentMessages: [][]string{
+			strings.Fields("is loose in the server"),
+			strings.Fields("and lachy are both here"),
+		},
+	}
+
+	for range 300 {
+		seed := g.Seed(in)
+		if seed == "is" {
+			t.Fatal("seeded on a lone function word from conversation memory")
+		}
+		if strings.HasPrefix(seed, "and") {
+			t.Fatalf("seeded on %q, which opens on a conjunction", seed)
+		}
+	}
+}
+
+// TestARecentWindowDoesNotSpanTwoMessages.
+//
+// The recent tier forms n-gram windows, and the old flat slice had no message boundary in it,
+// so a window could join the tail of one message to the head of the next: a phrase nobody said.
+func TestARecentWindowDoesNotSpanTwoMessages(t *testing.T) {
+	f := newFake()
+	for _, a := range []string{"alice", "bob"} {
+		// "charlie delta" exists only as a cross-message join, never as a real phrase.
+		f.learn(5, a, "alpha bravo charlie")
+		f.learn(5, a, "delta echo foxtrot")
+		f.learn(5, a, "charlie delta something")
+	}
+
+	g := New(f, testParams(), seeded(3, 7))
+	in := SeedInput{RecentMessages: [][]string{
+		strings.Fields("alpha bravo charlie"),
+		strings.Fields("delta echo foxtrot"),
+	}}
+
+	for range 300 {
+		if seed := g.Seed(in); strings.Contains(seed, "charlie delta") {
+			t.Fatalf("seeded on %q, which joins the end of one message to the start of the next", seed)
+		}
+	}
+}
+
+// TestRecalledNamesSteerButDoNotSeed.
+//
+// The rule memory of people obeys: what the channel was recently discussing should colour what
+// the bot talks about, and starting a reply AT somebody nobody just mentioned reads as a
+// non-sequitur rather than as memory. So a recalled name reaches the association tier and never
+// the name seed tier.
+func TestRecalledNamesSteerButDoNotSeed(t *testing.T) {
+	f := newFake()
+	for _, a := range []string{"alice", "bob"} {
+		f.learn(5, a, "greg is coping again")
+		f.learn(5, a, "cope is all he does")
+	}
+	f.names["greg"] = true
+	for range 6 {
+		f.addNameTopic("greg", "cope", 0.2)
+	}
+
+	g := New(f, testParams(), seeded(5, 9))
+	in := SeedInput{
+		PromptWords:   []string{"what"},
+		RecalledNames: []string{"greg"},
+	}
+
+	sawTopic := false
+	for range 400 {
+		seed := g.Seed(in)
+		if seed == "greg" {
+			t.Fatal("seeded ON a recalled name: the bot would address somebody nobody just mentioned")
+		}
+		if seed == "cope" {
+			sawTopic = true
+		}
+	}
+	if !sawTopic {
+		t.Error("a recalled name contributed no association candidate either, so recall does nothing")
 	}
 }
