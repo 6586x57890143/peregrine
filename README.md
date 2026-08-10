@@ -103,6 +103,7 @@ Maintenance modes do not need `DISCORD_BOT_TOKEN`: cleaning a poisoned corpus sh
 go run ./cmd/bot -clean-db                    # remove spammy and blocklisted n-grams
 go run ./cmd/bot -compact /data/markov.new    # reclaim free pages into a fresh file
 go run ./cmd/bot -purge-author 1234567890     # undo one user's contribution to diversity
+go run ./cmd/bot -tuning-report ./tuning      # summarize a pulled-down tuning export
 ```
 
 All three run against the corpus and never touch Discord, and none needs `DISCORD_BOT_TOKEN`: cleaning a poisoned corpus should not require a live credential. They respect `PEREGRINE_DB_PATH`. Running one while the bot is live fails within five seconds with a clear message rather than hanging, because bbolt holds an exclusive lock on the file. Pass one at a time; the order they should run in is your decision, not a default.
@@ -112,6 +113,8 @@ All three run against the corpus and never touch Discord, and none needs `DISCOR
 `-compact` exists because **bbolt's file never shrinks.** Deleting keys frees pages for reuse but does not return them to the filesystem, so a corpus that grew large stays large after `-clean-db` removes most of it. It writes a new file rather than replacing the original, so you move it into place yourself and the rollback stays trivial. Compacting onto the live path fails rather than corrupting anything, because bbolt would have to open a file it already holds.
 
 `-purge-author` is the surgical alternative to discarding a corpus one bad actor has poisoned. It removes that user's contribution to the **author-diversity** counts, which is what generation eligibility reads, and leaves occurrence counts alone: the counts do not record who produced them, and storing that would mean a count on every entry of the fastest-growing index in the database. In practice it is the effective half, since a phrase only one person ever said drops to zero distinct authors.
+
+`-tuning-report` is the odd one out and needs none of the above: it reads a directory of JSON lines rather than the corpus, so it takes no lock, needs no `.env`, and runs on a laptop that has never had this bot on it. See **The tuning loop** below.
 
 In a container:
 
@@ -156,7 +159,7 @@ And one repository **variable**:
 
 A skipped deploy reports as **green with a notice**, not red, since a deployment that was deliberately held has not gone wrong.
 
-On the VPS, `/home/deploy/peregrine` needs `.env` (mode `0600`, since it holds a token equivalent to full control of the bot) and a `backups/` directory. The compose file and the tag files are written by CI.
+On the VPS, `/home/deploy/peregrine` needs `.env` (mode `0600`, since it holds a token equivalent to full control of the bot) plus `backups/` and `tuning/` directories. CI creates both bind sources on every deploy, writes the compose file and writes the tag files; the one-time uid step below is still yours.
 
 ### Runbook
 
@@ -193,11 +196,30 @@ The image runs `USER nonroot`, uid 65532. A **named volume** inherits the image 
 cd /home/deploy/peregrine
 sudo chgrp 65532 blocklist.txt && chmod 640 blocklist.txt   # the container reads this
 sudo chgrp 65532 backups       && chmod 775 backups         # the container writes here
+sudo chgrp 65532 tuning        && chmod 775 tuning          # and here
 ```
 
 Group rather than world, and still owned by `deploy`, so the blocklist stays editable mid-incident without sudo. That is the whole reason it is a bind rather than baked into the image.
 
-Both halves bit on the first production deploy. The blocklist at mode 0600 gave `permission denied` in a restart loop, which at least failed loudly. `./backups` owned by `deploy` fails **quietly**, a tick after startup rather than during it, because the backup loop is deliberately not `Immediate`, so nobody watching the boot logs sees it.
+Both halves bit on the first production deploy. The blocklist at mode 0600 gave `permission denied` in a restart loop, which at least failed loudly. `./backups` owned by `deploy` fails **quietly**, a tick after startup rather than during it, because the backup loop is deliberately not `Immediate`, so nobody watching the boot logs sees it. `./tuning` fails the same quiet way, and the export reports the failure once per write rather than at startup.
+
+**The tuning loop**
+
+`SPEC.md` §10 has six open decisions and five of them say the same sentence: *revisit against real ingested text*. `mu` and `D` are starting guesses, `DefaultWeights` is "a considered first guess, not a measurement", and the only instrument that can judge output is a golden harness running against a 150-line synthetic fixture. The tuning export is what closes that: the bot writes what it said, why it said it, and whether anybody reacted.
+
+```sh
+# on the host, once: PEREGRINE_TUNING_DIR=/tuning in .env, plus the chgrp above
+scp -r deploy@vps:/home/deploy/peregrine/tuning ./tuning
+go run ./cmd/bot -tuning-report ./tuning
+```
+
+The bot **never uploads anything**. Files land on a bind mount and you pull them, which is the whole transport.
+
+Three record kinds, one JSON object per line. A `sample` is one generation attempt, **including the ones that produced nothing**, with the seed tier it started from, how far the backoff had to go, and how many candidates the author-diversity gate removed. An `engagement` resolves a sample by message ID once its window closes: reactions, distinct reactors, whether a human replied. A `snapshot` carries the corpus counts, the health counters, and **the full set of dials in force** including the logit weights, which are constants in the binary and therefore not reconstructable from a deployment afterwards.
+
+Read a report before and after a change, not one in isolation. `-tuning-report` warns when an archive spans two versions or two sets of dials, because an average over both describes neither.
+
+What is deliberately **not** in the export: anything the emit gate refused. A sample whose send was turned down carries no text at all, matching `internal/safety` never recording the offending content anywhere. Everything else in there is message text, so treat the directory like the corpus rather than like logs.
 
 **Back up and restore the corpus**
 

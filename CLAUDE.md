@@ -48,6 +48,13 @@ go run ./cmd/bot -compact ./markov.new      # reclaim free pages; bbolt never sh
 go run ./cmd/bot -purge-author 123456789    # undo one author's contribution to diversity counts
 ```
 
+`-tuning-report` is not one of those and takes no lock: it reads a directory of JSON lines
+rather than the corpus, so it needs no `.env`, no token and no database, and runs against an
+archive pulled off the host with `scp`.
+```sh
+go run ./cmd/bot -tuning-report ./tuning
+```
+
 ## Architecture
 
 ### The entrypoint, and why `internal/legacy` existed
@@ -545,6 +552,88 @@ Backups are in-process, in `internal/plugins/backup`: `Store.Backup` takes a rea
 **`PEREGRINE_BACKUP_DIR` must be a writable mount in a container.** The image runs `read_only: true`, so any path outside a volume or bind fails on the first write, and a relative path resolves against the distroless working directory. `docker-compose.prod.yml` binds `./backups` to `/backups` for this, and it is deliberately **outside** the corpus volume so that losing or removing that volume does not take the snapshots with it. Each snapshot is a full copy, so the disk cost is `KEEP` times the corpus size.
 
 `markov.db`, the whisper model and the ffmpeg binary are all gitignored. `voicenotes/models/ggml-small.bin` is 465 MiB, over GitHub's hard 100 MiB per-file limit, so a commit containing it cannot be pushed at all and the only remedy is rewriting history. `.dockerignore` exists for the same weight: the working tree is around 692 MB and `COPY . .` would ship all of it into the builder on every build.
+
+## The tuning export, and why the engine grew an observer
+
+`SPEC.md` §10 has six open decisions and five say the same sentence: *revisit against real
+ingested text*. `mu` and `D` are "starting guesses", `DefaultWeights` is "a considered first
+guess, not a measurement", `PEREGRINE_TEMPERATURE` may want to be 1.6, `MIN_DISTINCT_AUTHORS`
+"needs a real value". All five are blocked on the same thing: the only instrument that can
+judge output is the golden harness, and it runs against a 150-line synthetic fixture. Finding
+29's rule is that a tuning constant nobody validated against real data is a guess wearing a
+default's clothes.
+
+`internal/tuning` is the wire format and the rotating JSONL writer; `internal/plugins/tuning`
+is the service that fills it in; `-tuning-report` reads an archive back.
+
+**The wire types are deliberate duplicates of the engine's, not embeds.** An archive has to
+stay comparable across versions, so a field disappearing from `markov.Weights` or
+`storage.Status` must be a decision made in `internal/plugins/tuning/map.go` rather than a
+silent change to the shape of files nobody can regenerate. That is what keeps
+`internal/tuning` a stdlib-only leaf, and the cost is one mapping file.
+
+**`markov.Trace` hangs off `Step` and `SeedInput`, never off the `Generator`.** The Generator
+holds the corpus, the dials and the randomness and keeps no per-sentence state, which is what
+makes it safe for every message goroutine to share without a lock; a counter on it would be
+finding 3 rebuilt on purpose. `Step` already owns exactly this kind of state (it counts
+`Jumps`). Every method on `Trace` guards a nil receiver, so tracing off is one branch per step
+and no allocation, and `TestANilTraceChangesNothing` pins that it changes no output.
+
+**The trace records the seed tier by NAME.** `seedTier` is an unexported int whose values
+shift whenever a tier is added or removed, and two have already been deleted as dead (findings
+34 and 37). A per-tier share of real draws is what would have caught either one on the first
+day rather than on a code read months later, and a mislabelled tier would be worse than no
+trace: it would make a dead tier look alive. The comma-ok on `cands.tierOf` is there because
+`seedTier`'s zero value is `tierName`, so a miss would attribute the draw to the one tier whose
+share this repo has already had to fix once.
+
+**`DeadEnds` and `Starved` are split, and that split is most of the point.** A dead end on an
+unseen prefix is a sparse corpus; a starved step is `PEREGRINE_MIN_DISTINCT_AUTHORS` ending
+the sentence. Those need opposite responses and an operator has never been able to tell which
+one they have.
+
+**Silence is recorded, and it is the most valuable thing in the file.** Finding 32 made the
+`too-short` outcome visible to an operator reading logs; this makes it countable. Both
+producers (`chat.stepReply` and `autopost.post`) route every exit through one `record` closure
+so a new path cannot be added that records nothing.
+
+**Refused sends carry no text.** `internal/safety` never writes the offending content
+anywhere, on purpose, and a telemetry file does not get an exception. A `Sample` whose send
+the guard turned down has `Sent=false` and no `Reply`.
+
+**The recorder drops rather than blocking.** It is called from the reply path with a human
+waiting, so `submit` is a non-blocking channel send that increments a counter when full, which
+is `core.Dispatcher`'s contract for the same reason. The drop count rides in the next snapshot
+and the report prints a warning about it, because an archive assembled from a queue that was
+full half the time is a biased sample and nothing else in it would say so.
+
+**Engagement is a second record, and its map is bounded.** The answer to "did that land"
+arrives minutes later, so filling it into the `Sample` would mean rewriting a line in an
+append-only file or holding every sample in memory. The pending map is keyed by message ID,
+which is the leak this repo has shipped twice, and going over `PEREGRINE_TUNING_TRACK_MAX`
+resolves the **oldest** watch early rather than dropping the newest: a dropped observation
+produces no record, an early one produces a record with a short `WindowS` that an analysis can
+see and exclude.
+
+**`IntentsGuildMessageReactions` is requested unconditionally.** It is not privileged, so it
+cannot cause the 4014 close code `WatchReady` diagnoses. Unconditional because an intent is
+negotiated once at identify, so making it conditional would mean turning the export on needed
+a reconnect rather than a restart.
+
+**`health` hands the status to a `Reporter` rather than tuning asking the corpus itself.**
+`Reader.Status` walks every page in several buckets, which is why it lives on a ticker at all
+(finding 11); a second service asking the same question on its own ticker would pay that cost
+twice for one answer.
+
+**The bot never uploads anything.** Files land on a bind mount and the operator pulls them with
+`scp`. `./tuning` needs the same `sudo chgrp 65532` a bind mount always needs here, and fails
+the same quiet way `./backups` does when it is skipped.
+
+**`-tuning-report` comes before `config.Load` in `run`.** It reads JSON lines, opens no corpus,
+takes no flock and needs no token, so an archive can be analyzed on a laptop that has never run
+this bot. It warns when an archive spans two versions or two sets of dials, because an average
+over both describes neither, and it skips an undecodable line rather than failing: the last
+line of a file copied off a running host is routinely half-written.
 
 ## Transcription is a seam with no engine behind it
 

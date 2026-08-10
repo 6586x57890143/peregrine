@@ -209,7 +209,13 @@ jobs:
           script: |
             set -e
             cd /home/deploy/peregrine
-            mkdir -p backups
+            # Both bind sources, created HERE so they exist as deploy-owned
+            # directories. If Docker has to create a missing bind source it makes
+            # one owned by root, and the operator then cannot even run the
+            # one-time `sudo chgrp 65532` these need without more sudo. The
+            # container runs as uid 65532 and a bind keeps its host ownership,
+            # so without that step every write into them fails.
+            mkdir -p backups tuning
 
             # Record the tag being deployed before deploying it, and keep the
             # one it replaces. Rolling back is then reading a file, not digging

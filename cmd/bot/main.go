@@ -28,6 +28,7 @@ import (
 	"github.com/6586x57890143/peregrine/internal/maintenance"
 	"github.com/6586x57890143/peregrine/internal/safety"
 	"github.com/6586x57890143/peregrine/internal/storage"
+	"github.com/6586x57890143/peregrine/internal/tuning"
 )
 
 func main() {
@@ -87,6 +88,9 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 	purgeAuthor := flag.String("purge-author", "",
 		"Remove one Discord user ID's contribution to author-diversity counts, then exit. "+
 			"The surgical alternative to discarding a corpus one bad actor has poisoned.")
+	tuningReport := flag.String("tuning-report", "",
+		"Summarize a tuning export directory (or one .jsonl file) and exit. Reads no corpus "+
+			"and contacts nothing, so it runs against an archive pulled off the host.")
 	flag.Parse()
 
 	// Which maintenance flags were PASSED, rather than which have a non-empty value.
@@ -99,6 +103,20 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 	// the empty ID is refused by the mode itself with an explanation.
 	passed := map[string]bool{}
 	flag.Visit(func(f *flag.Flag) { passed[f.Name] = true })
+
+	// The report comes before config.Load, and that placement is the point of the mode.
+	//
+	// It reads a directory of JSON lines: no corpus, no token, no environment at all. An
+	// archive is analyzed on a laptop that has never run this bot, and requiring a valid
+	// .env to read one would be the same mistake as requiring a Discord credential to clean
+	// a poisoned corpus, which is why config.Load does not demand a token either.
+	if passed["tuning-report"] {
+		if *tuningReport == "" {
+			return errors.New("-tuning-report needs a path: the export directory, or a single " +
+				"tuning-*.jsonl file out of it")
+		}
+		return tuning.Report(*tuningReport, os.Stdout)
+	}
 
 	cfg, err := config.Load()
 	if err != nil {

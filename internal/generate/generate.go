@@ -87,6 +87,15 @@ func (o Options) Params() markov.Params {
 // by the session adapter in the caller, which is what keeps discordgo out of here.
 type EmojiResolver = text.EmojiResolver
 
+// Trace is markov.Trace, aliased so a caller that wants one does not have to import the
+// engine to name it.
+//
+// The same reasoning as EmojiResolver above, in the other direction: a caller's dependency
+// should be on this package, which is the seam it already talks to, rather than on the
+// engine behind it. An alias rather than a wrapper because the engine fills the struct in
+// directly and a wrapper would be a copy nobody asked for.
+type Trace = markov.Trace
+
 // Generator produces sentences from a corpus.
 type Generator struct {
 	store *storage.Store
@@ -171,6 +180,19 @@ type Request struct {
 
 	// Emoji resolves :shortcode: tokens against the guild.
 	Emoji EmojiResolver
+
+	// Trace, when non-nil, is FILLED IN by Sentence with what generation did: the seed
+	// tier, how far the backoff went, how often the author-diversity gate emptied the
+	// candidate set. For the tuning export.
+	//
+	// An out-parameter rather than a fourth return value, deliberately. Sentence already
+	// returns three things and the trace is wanted by exactly one of its callers; widening
+	// the signature would move every call site for a field none of them read. Nil is the
+	// normal case and costs a nil check per step.
+	//
+	// It carries the BEST attempt's trace, matching the sentence that is returned. A trace
+	// describing a re-seed that was thrown away would be a trace of text nobody saw.
+	Trace *markov.Trace
 }
 
 // Sentence generates a reply to req.Prompt and returns "" with a reason when there is nothing
@@ -196,6 +218,12 @@ func (g *Generator) Sentence(req Request) (string, Outcome, error) {
 		sentence        []string
 		recognizedNames []string
 		empty           bool
+
+		// bestTrace belongs to the attempt whose sentence was kept, and tries counts the
+		// re-seeds. Both are copied into req.Trace below, so a caller that passed one gets
+		// a description of the text it is about to send rather than of an attempt that lost.
+		bestTrace *markov.Trace
+		tries     int
 	)
 
 	// ONE read transaction for the whole attempt, and genuinely one: everything inside
@@ -228,9 +256,19 @@ func (g *Generator) Sentence(req Request) (string, Outcome, error) {
 		// are the ones storage has cheap answers for.
 		const attempts = 3
 		for i := range attempts {
-			words, found := g.attempt(r, promptWords, ctx, prompt, roast)
+			// A trace per attempt, kept only if this attempt wins. Sharing one across all
+			// three would describe a sentence nobody saw: the re-seeds that lost are
+			// discarded text, and their dead ends and seed tier belong to them rather than
+			// to the reply. Allocated only when the caller asked for a trace at all.
+			var attemptTrace *markov.Trace
+			if req.Trace != nil {
+				attemptTrace = &markov.Trace{}
+			}
+			tries = i + 1
+
+			words, found := g.attempt(r, promptWords, ctx, prompt, roast, attemptTrace)
 			if len(words) > len(sentence) {
-				sentence, recognizedNames = words, found
+				sentence, recognizedNames, bestTrace = words, found, attemptTrace
 			}
 			if len(sentence) >= g.opts.MinWords {
 				break
@@ -242,6 +280,17 @@ func (g *Generator) Sentence(req Request) (string, Outcome, error) {
 		}
 		return nil
 	})
+	// The trace is filled in before every early return below, so a silent outcome is
+	// traceable too. That is the half worth having: a produced sentence can be read, whereas
+	// "the bot said nothing" is exactly the case where the seed tier and the starved-step
+	// count are the only evidence there is.
+	if req.Trace != nil {
+		if bestTrace != nil {
+			*req.Trace = *bestTrace
+		}
+		req.Trace.Attempts = tries
+	}
+
 	if err != nil {
 		return "", Produced, err
 	}
@@ -273,7 +322,7 @@ func (g *Generator) Sentence(req Request) (string, Outcome, error) {
 
 // attempt drives one sentence out of the engine and returns it with the names it
 // recognized in the prompt.
-func (g *Generator) attempt(r *storage.Reader, promptWords []string, ctx steerContext, prompt string, roast bool) ([]string, []string) {
+func (g *Generator) attempt(r *storage.Reader, promptWords []string, ctx steerContext, prompt string, roast bool, tr *markov.Trace) ([]string, []string) {
 	engine := markov.New(r, g.opts.Params(), nil)
 
 	var recognized []string
@@ -365,6 +414,7 @@ func (g *Generator) attempt(r *storage.Reader, promptWords []string, ctx steerCo
 		Names:          recognized,
 		RecalledNames:  ctx.names,
 		NameTokens:     nameTokens,
+		Trace:          tr,
 	}
 	seed := engine.Seed(seedIn)
 	if seed == "" {
@@ -410,6 +460,7 @@ func (g *Generator) attempt(r *storage.Reader, promptWords []string, ctx steerCo
 		CurrentTopic:  markov.SeedTopic(seed),
 		NameAssoc:     assoc,
 		PromptNames:   promptNames,
+		Trace:         tr,
 	}
 	if roast {
 		step.Persona = markov.PersonaRoast
@@ -478,6 +529,14 @@ func (g *Generator) attempt(r *storage.Reader, promptWords []string, ctx steerCo
 		if len(step.Prefix) > g.opts.MaxNGram-1 {
 			step.Prefix = step.Prefix[1:]
 		}
+	}
+
+	if tr != nil {
+		// Jumps is copied from the Step rather than counted here or in Jump, because
+		// Step.Jumps is already the authority the bounds are enforced against and a second
+		// counter is a second thing that can disagree with it.
+		tr.Jumps = step.Jumps
+		tr.ChoseEnd = chose
 	}
 
 	step.Sentence = markov.TrimDangling(step.Sentence, chose)
