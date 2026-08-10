@@ -234,6 +234,40 @@ The dictionary load used to be `log.Fatalf`, so a missing 64 KB word list killed
 
 **`MaybeStart` asks the counter outside its own lock**, because the counter is another package's mutex and holding one lock while taking another is how a lock-ordering deadlock gets built. Nothing needs the count and the game map to be consistent with each other; the worst case is a game started on a count that was true a microsecond ago.
 
+**A refusal that says nothing is the bug, not the silence itself.** `!wordgame` used to `return` on
+an unauthorized caller with no log line and no reply, which is indistinguishable from a broken
+bot. The case that actually bit is the operator's: with `PEREGRINE_BOOTSTRAP_ADMIN_USER_ID`
+unset, `Authorized` fails closed and refuses **everyone** including the person who deployed the
+bot. So the log now names which of the two happened, and a guard-refused announcement says so
+too. It stays silent **in the channel**, which is a different decision: answering a non-admin
+advertises that the command exists and that they are not allowed to use it. That is finding 32's
+shape in a command rather than in the reply path.
+
+**A hint is not a fourth timer.** `HintAt` is a field on the `Game` and `DueHints` is swept by
+the sweep that already expires puzzles, so it costs no goroutine and inherits `RunLoop`'s panic
+isolation and context binding for free. It **edits** the announcement rather than posting again,
+so the hint arrives where people are already looking, and a game whose announcement the guard
+refused is skipped rather than returned, because there is nothing to edit.
+`PEREGRINE_WORDGAME_HINT_AFTER` at or above `PEREGRINE_WORDGAME_TIMEOUT` is a startup error
+naming both: a hint due after the puzzle has ended is a knob wired to nothing.
+
+**A planted word is held to the dictionary's own rules, through the same function.**
+`LoadDictionary` excludes words with fewer than two distinct letters *specifically* because
+`scramble` used to recurse forever on them, and the scrambler's own bound is documented as a belt
+to those braces. `!wordgame <word>` skips the loader, so `Dictionary.Usable` reuses `usable`
+rather than restating it, and the refusal names the length bounds instead of saying no.
+
+**`commandFor` keeps matching the whole message, and the argument form is what preserves that.**
+It accepts exactly two tokens whose **first** is the command, so "you should try !wordgame
+sometime" is still ordinary chat. Taking everything after the command would have turned any
+sentence mentioning it into an invocation carrying the rest of that sentence as its puzzle word.
+
+**Streaks and records are `omitempty` fields on the persisted board**, so an M11-era blob loads
+with zeroes rather than being refused, for the same reason the pre-M11 format is still read.
+`Streak()` reads `lastWinner` rather than scanning for the largest streak, because every other
+entry's number is stale from whenever that player last had one, and it requires two wins: a line
+that appeared after every single game would be noise rather than news.
+
 ### Names: one answer to what somebody is called, and the author is always one
 
 `names.Spellings` returns every name a person is addressed by, display form first: guild nickname, then `GlobalName`, then username. Three sites hand-built this before M14 and all three threw away `GlobalName`, which since usernames became lowercase handles is the name most people actually type. `names.Primary` is the nil-safe single-value form, and callers use it rather than indexing, because a nil `Author` has turned up in a fixture here before. **The display-first order is load-bearing**, not cosmetic: `Primary` and `Substitute` both take the first entry.
