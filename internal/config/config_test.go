@@ -36,6 +36,7 @@ func clearEnv(t *testing.T) {
 		"PEREGRINE_ENABLE_TRANSCRIPTION", "PEREGRINE_TRANSCRIPTION_QUEUE",
 		"PEREGRINE_BACKUP_DIR", "PEREGRINE_BACKUP_TICK", "PEREGRINE_BACKUP_KEEP",
 		"PEREGRINE_ASSOC_BACKFILL", "PEREGRINE_ASSOC_BACKFILL_BEFORE",
+		"PEREGRINE_REPAIR_JOBS", "PEREGRINE_REPAIR_BEFORE",
 	}
 	for k := range deferredVars {
 		keys = append(keys, k)
@@ -558,36 +559,54 @@ func TestLevel(t *testing.T) {
 	}
 }
 
-// TestAssocBackfillNeedsItsBoundary.
+// TestRenamedRepairVariablesAreRefusedNotIgnored.
 //
-// The pass is additive rather than a drop-and-rebuild precisely because it stops at the
-// instant the association fix deployed. Without that boundary it would walk all of history and
-// re-count associations for every message the fixed writer has already handled, which is the
-// double-counting the bound exists to make impossible (finding 46). Naming both variables is
-// the point: the mistake is in their relationship.
-func TestAssocBackfillNeedsItsBoundary(t *testing.T) {
-	clearEnv(t)
-	t.Setenv("PEREGRINE_ASSOC_BACKFILL", "true")
+// PEREGRINE_ASSOC_BACKFILL became PEREGRINE_REPAIR_JOBS in M18. A rename that silently stops
+// reading the old value is the exact failure this package is written against: an operator who
+// had the backfill switched on would get a bot that cheerfully repairs nothing and says so
+// nowhere. The rule is prefer rescale-and-refuse over rename, and refusing is how a rename
+// honours it.
+func TestRenamedRepairVariablesAreRefusedNotIgnored(t *testing.T) {
+	for old, replacement := range map[string]string{
+		"PEREGRINE_ASSOC_BACKFILL":        "PEREGRINE_REPAIR_JOBS",
+		"PEREGRINE_ASSOC_BACKFILL_BEFORE": "PEREGRINE_REPAIR_BEFORE",
+	} {
+		t.Run(old, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv(old, "something")
 
-	_, err := Load()
-	if err == nil {
-		t.Fatal("the backfill enabled with no boundary loaded cleanly, so it would re-walk " +
-			"history that already has correct associations")
-	}
-	for _, want := range []string{"PEREGRINE_ASSOC_BACKFILL", "PEREGRINE_ASSOC_BACKFILL_BEFORE"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("the error does not name %s: %v", want, err)
-		}
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("%s loaded cleanly, so an operator who set it gets silence", old)
+			}
+			if !strings.Contains(err.Error(), replacement) {
+				t.Errorf("the error does not name the replacement %s: %v", replacement, err)
+			}
+		})
 	}
 }
 
-// TestAssocBackfillBeforeMustParse, per the rule that a bad value is a startup error and never
-// a silent fallback to the default. A fallback here would be a zero time, which reads as "walk
-// nothing" and would make an enabled pass do nothing at all.
-func TestAssocBackfillBeforeMustParse(t *testing.T) {
+// TestRepairJobsDefaultsToNone, because a repair re-reads the whole of history and that is an
+// operator's decision rather than a deploy's.
+func TestRepairJobsDefaultsToNone(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("PEREGRINE_ASSOC_BACKFILL", "true")
-	t.Setenv("PEREGRINE_ASSOC_BACKFILL_BEFORE", "last tuesday")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.RepairJobs) != 0 {
+		t.Errorf("RepairJobs defaults to %v, want empty", cfg.RepairJobs)
+	}
+}
+
+// TestRepairBeforeMustParse, per the rule that a bad value is a startup error and never a
+// silent fallback. Falling back here would give a zero time, which reads as "repair nothing"
+// and would make an enabled job do nothing at all while reporting success.
+func TestRepairBeforeMustParse(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("PEREGRINE_REPAIR_JOBS", "associations")
+	t.Setenv("PEREGRINE_REPAIR_BEFORE", "last tuesday")
 
 	if _, err := Load(); err == nil {
 		t.Fatal("an unparseable timestamp loaded cleanly")
@@ -596,20 +615,24 @@ func TestAssocBackfillBeforeMustParse(t *testing.T) {
 	}
 }
 
-// TestAssocBackfillAcceptsAValidBoundary, the control.
-func TestAssocBackfillAcceptsAValidBoundary(t *testing.T) {
+// TestRepairJobsAndBoundaryLoad, the control.
+//
+// Note that an ENABLED job with no boundary is deliberately NOT a config error any more: the
+// boundary now comes from the corpus, which config cannot see, so whether one exists is a
+// question only the service can answer. It declines and logs rather than failing startup.
+func TestRepairJobsAndBoundaryLoad(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("PEREGRINE_ASSOC_BACKFILL", "true")
-	t.Setenv("PEREGRINE_ASSOC_BACKFILL_BEFORE", "2026-08-09T21:00:00Z")
+	t.Setenv("PEREGRINE_REPAIR_JOBS", "associations,all")
+	t.Setenv("PEREGRINE_REPAIR_BEFORE", "2026-08-09T21:00:00Z")
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if !cfg.AssocBackfill {
-		t.Error("AssocBackfill is false after being set true")
+	if len(cfg.RepairJobs) != 2 {
+		t.Errorf("RepairJobs = %v, want two entries", cfg.RepairJobs)
 	}
-	if cfg.AssocBackfillBefore.IsZero() {
-		t.Error("AssocBackfillBefore is zero after being set to a valid timestamp")
+	if cfg.RepairBefore.IsZero() {
+		t.Error("RepairBefore is zero after being set to a valid timestamp")
 	}
 }

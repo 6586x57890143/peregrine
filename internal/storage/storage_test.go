@@ -1645,37 +1645,119 @@ func TestAddingTheCursorBucketDidNotBreakAnExistingCorpus(t *testing.T) {
 	}
 }
 
-// TestANewCorpusIsMarkedAlreadyBackfilled.
+// TestALearnGenerationStampIsIdempotent.
 //
-// The association re-walk repairs messages learned before a fix deployed (finding 46). A
-// corpus created after that fix has nothing older to repair, so it must never walk. Deciding
-// that in Open rather than in the service means it does not depend on an operator remembering
-// to unset an environment variable after wiping the volume, and Open is the only place that
-// knows the file is new.
-func TestANewCorpusIsMarkedAlreadyBackfilled(t *testing.T) {
-	s := dbtest.Store(t)
+// The stamp is the boundary a future repair measures itself against, so a restart must not
+// move it. If it did, every restart would shrink the window of messages a repair considers
+// "before the fix" and the repair would quietly do less each time.
+func TestALearnGenerationStampIsIdempotent(t *testing.T) {
+	path := dbtest.Path(t)
 
-	var state string
-	if err := s.View(func(r *storage.Reader) error {
-		state = r.AssocBackfillState()
+	first := time.Now().Add(-48 * time.Hour).Truncate(time.Second)
+	later := time.Now()
+
+	s, err := storage.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := s.Update(func(w *storage.Writer) error {
+		return w.RecordLearnGeneration(2, first)
+	}); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	// A second call in the same process, and then again after a reopen, which is what a
+	// restart actually looks like.
+	if err := s.Update(func(w *storage.Writer) error {
+		return w.RecordLearnGeneration(2, later)
+	}); err != nil {
+		t.Fatalf("record again: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	s2, err := storage.Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer func() { _ = s2.Close() }()
+	if err := s2.Update(func(w *storage.Writer) error {
+		return w.RecordLearnGeneration(2, later)
+	}); err != nil {
+		t.Fatalf("record after reopen: %v", err)
+	}
+
+	if err := s2.View(func(r *storage.Reader) error {
+		at, known := r.LearnGenerationStart(2)
+		if !known {
+			t.Fatal("the generation stamp is not readable after being written")
+		}
+		if !at.Equal(first) {
+			t.Errorf("stamp moved to %s, want the first value %s: a restart must not shrink "+
+				"the window a repair considers", at, first)
+		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if state != storage.AssocBackfillDone {
-		t.Errorf("a fresh corpus reports assoc backfill state %q, want %q: it would otherwise "+
-			"re-read all of Discord history looking for messages that cannot exist",
-			state, storage.AssocBackfillDone)
+}
+
+// TestAnUnstampedGenerationIsUnknownRatherThanZero.
+//
+// Unknown is the ordinary answer for a generation that shipped before stamping existed, and it
+// has to be distinguishable from the zero time: a repair reading zero as a boundary would walk
+// nothing while reporting success, where "unknown" makes it decline and say why.
+func TestAnUnstampedGenerationIsUnknownRatherThanZero(t *testing.T) {
+	s := dbtest.Store(t)
+
+	if err := s.View(func(r *storage.Reader) error {
+		if _, known := r.LearnGenerationStart(99); known {
+			t.Error("a generation that was never stamped reports itself known")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 
-// TestTheAssociationCursorIsIndependentOfTheIngestCursor.
+// TestRepairCursorsAreNamespacedByJob.
 //
-// The two passes read the same channels for opposite reasons: ingest asks what is NEW and must
-// never rewind, the re-walk asks what is OLD and finishes. Sharing one mark would let either
-// move the other's, and moving the ingest mark backwards re-learns everything between, which
-// is finding 13.
-func TestTheAssociationCursorIsIndependentOfTheIngestCursor(t *testing.T) {
+// Two repairs walk the same channels at different speeds. Sharing a cursor would make one
+// job's progress look like the other's, so a job could skip messages it never read.
+func TestRepairCursorsAreNamespacedByJob(t *testing.T) {
+	s := dbtest.Store(t)
+	const channel = "c1"
+
+	newer, older := snowflake(5000), snowflake(1000)
+
+	if err := s.Update(func(w *storage.Writer) error {
+		if err := w.SetRepairCursor("jobA", channel, newer); err != nil {
+			return err
+		}
+		return w.SetRepairCursor("jobB", channel, older)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.View(func(r *storage.Reader) error {
+		if got := r.RepairCursor("jobA", channel); got != newer {
+			t.Errorf("jobA cursor = %q, want %q", got, newer)
+		}
+		if got := r.RepairCursor("jobB", channel); got != older {
+			t.Errorf("jobB cursor = %q, want %q", got, older)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestARepairCursorIsIndependentOfTheIngestCursor.
+//
+// The two read the same channels for opposite reasons: ingest asks what is new and must never
+// rewind, a repair asks what is old and finishes. Moving the ingest mark backwards is finding
+// 13, so they cannot share.
+func TestARepairCursorIsIndependentOfTheIngestCursor(t *testing.T) {
 	s := dbtest.Store(t)
 	const channel = "c1"
 
@@ -1685,17 +1767,17 @@ func TestTheAssociationCursorIsIndependentOfTheIngestCursor(t *testing.T) {
 		if err := w.SetCursor(channel, newer); err != nil {
 			return err
 		}
-		return w.SetAssocCursor(channel, older)
+		return w.SetRepairCursor("associations", channel, older)
 	}); err != nil {
 		t.Fatal(err)
 	}
 
 	if err := s.View(func(r *storage.Reader) error {
 		if got := r.Cursor(channel); got != newer {
-			t.Errorf("ingest cursor = %q, want %q: the association pass moved it", got, newer)
+			t.Errorf("ingest cursor = %q, want %q: a repair moved it", got, newer)
 		}
-		if got := r.AssocCursor(channel); got != older {
-			t.Errorf("association cursor = %q, want %q", got, older)
+		if got := r.RepairCursor("associations", channel); got != older {
+			t.Errorf("repair cursor = %q, want %q", got, older)
 		}
 		return nil
 	}); err != nil {
@@ -1703,26 +1785,80 @@ func TestTheAssociationCursorIsIndependentOfTheIngestCursor(t *testing.T) {
 	}
 }
 
-// TestTheAssociationCursorRefusesToRewind, for the same reason SetCursor does: a batch
-// processed out of order would otherwise have its associations counted twice.
-func TestTheAssociationCursorRefusesToRewind(t *testing.T) {
+// TestARepairCursorRefusesToRewind, for the same reason SetCursor does: a batch processed out
+// of order would otherwise have its repair applied twice.
+func TestARepairCursorRefusesToRewind(t *testing.T) {
 	s := dbtest.Store(t)
-	const channel = "c1"
 
 	newer, older := snowflake(5000), snowflake(1000)
-
 	if err := s.Update(func(w *storage.Writer) error {
-		if err := w.SetAssocCursor(channel, newer); err != nil {
+		if err := w.SetRepairCursor("associations", "c1", newer); err != nil {
 			return err
 		}
-		return w.SetAssocCursor(channel, older)
+		return w.SetRepairCursor("associations", "c1", older)
 	}); err != nil {
 		t.Fatal(err)
 	}
 
 	if err := s.View(func(r *storage.Reader) error {
-		if got := r.AssocCursor(channel); got != newer {
-			t.Errorf("association cursor rewound to %q, want it held at %q", got, newer)
+		if got := r.RepairCursor("associations", "c1"); got != newer {
+			t.Errorf("repair cursor rewound to %q, want it held at %q", got, newer)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestForEachRepairCursorRecoversBothHalvesOfTheKey, which is what the composite key buys and
+// what the association version never had.
+func TestForEachRepairCursorRecoversBothHalvesOfTheKey(t *testing.T) {
+	s := dbtest.Store(t)
+
+	if err := s.Update(func(w *storage.Writer) error {
+		return w.SetRepairCursor("associations", "chan-1", snowflake(42))
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	seen := 0
+	if err := s.View(func(r *storage.Reader) error {
+		return r.ForEachRepairCursor(func(job, channelID, messageID string) error {
+			seen++
+			if job != "associations" || channelID != "chan-1" {
+				t.Errorf("split gave job=%q channel=%q, want associations/chan-1", job, channelID)
+			}
+			if messageID != snowflake(42) {
+				t.Errorf("message ID = %q, want %q", messageID, snowflake(42))
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if seen != 1 {
+		t.Errorf("visited %d cursors, want 1", seen)
+	}
+}
+
+// TestAnUnknownRepairStateIsRefused.
+//
+// The previous version took any string and wrote it raw, so a typo became a value no reader
+// recognised and the job then silently never completed. That is the class of silence this
+// repository keeps closing.
+func TestAnUnknownRepairStateIsRefused(t *testing.T) {
+	s := dbtest.Store(t)
+
+	err := s.Update(func(w *storage.Writer) error {
+		return w.SetRepairState("associations", storage.RepairState("finsihed"))
+	})
+	if err == nil {
+		t.Fatal("a misspelled repair state was accepted, so the job would never complete")
+	}
+
+	if err := s.View(func(r *storage.Reader) error {
+		if got := r.RepairStateOf("associations"); got != storage.RepairPending {
+			t.Errorf("state is %q after a refused write, want pending", got)
 		}
 		return nil
 	}); err != nil {

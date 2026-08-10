@@ -93,13 +93,25 @@ type Config struct {
 	// passes resume from a stored per-channel cursor. The old meaning was the mechanism
 	// behind finding 13, since re-reading a window whose dedup record had been evicted
 	// counted the same n-grams twice.
-	AssocBackfill            bool          // PEREGRINE_ASSOC_BACKFILL
-	AssocBackfillBefore      time.Time     // PEREGRINE_ASSOC_BACKFILL_BEFORE
 	IngestTick               time.Duration // PEREGRINE_INGEST_TICK
 	IngestLookback           time.Duration // PEREGRINE_INGEST_LOOKBACK
 	IngestBatchDelay         time.Duration // PEREGRINE_INGEST_BATCH_DELAY
 	IngestGuildConcurrency   int           // PEREGRINE_INGEST_GUILD_CONCURRENCY
 	IngestChannelConcurrency int           // PEREGRINE_INGEST_CHANNEL_CONCURRENCY
+
+	// History repair. RepairJobs names the jobs to run, or "all"; empty runs none.
+	//
+	// RepairBefore is an override used only by a job whose learn generation predates
+	// generation stamping, because the corpus records when each generation first ran and that
+	// is the boundary a repair should use. It exists for exactly one case and should not grow
+	// a second (SPEC.md section 8, finding 46).
+	//
+	// The two variables these replace, PEREGRINE_ASSOC_BACKFILL and
+	// PEREGRINE_ASSOC_BACKFILL_BEFORE, are REFUSED at startup rather than ignored. The rule
+	// in this file is prefer rescale-and-refuse over rename, precisely because a rename lets
+	// an old value stop being read without saying so; refusing is how a rename honours it.
+	RepairJobs   []string  // PEREGRINE_REPAIR_JOBS
+	RepairBefore time.Time // PEREGRINE_REPAIR_BEFORE
 
 	// Runtime. The worker pool that every incoming message goes through, replacing
 	// an unbounded goroutine per message that shared a WaitGroup with the shutdown
@@ -336,10 +348,10 @@ func Load() (*Config, error) {
 
 		SelfMention: l.regex("PEREGRINE_SELF_MENTION_PATTERN", `(?i)\b(peregrine|bird)\b`),
 
-		// The one-shot association re-walk (finding 46). Default OFF: it re-reads the whole
-		// of history, which is an operator's decision rather than a deploy's.
-		AssocBackfill:       l.boolVal("PEREGRINE_ASSOC_BACKFILL", false),
-		AssocBackfillBefore: l.timestamp("PEREGRINE_ASSOC_BACKFILL_BEFORE"),
+		// History repair (finding 46). Default OFF: a repair re-reads the whole of history,
+		// which is an operator's decision rather than a deploy's.
+		RepairJobs:   l.csv("PEREGRINE_REPAIR_JOBS"),
+		RepairBefore: l.timestamp("PEREGRINE_REPAIR_BEFORE"),
 
 		IngestTick:       l.dur("PEREGRINE_INGEST_TICK", 10*time.Minute, time.Minute, 24*time.Hour),
 		IngestLookback:   l.dur("PEREGRINE_INGEST_LOOKBACK", 24*time.Hour, time.Minute, 30*24*time.Hour),
@@ -442,17 +454,18 @@ func Load() (*Config, error) {
 	// The old arrangement had the feature const false AND the channel list
 	// empty, so flipping either one alone produced no posts and no explanation
 	// of why. Naming both variables in the error is the entire point.
-	// The association re-walk needs its boundary, and naming both variables is the point:
-	// the mistake is in their relationship rather than in either value. Without a boundary
-	// the pass would walk all of history and re-count associations for every message the
-	// fixed writer has already handled since M14, which is the double-counting the
-	// time bound exists to make impossible (finding 46).
-	if cfg.AssocBackfill && cfg.AssocBackfillBefore.IsZero() {
-		l.errs = append(l.errs, errors.New(
-			"PEREGRINE_ASSOC_BACKFILL is true but PEREGRINE_ASSOC_BACKFILL_BEFORE is unset: "+
-				"set it to the RFC3339 instant the association fix deployed, because only messages "+
-				"older than that were learned without associations and walking newer ones would "+
-				"count them twice"))
+	// THE RENAMED VARIABLES ARE REFUSED, NOT IGNORED. A rename that silently stops reading an
+	// old value is the failure this whole file is written against, and an operator who set
+	// PEREGRINE_ASSOC_BACKFILL=true would otherwise get a bot that cheerfully repairs nothing.
+	for old, replacement := range map[string]string{
+		"PEREGRINE_ASSOC_BACKFILL":        "PEREGRINE_REPAIR_JOBS",
+		"PEREGRINE_ASSOC_BACKFILL_BEFORE": "PEREGRINE_REPAIR_BEFORE",
+	} {
+		if v, ok := os.LookupEnv(old); ok && v != "" {
+			l.errs = append(l.errs, fmt.Errorf(
+				"%s was renamed to %s in M18, when the one-shot association backfill became a "+
+					"general repair mechanism. Unset %s and set %s instead", old, replacement, old, replacement))
+		}
 	}
 	if cfg.EnableAutonomousPost && len(cfg.AutonomousPostChannels) == 0 {
 		l.errs = append(l.errs, errors.New(

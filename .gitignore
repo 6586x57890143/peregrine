@@ -26,8 +26,15 @@ backups/
 voicenotes/
 
 # Build output
+#
+# /bot and /bot.exe are the ones that actually happen: `go build ./...` names the binary
+# after its package directory, and the entrypoint is cmd/bot, so a plain build at the repo
+# root drops "bot" here rather than "peregrine". Only /peregrine was listed, so the real
+# artifact was untracked-but-not-ignored and showed up in `git add -A`.
 /bin/
 /dist/
+/bot
+/bot.exe
 /peregrine
 /peregrine.exe
 

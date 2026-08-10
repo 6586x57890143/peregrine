@@ -92,19 +92,14 @@ func (w *Writer) trimHistory(max int) error {
 // HistoryCount reports the dedup window size, for the status line.
 func (r *Reader) HistoryCount() uint64 { return r.counter(metaHistoryCount) }
 
-// OldestSeen returns the timestamp of the oldest entry in the dedup window, which
-// tells an operator how far back the window actually reaches. Zero if empty.
-func (r *Reader) OldestSeen() time.Time {
-	b := r.bucket(bucketHistory)
-	if b == nil {
-		return time.Time{}
-	}
-	_, v := b.Cursor().First()
-	if v == nil {
-		return time.Time{}
-	}
-	return time.Unix(0, decodeTime(v))
-}
+// OldestSeen is GONE, and it is worth one line saying why rather than leaving a gap.
+//
+// It reported the oldest entry in the dedup window and had zero callers anywhere: not in
+// Status, not in the health line, not in a test. It also answered a slightly wrong question,
+// since trimHistory evicts by MESSAGE time while the value it returned was a WRITE time, so
+// the two only agree when messages arrive in order. Found while looking for something in the
+// corpus that could date a repair boundary; deleting a behaviour is not finished until the
+// layout stops making room for it.
 
 // ---------------------------------------------------------------- topics
 
@@ -716,6 +711,20 @@ func (r *Reader) Cursor(channelID string) string {
 // which is finding 13 arriving by a different route. A monotonic cursor cannot do that
 // however confused its caller is.
 func (w *Writer) SetCursor(channelID, messageID string) error {
+	return w.setCursor(bucketCursor, []byte(channelID), channelID, messageID)
+}
+
+// setCursor is the monotonic write every cursor family shares.
+//
+// One implementation rather than two, because SetCursor and the association pass's version
+// were near-verbatim copies differing only in bucket name and error text, and the job table
+// wanted a third. That is finding 28's shape: two statements of one rule, differing only in
+// what each forgets. The monotonic guarantee is the entire content of this function and it
+// should be written down once.
+//
+// key is separate from channelID because the repair family namespaces its keys by job name
+// while still wanting the channel in its error messages.
+func (w *Writer) setCursor(bucket string, key []byte, channelID, messageID string) error {
 	if channelID == "" {
 		return fmt.Errorf("refusing to store a cursor for an empty channel ID")
 	}
@@ -724,11 +733,11 @@ func (w *Writer) SetCursor(channelID, messageID string) error {
 		return fmt.Errorf("cursor for channel %s: %w", channelID, err)
 	}
 
-	b := w.bucket(bucketCursor)
-	if current := b.Get([]byte(channelID)); len(current) > 0 && bytes.Compare(next, current) <= 0 {
+	b := w.bucket(bucket)
+	if current := b.Get(key); len(current) > 0 && bytes.Compare(next, current) <= 0 {
 		return nil
 	}
-	return b.Put([]byte(channelID), next)
+	return b.Put(key, next)
 }
 
 // ForgetCursor drops a channel's mark, so the next pass treats it as never read.
@@ -755,57 +764,145 @@ func (r *Reader) ForEachCursor(fn func(channelID, messageID string) error) error
 	})
 }
 
-// AssocCursor and SetAssocCursor are the association re-walk's own high-water marks.
+// repairCursorKey namespaces a repair job's cursor by job name.
 //
-// A SEPARATE BUCKET from the ingest cursor, and that separation is the whole reason the
-// re-walk is safe to run at all. The two passes read the same channels for different
-// reasons and at different speeds: ingest is asking "what is new" and must never rewind,
-// while the re-walk is asking "what is old" and finishes. Sharing one mark would mean
-// either pass moving the other's, and moving the ingest mark backwards is finding 13.
-func (r *Reader) AssocCursor(channelID string) string {
-	b := r.bucket(bucketAssocCursor)
+// One bucket keyed <job> NUL <channel id> rather than a bucket per job, reusing the composite
+// codec and its NUL assertion. A bucket per job would mean allBuckets growing every time a
+// repair is added, and centralising bucket creation is exactly what that list is for.
+func repairCursorKey(job, channelID string) ([]byte, error) {
+	if job == "" {
+		return nil, fmt.Errorf("refusing to key a repair cursor on an empty job name")
+	}
+	return pairKey(job, channelID)
+}
+
+// RepairCursor returns how far a repair job has walked one channel.
+//
+// A SEPARATE FAMILY from the ingest cursor, and that separation is the whole reason a repair
+// is safe to run alongside the live pass. The two read the same channels for opposite reasons:
+// ingest asks "what is new" and must never rewind, a repair asks "what is old" and finishes.
+// Sharing one mark would mean either moving the other's, and moving the ingest mark backwards
+// is finding 13.
+func (r *Reader) RepairCursor(job, channelID string) string {
+	key, err := repairCursorKey(job, channelID)
+	if err != nil {
+		return ""
+	}
+	b := r.bucket(bucketRepairCurs)
 	if b == nil {
 		return ""
 	}
-	v := b.Get([]byte(channelID))
+	v := b.Get(key)
 	if len(v) == 0 {
 		return ""
 	}
 	return decodeSnowflake(v)
 }
 
-// SetAssocCursor advances the re-walk's mark, refusing to move backwards for the same
-// reason SetCursor does: a batch processed out of order would otherwise cause the same
-// messages to have their associations counted twice.
-func (w *Writer) SetAssocCursor(channelID, messageID string) error {
-	if channelID == "" {
-		return fmt.Errorf("refusing to store an association cursor for an empty channel ID")
-	}
-	next, err := encodeSnowflake(messageID)
+// SetRepairCursor advances a repair job's mark for one channel, refusing to move backwards for
+// the same reason SetCursor does: a batch processed out of order would otherwise have its
+// repair applied twice.
+func (w *Writer) SetRepairCursor(job, channelID, messageID string) error {
+	key, err := repairCursorKey(job, channelID)
 	if err != nil {
-		return fmt.Errorf("association cursor for channel %s: %w", channelID, err)
+		return err
 	}
+	return w.setCursor(bucketRepairCurs, key, channelID, messageID)
+}
 
-	b := w.bucket(bucketAssocCursor)
-	if current := b.Get([]byte(channelID)); len(current) > 0 && bytes.Compare(next, current) <= 0 {
+// ForEachRepairCursor visits every stored repair mark, for an operator asking how far a pass
+// got.
+//
+// The ingest family has had this since M9 and the association family never got one, which is
+// the kind of gap a second copy of a thing quietly produces.
+func (r *Reader) ForEachRepairCursor(fn func(job, channelID, messageID string) error) error {
+	b := r.bucket(bucketRepairCurs)
+	if b == nil {
 		return nil
 	}
-	return b.Put([]byte(channelID), next)
+	return b.ForEach(func(k, v []byte) error {
+		if len(v) == 0 {
+			return nil
+		}
+		job, channelID, ok := splitPairKey(k)
+		if !ok {
+			// A key that does not split is one no writer here produced. Skipping beats
+			// failing the whole walk over it.
+			return nil
+		}
+		return fn(job, channelID, decodeSnowflake(v))
+	})
 }
 
-// AssocBackfillState reports whether the association re-walk has run. See finding 46.
-func (r *Reader) AssocBackfillState() string {
+// RepairStateOf reports how far a repair job has got.
+func (r *Reader) RepairStateOf(job string) RepairState {
 	b := r.bucket(bucketMeta)
 	if b == nil {
-		return AssocBackfillPending
+		return RepairPending
 	}
-	return string(b.Get([]byte(metaAssocBackfill)))
+	return RepairState(b.Get([]byte(metaRepairPrefix + job)))
 }
 
-// SetAssocBackfillState records progress through the re-walk.
+// SetRepairState records progress through a repair.
 //
-// Persisted rather than held in memory because the walk spans hours and restarts, and the
-// marker is what stops a completed pass from running again on every boot.
-func (w *Writer) SetAssocBackfillState(state string) error {
-	return w.bucket(bucketMeta).Put([]byte(metaAssocBackfill), []byte(state))
+// Persisted rather than held in memory because a repair spans hours and restarts, and the
+// marker is what stops a completed pass running again on every boot.
+//
+// It REFUSES an unknown state. The previous version took any string and wrote it raw, so a
+// typo became a value no reader recognised and the job then silently never completed, which is
+// the class of silence this repository keeps closing.
+func (w *Writer) SetRepairState(job string, state RepairState) error {
+	if job == "" {
+		return fmt.Errorf("refusing to record repair state for an empty job name")
+	}
+	if !state.Valid() {
+		return fmt.Errorf("refusing to record unknown repair state %q for job %s", state, job)
+	}
+	return w.bucket(bucketMeta).Put([]byte(metaRepairPrefix+job), []byte(state))
+}
+
+// RecordLearnGeneration stamps the first time a generation of the write path ran here.
+//
+// # Why the corpus records this at all
+//
+// A repair needs to know which messages predate the fix it repairs. M17 asked the OPERATOR for
+// that instant as an RFC3339 string, whose two failure modes are a silent double count and a
+// silent gap, and which does not survive a second repair because nobody remembers two deploy
+// dates.
+//
+// Nothing already in the corpus can answer it. No meta counter is a timestamp. The history
+// bucket does store write times, but it is capped and evicted by MESSAGE time, so its
+// survivors are an arbitrary sample of them. The cursor bucket answers "what has been read",
+// which is a different question. So the instant has to be stamped, and startup is the only
+// moment that knows it.
+//
+// IDEMPOTENT: only the first call for a generation writes. Restarts must not move a boundary
+// that a later repair will be measured against.
+func (w *Writer) RecordLearnGeneration(gen int, at time.Time) error {
+	if gen <= 0 {
+		return fmt.Errorf("refusing to record learn generation %d, which is not a generation", gen)
+	}
+	b := w.bucket(bucketLearnGen)
+	key := encodeUint64(uint64(gen))
+	if existing := b.Get(key); len(existing) > 0 {
+		return nil
+	}
+	return b.Put(key, encodeTime(at.UnixNano()))
+}
+
+// LearnGenerationStart reports when a generation first ran here, and whether that is known.
+//
+// Unknown is the ordinary answer for any generation that shipped before stamping existed,
+// which is why the operator override still exists. It is deliberately not an error: a repair
+// that cannot find its boundary declines to run and says so, which is the safe direction.
+func (r *Reader) LearnGenerationStart(gen int) (time.Time, bool) {
+	b := r.bucket(bucketLearnGen)
+	if b == nil {
+		return time.Time{}, false
+	}
+	v := b.Get(encodeUint64(uint64(gen)))
+	if len(v) == 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(0, decodeTime(v)), true
 }
