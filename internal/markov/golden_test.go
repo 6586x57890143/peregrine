@@ -122,7 +122,7 @@ func generate(g *Generator, prompt string, persona Persona) []string {
 		if len(s.Prefix) == 0 {
 			break
 		}
-		s.Position = float64(len(s.Sentence)) / float64(length.Max)
+		s.Position = length.Progress(len(s.Sentence))
 
 		next, err := g.Next(s)
 		if err != nil {
