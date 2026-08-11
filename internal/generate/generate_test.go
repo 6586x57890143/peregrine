@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"strconv"
 	"strings"
 	"testing"
@@ -404,5 +405,60 @@ func TestMemoryIsBoundedPerChannel(t *testing.T) {
 	m.mu.Unlock()
 	if n > maxEntries {
 		t.Errorf("one channel holds %d entries against a bound of %d", n, maxEntries)
+	}
+}
+
+// TestGenerationIsReproducibleUnderASeededSource is the pin for the one draw on this path
+// that no test could control.
+//
+// markov.Source exists so that the same seed produces the same text twice, which is what
+// lets a printed difference be attributed to a change rather than to the draw. Every draw
+// here went through it EXCEPT the length target, which constructed a markov.DefaultSource{}
+// inline whatever the caller passed. So the sentence length, and therefore the end-token
+// logit at every step, was unpinnable from outside the engine.
+//
+// That is the same shape M14, M16 and M19 each found elsewhere: a code path the instrument
+// silently does not reach. Revert attempt to build its own DefaultSource and this fails.
+func TestGenerationIsReproducibleUnderASeededSource(t *testing.T) {
+	run := func() []string {
+		s, l, _ := fixture(t, defaults())
+		g := NewWithSource(s, defaults(), rand.New(rand.NewPCG(0xC0FFEE, 0xBADF00D)))
+		teach(t, s, l, "alice", 100,
+			"the bird is loose in the server again",
+			"the bird is coping about the ratio",
+			"greg said the server is doomed honestly",
+			"the ratio is doomed and the bird knows it",
+		)
+
+		out := make([]string, 0, 12)
+		for range 12 {
+			got, _, err := g.Sentence(Request{Prompt: "the bird is"})
+			if err != nil {
+				t.Fatalf("generate: %v", err)
+			}
+			out = append(out, got)
+		}
+		return out
+	}
+
+	a, b := run(), run()
+	for i := range a {
+		if a[i] != b[i] {
+			t.Fatalf("draw %d differed between two seeded runs:\n  %q\n  %q\n"+
+				"Every draw on this path must come from the injected Source, or the golden "+
+				"harness cannot attribute an output change to the change that caused it",
+				i, a[i], b[i])
+		}
+	}
+
+	// And the source must actually be doing something: twelve identical sentences would
+	// satisfy the loop above while proving nothing.
+	distinct := map[string]struct{}{}
+	for _, s := range a {
+		distinct[s] = struct{}{}
+	}
+	if len(distinct) < 2 {
+		t.Errorf("all %d draws were the same sentence, so reproducibility is being satisfied "+
+			"by a deterministic path rather than by the seed: %q", len(a), a[0])
 	}
 }

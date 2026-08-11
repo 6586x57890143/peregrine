@@ -100,12 +100,43 @@ type Trace = markov.Trace
 type Generator struct {
 	store *storage.Store
 	opts  Options
+
+	// src is the randomness every draw on this path takes, or nil for DefaultSource.
+	//
+	// One source rather than none, because the length draw used to construct
+	// markov.DefaultSource{} inline while the engine took nil, so nothing outside the engine
+	// could make this package produce the same text twice. markov.Source exists precisely so
+	// that a printed difference can be attributed to a change rather than to the draw, and
+	// this was the one step of the pipeline that escaped it. Production still passes nil and
+	// still has no shared generator to race on, because DefaultSource is stateless.
+	src markov.Source
 }
 
 // New returns a Generator. It holds the Store rather than a Reader, because it opens its
 // own transaction per sentence and a Reader cannot be held across one.
 func New(store *storage.Store, opts Options) *Generator {
 	return &Generator{store: store, opts: opts}
+}
+
+// NewWithSource is New with the randomness supplied, for tests that need reproducible
+// output. Production uses New, which leaves src nil and therefore uses DefaultSource.
+func NewWithSource(store *storage.Store, opts Options, src markov.Source) *Generator {
+	return &Generator{store: store, opts: opts, src: src}
+}
+
+// source is the one answer to where a draw on this path comes from.
+//
+// A method rather than a field read because there were THREE draws here and they did not
+// agree: the engine took whatever was passed, the length target constructed its own
+// markov.DefaultSource{} inline, and the persona post-pass was called with a literal nil.
+// Two of the three were therefore unpinnable from outside, which is what
+// TestGenerationIsReproducibleUnderASeededSource found the moment it was written. A shared
+// accessor is what stops a fourth draw inventing a fourth answer.
+func (g *Generator) source() markov.Source {
+	if g.src == nil {
+		return markov.DefaultSource{}
+	}
+	return g.src
 }
 
 // Outcome says WHY Sentence produced nothing, which the caller needs in order to log
@@ -317,13 +348,16 @@ func (g *Generator) Sentence(req Request) (string, Outcome, error) {
 	if roast {
 		persona = markov.PersonaRoast
 	}
-	return markov.Style(nil, markov.DefaultWeights(), final, persona, len(recognizedNames) > 0), Produced, nil
+	// g.source() rather than the nil that used to be here. Style draws twice, for whether to
+	// add filler at all and for where to put it, so a literal nil meant the visible half of
+	// the persona was unpinnable even when every other draw was seeded.
+	return markov.Style(g.source(), markov.DefaultWeights(), final, persona, len(recognizedNames) > 0), Produced, nil
 }
 
 // attempt drives one sentence out of the engine and returns it with the names it
 // recognized in the prompt.
 func (g *Generator) attempt(r *storage.Reader, promptWords []string, ctx steerContext, prompt string, roast bool, tr *markov.Trace) ([]string, []string) {
-	engine := markov.New(r, g.opts.Params(), nil)
+	engine := markov.New(r, g.opts.Params(), g.src)
 
 	var recognized []string
 	// BOTH SPELLINGS are collected, and that is the point rather than belt and braces. The
@@ -445,7 +479,12 @@ func (g *Generator) attempt(r *storage.Reader, promptWords []string, ctx steerCo
 		}
 	}
 
-	length := markov.NewLength(markov.DefaultSource{}, g.opts.MinWords, g.opts.MaxWords)
+	// The SAME source the engine draws on, where this used to construct a
+	// markov.DefaultSource{} inline whatever the caller asked for. That made the length
+	// target a draw no test could pin, which is the shape M14, M16 and M19 each found
+	// somewhere else: an instrument that silently omits a code path reports on a bot that
+	// does not exist.
+	length := markov.NewLength(g.source(), g.opts.MinWords, g.opts.MaxWords)
 
 	step := &markov.Step{
 		Prefix:        append([]string{}, words...),
@@ -481,7 +520,7 @@ func (g *Generator) attempt(r *storage.Reader, promptWords []string, ctx steerCo
 		if len(step.Prefix) == 0 {
 			break
 		}
-		step.Position = float64(len(step.Sentence)) / float64(length.Max)
+		step.Position = length.Progress(len(step.Sentence))
 
 		next, err := engine.Next(step)
 		if err != nil {

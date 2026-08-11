@@ -61,7 +61,13 @@ type Step struct {
 	Used   map[string]int
 	Ngrams map[string]struct{}
 
-	// Position is progress through the sentence, 0 at the start and 1 at the cap.
+	// Position is progress through the sentence, 0 at the start and 1 at the target.
+	//
+	// IT IS ON THE SAME SCALE AS corpus.TopicAssoc.MeanPosition, which is a fraction of a
+	// message, and every consumer below compares the two directly. Set it from
+	// Length.Progress and from nothing else: both walk loops used to divide by Length.Max,
+	// which is a different scale entirely, and the invariant was violated precisely because
+	// it was never written down here. Length.Progress carries the full account.
 	Position float64
 
 	// Length is the one length model: floor, cap and the target sampled once for this
@@ -413,6 +419,12 @@ func (g *Generator) heuristics(s *Step, c candidate, assoc assocCache) float64 {
 
 	// Connectives: a nudge mid-sentence, a dampening right at the end. Both small,
 	// and both were multiplicative constants before.
+	//
+	// BOTH BRANCHES ARE REACHABLE NOW, which is new. Position used to be measured against
+	// Length.Max, so "right at the end" meant word 16 of 18 against a median target of 7 and
+	// the dampening had effectively never fired, while the mid-sentence nudge covered almost
+	// the whole sentence. The term was therefore a flat bias toward "and/but/then/because"
+	// in an engine whose length model exists to argue against run-ons. See Length.Progress.
 	if _, ok := connectives[tok]; ok {
 		switch {
 		case s.Position > 0.85:
