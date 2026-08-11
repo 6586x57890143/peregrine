@@ -160,3 +160,70 @@ func TestTheLengthModelActuallyEndsSentences(t *testing.T) {
 }
 
 // generate returns the word slice directly, so no splitting helper is needed here.
+
+// TestProgressIsMeasuredAgainstTheTargetNotTheCap is the pin for the position scale
+// mismatch, and it is written as a scale comparison rather than as fixed numbers because
+// the defect was a scale error rather than an off-by-one.
+//
+// Step.Position is compared directly against corpus.TopicAssoc.MeanPosition, which the
+// learn path records as j/len(words): a fraction of a real message, spread over the whole
+// of [0, 1). Both walk loops divided by Length.Max instead. At the shipped 4-to-18 bounds
+// the median target is around 7, so a typical reply swept Position from 0 to about 0.39 and
+// never entered the upper half of the range the corpus measured against, which damped every
+// word the corpus usually sees late in a message for the entire sentence.
+//
+// Revert Progress to divide by l.Max and the first subtest fails.
+func TestProgressIsMeasuredAgainstTheTargetNotTheCap(t *testing.T) {
+	l := Length{Min: 4, Max: 18, Target: 7}
+
+	if got := l.Progress(0); got != 0 {
+		t.Errorf("Progress(0) = %.3f, want 0: a sentence that has produced nothing is at the start", got)
+	}
+
+	// The whole point: a sentence that reaches its target has reached the END of the scale
+	// the corpus recorded, not 39% of it.
+	if got := l.Progress(l.Target); got != 1 {
+		t.Errorf("Progress(target) = %.3f, want 1. Position is on the same scale as "+
+			"corpus.TopicAssoc.MeanPosition, which is a fraction of a message, so a "+
+			"sentence at its target is at the end of that scale. Dividing by Max instead "+
+			"gives %.3f and confines every position term to the bottom third of its domain",
+			got, float64(l.Target)/float64(l.Max))
+	}
+
+	// Monotonic and clamped. Past the target the sentence is in the end-bonus regime; there
+	// is no more progress to report, and MeanPosition cannot exceed 1 either.
+	prev := -1.0
+	for n := range l.Max + 5 {
+		p := l.Progress(n)
+		if p < 0 || p > 1 {
+			t.Fatalf("Progress(%d) = %.3f, outside [0, 1]", n, p)
+		}
+		if p < prev {
+			t.Fatalf("Progress(%d) = %.3f went backwards from %.3f", n, p, prev)
+		}
+		prev = p
+	}
+
+	// The connective dampening branch fires above 0.85, which under the old divisor meant
+	// word 16 of 18 against a median target of 7 and therefore essentially never. A median
+	// sentence must now be able to reach it, or the branch is dead again with nothing
+	// failing.
+	if l.Progress(l.Target) <= 0.85 {
+		t.Error("a sentence at its target does not reach the connective dampening threshold " +
+			"of 0.85, so the branch is unreachable for a median-length reply and the term " +
+			"is a flat bias toward run-on conjunctions")
+	}
+}
+
+// TestProgressToleratesAZeroValueLength. A caller that skipped NewLength hands us Target 0,
+// and dividing by it would panic inside a message handler. Length is not worth failing a
+// reply over, which is the same reasoning NewLength's bad-range guard runs on.
+func TestProgressToleratesAZeroValueLength(t *testing.T) {
+	for _, l := range []Length{{}, {Max: 18}, {Min: 4, Max: 18}} {
+		for _, n := range []int{0, 1, 50} {
+			if p := l.Progress(n); p < 0 || p > 1 {
+				t.Errorf("Progress(%d) on %+v = %.3f, outside [0, 1]", n, l, p)
+			}
+		}
+	}
+}
