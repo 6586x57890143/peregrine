@@ -5,57 +5,44 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bwmarrin/discordgo"
-
 	"github.com/6586x57890143/peregrine/internal/wordgame"
 )
 
-// The puzzle's rendering.
+// The puzzle's rendering: a plain chat message.
 //
-// # Why an embed rather than the plain strings it replaced
+// # Why not an embed
 //
-// The same argument embed.go makes about the leaderboard, plus one this feature has that the
-// leaderboard does not: a puzzle has STATE. It is live, or it has been hinted, or it was solved,
-// or it timed out, and a player scrolling back through a channel needs to know which at a glance
-// rather than by reading. A colour answers that in no words at all, and a plain message has no
-// colour to give.
+// It was one for two milestones and it was wrong. An embed is a CARD: a coloured bar, a box, and
+// a chunk of visual weight that says "this is a notice" every time it appears. A word game is not
+// a notice, it is a thing somebody said in the channel, and a bot that posts a card every few
+// minutes is a bot that keeps interrupting. Reverted on that feedback rather than on a theory.
 //
-// It also has a deadline, and "60 seconds" printed into a string is wrong the moment it is sent.
-// A Discord relative timestamp counts down on its own, in the reader's own timezone, without the
-// bot editing anything, which is the same reason the leaderboard renders its reset that way.
+// **The formatting survives the container.** Everything the embed carried in its description is
+// markdown that a normal message renders identically, and two of those actually work BETTER
+// outside an embed: headers and subtext are ordinary message markdown, and the relative timestamp
+// has no footer or title to be excluded from any more. So this is the same three lines with the
+// box taken off.
 //
-// # The M27 pass: a card is two lines, three when hinted
+// # What is genuinely lost, and what replaced it
 //
-// The first version of this spent four embed slots (title, description, a field, footer) on what
-// is really two facts, and read like a productivity app in a server whose bot talks in lowercase.
-// It said "Unscramble this word:" above a scrambled word, titled itself "Word Scramble" on a card
-// whose entire content is a word scramble, and closed with a three-clause footer.
+// The state colour. Four colours said live, hinted, solved and timed out with no words at all,
+// and a plain message has no colour to give. It turned out to be near-redundant: the mask only
+// exists on a hinted puzzle, "hint 1/3" only appears once a rung has landed, and a message that
+// opens "nobody got" is not ambiguous about how it went. The one thing the colour did that the
+// text does not is work at a glance while scrolling, and the H2 does that instead.
 //
-// So: description only. The scramble is a header, the mask sits under it, and everything else
-// collapses into ONE line of subtext. The four state colours are unchanged and are now doing the
-// work the deleted title used to.
+// # Which is why the header stays
 //
-// The copy is deadpan lowercase, and that is the opposite of what "match the server's register"
-// naively implies. This chrome repeats on EVERY puzzle, and a fixed joke stops being funny by the
-// fourth time; peregrine's chaos belongs in the generated text, which varies. Furniture should be
-// flat and get out of the way.
+// Dropping the box makes the header MORE load-bearing rather than less. An embed is findable in a
+// scroll because it is a box; without it, the scramble being an H2 is the only thing that makes
+// the puzzle catch the eye of somebody skimming. It is also the one element on the message that
+// deserves weight, since it is the entire question being asked.
 //
-// # Everything here still goes through Guard.SendEmbed
+// # Everything here still goes through the guard
 //
-// Which runs CheckEmit over EVERY text field rather than the description alone. The winner's
-// nickname is interpolated into one of these, and a nickname is user-controlled text: even a
-// message the bot composes itself is untrusted-input-shaped. Nothing here needed a new gate,
-// which is precisely why this renders embeds and not Components V2, whose flag disables embeds
-// and would have made a recursive component walker load-bearing safety code.
-
-// Puzzle state colours. Discord's own palette, so they read as intentional next to every other
-// bot in the server rather than as arbitrary hex.
-const (
-	colourLive    = 0x5865F2 // blurple: running, no help given
-	colourHinted  = 0xFEE75C // yellow: the ladder has started, the prize is falling
-	colourSolved  = 0x57F287 // green
-	colourTimeout = 0xED4245 // red
-)
+// Guard.Send applies CheckEmit to the whole message, which is if anything a wider check than the
+// embed walk it replaces. The winner's nickname is interpolated into one of these and a nickname
+// is user-controlled text: even a message the bot composes itself is untrusted-input-shaped.
 
 // sep joins the parts of a subtext line.
 //
@@ -64,12 +51,12 @@ const (
 // have been.
 const sep = " · "
 
-// puzzleEmbed renders a live puzzle, at whatever rung its ladder has reached.
+// puzzleMessage renders a live puzzle, at whatever rung its ladder has reached.
 //
-// One function for the announcement and every repost of it, because they are the same card at
+// One function for the announcement and every repost of it, because they are the same message at
 // different moments and two builders would be two places for the round number or the stake to go
 // stale.
-func puzzleEmbed(g *wordgame.Game, points int) *discordgo.MessageEmbed {
+func puzzleMessage(g *wordgame.Game, points int) string {
 	lines := []string{"## " + g.Scrambled}
 	meta := []string{}
 
@@ -77,9 +64,7 @@ func puzzleEmbed(g *wordgame.Game, points int) *discordgo.MessageEmbed {
 		meta = append(meta, fmt.Sprintf("round %d/%d", g.Round, g.Rounds))
 	}
 
-	colour := colourLive
 	if g.HintLevel > 0 {
-		colour = colourHinted
 		// NOT wrapped in backticks, and that is a collision with existing code rather than a
 		// preference. hidden in internal/wordgame/hint.go is an ESCAPED underscore, because an
 		// underscore is italic markup and a mask is mostly underscores; inside an inline code
@@ -98,55 +83,40 @@ func puzzleEmbed(g *wordgame.Game, points int) *discordgo.MessageEmbed {
 		fmt.Sprintf("worth %d", points),
 		fmt.Sprintf("ends <t:%d:R>", g.ExpiresAt.Unix()),
 	)
-	lines = append(lines, subtext(meta...))
-
-	return &discordgo.MessageEmbed{
-		Description: strings.Join(lines, "\n"),
-		Color:       colour,
-	}
+	return strings.Join(append(lines, subtext(meta...)), "\n")
 }
 
-// solvedEmbed announces a win.
-func solvedEmbed(winner, word string, solveTime time.Duration, points int) *discordgo.MessageEmbed {
-	return &discordgo.MessageEmbed{
-		Description: fmt.Sprintf("**%s** got **%s**\n%s",
-			wordgame.TruncateRunes(winner, 32), word,
-			subtext(fmt.Sprintf("%.2fs", solveTime.Seconds()), fmt.Sprintf("%d pts", points))),
-		Color: colourSolved,
-	}
+// solvedMessage announces a win.
+func solvedMessage(winner, word string, solveTime time.Duration, points int) string {
+	return fmt.Sprintf("**%s** got **%s**\n%s",
+		wordgame.TruncateRunes(winner, 32), word,
+		subtext(fmt.Sprintf("%.2fs", solveTime.Seconds()), fmt.Sprintf("%d pts", points)))
 }
 
-// timeoutEmbed announces that nobody got it.
+// timeoutMessage announces that nobody got it.
 //
-// One line, and no consolation. The colour says it went badly and the word says what it was.
-func timeoutEmbed(word string) *discordgo.MessageEmbed {
-	return &discordgo.MessageEmbed{
-		Description: fmt.Sprintf("nobody got **%s**", word),
-		Color:       colourTimeout,
-	}
+// One line, and no consolation.
+func timeoutMessage(word string) string {
+	return fmt.Sprintf("nobody got **%s**", word)
 }
 
-// gauntletDoneEmbed closes out a run.
+// gauntletDoneMessage closes out a run.
 //
 // A run that just stops is indistinguishable from a run that broke, which is finding 32's shape:
 // the bot going quiet is fine, a player being unable to tell whether that was the design is not.
 // It carries no standings of its own, because a gauntlet win is an ordinary win and the weekly
 // board is where wins are counted.
-func gauntletDoneEmbed(rounds int) *discordgo.MessageEmbed {
-	return &discordgo.MessageEmbed{
-		Description: fmt.Sprintf("that's all %s\n%s",
-			plural(rounds, "round"), subtext("`!leaderboard` for the damage")),
-		Color: colourSolved,
-	}
+func gauntletDoneMessage(rounds int) string {
+	return fmt.Sprintf("that's all %s\n%s",
+		plural(rounds, "round"), subtext("`!leaderboard` for the damage"))
 }
 
 // subtext renders one small grey line from its non-empty parts.
 //
-// "-#" is Discord's subtext markdown, which is the only way to get footer-sized text into a
-// DESCRIPTION. It has to be the description rather than the actual footer, because the countdown
-// lives on this line and Discord renders <t:N:R> in descriptions and field values only, never in
-// a footer or a title. So the one part of the card that most wants to be small is also the one
-// part that cannot use the small slot.
+// "-#" is Discord's subtext markdown. It was load-bearing when these were embeds, because a
+// relative timestamp renders in a description and not in a footer, so the one part of the card
+// that most wanted to be small could not use the small slot. In a plain message it is simply the
+// right size for metadata: the scramble is the message and this is the annotation on it.
 func subtext(parts ...string) string {
 	kept := parts[:0]
 	for _, p := range parts {
