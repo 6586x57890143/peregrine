@@ -136,6 +136,9 @@ func registerServices(
 		ActivityThreshold: cfg.WordGameActivityThreshold,
 		TriggerChance:     cfg.WordGameTriggerChance,
 		HintAfter:         cfg.WordGameHintAfter,
+		HintLevels:        cfg.WordGameHintLevels,
+		GauntletMax:       cfg.WordGameGauntletMax,
+		GauntletGap:       cfg.WordGameGauntletGap,
 	})
 
 	// The reactor is built before the features it calls, because it hands them nothing: they
@@ -163,6 +166,7 @@ func registerServices(
 		ActiveChannelWindow: cfg.ActiveChannelWindow,
 		AllowChannels:       cfg.AutonomousPostChannels,
 		AdminUserID:         cfg.AdminUserID,
+		PointsBase:          cfg.WordGamePointsBase,
 	})
 	autopostSvc := autopost.New(guard, speaker, memories, tracker, resolver, emoji, tuningSvc, autopost.Options{
 		Enabled:             cfg.EnableAutonomousPost,

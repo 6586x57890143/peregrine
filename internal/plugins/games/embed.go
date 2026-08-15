@@ -56,8 +56,13 @@ func leaderboardEmbed(wins, chat wordgame.Board, nextReset time.Time, footer str
 		Color:       0xF1C40F,
 		Fields: []*discordgo.MessageEmbedField{
 			{
-				Name:  "Word Scramble",
-				Value: renderBoard(wins, "wins"),
+				Name: "Word Scramble",
+				// "points", not "wins", because that is what the column now holds and what the
+				// board ranks by. The unit names the numbers for exactly this reason: two
+				// columns of bare integers under one heading invite the reading that they are
+				// comparable, and a column of points labelled "wins" invites the worse reading
+				// that somebody with 12 has won twelve games.
+				Value: renderBoard(wins, "points"),
 				// Inline, so the two boards sit side by side on a desktop and stack on a
 				// phone. That is the whole reason this is a field pair rather than one long
 				// description.
