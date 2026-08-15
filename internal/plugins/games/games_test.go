@@ -31,6 +31,10 @@ type fakeGuard struct {
 	deletes []string
 	edited  map[string]string
 	refuse  bool
+
+	responses     []response
+	registered    []*discordgo.ApplicationCommand
+	registeredApp string
 }
 
 func (g *fakeGuard) Edit(_, messageID, content string) bool {
@@ -63,7 +67,31 @@ func (g *fakeGuard) SendEmbed(_ string, embed *discordgo.MessageEmbed) (*discord
 		return nil, false
 	}
 	g.embeds = append(g.embeds, embed)
+	// Also recorded as text, so posts() answers "what did the bot say" rather than "which
+	// method did it use". The puzzle moved from a plain send to an embed in M25 and every
+	// assertion about the words in it is still the assertion worth making; a fake that
+	// distinguished them would have turned a rendering change into a test rewrite and taught
+	// nobody anything.
+	g.sent = append(g.sent, flatten(embed))
 	return &discordgo.Message{ID: snowflake(880000 + len(g.embeds))}, true
+}
+
+// flatten is every rendering field of an embed, in the spirit of discordguard's embedText:
+// whatever a reader would see.
+func flatten(e *discordgo.MessageEmbed) string {
+	if e == nil {
+		return ""
+	}
+	parts := []string{e.Title, e.Description}
+	for _, f := range e.Fields {
+		if f != nil {
+			parts = append(parts, f.Name, f.Value)
+		}
+	}
+	if e.Footer != nil {
+		parts = append(parts, e.Footer.Text)
+	}
+	return strings.Join(parts, "\n")
 }
 
 func (g *fakeGuard) posted() []*discordgo.MessageEmbed {
@@ -80,6 +108,38 @@ func (g *fakeGuard) Send(_, content string) (*discordgo.Message, bool) {
 	}
 	g.sent = append(g.sent, content)
 	return &discordgo.Message{ID: snowflake(870000 + len(g.sent))}, true
+}
+
+// responded records what the ephemeral half of a slash command said, separately from posts()
+// because the whole point of the split is that these two go to different audiences: a test that
+// merged them could not tell a public puzzle from a private refusal.
+type response struct {
+	content   string
+	ephemeral bool
+}
+
+func (g *fakeGuard) Respond(_ *discordgo.Interaction, content string, ephemeral bool) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.refuse {
+		return false
+	}
+	g.responses = append(g.responses, response{content: content, ephemeral: ephemeral})
+	return true
+}
+
+func (g *fakeGuard) RegisterCommands(appID string, commands []*discordgo.ApplicationCommand) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.registeredApp = appID
+	g.registered = commands
+	return true
+}
+
+func (g *fakeGuard) responded() []response {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]response(nil), g.responses...)
 }
 
 func (g *fakeGuard) Delete(_, messageID string) bool {
@@ -131,6 +191,13 @@ func fixtureWithTimeout(t *testing.T, opts Options, timeout time.Duration) (*Ser
 		ActivityThreshold: 5,
 		TriggerChance:     0, // never by chance: a fixture that started puzzles at random
 		// would make unrelated tests flaky in a way nobody would attribute to word games.
+
+		HintLevels: 3,
+		// No gap, so a gauntlet's successor is due the instant the previous puzzle concludes
+		// and the sweep can be driven without an injected clock. WHEN the gap applies is pinned
+		// in the Manager's own tests, which have one.
+		GauntletGap: 0,
+		GauntletMax: 10,
 	})
 	guard := &fakeGuard{}
 	chans := fakeChannels{"c1": {ID: "c1", Name: "memes", Text: true}}
@@ -151,6 +218,11 @@ func enabled() Options {
 		SweepTick:           5 * time.Second,
 		ActiveChannelWindow: time.Hour,
 		AdminUserID:         snowflake(1),
+
+		// The PRODUCTION default from internal/config, verbatim, so these tests exercise what
+		// actually ships. A zero here would floor every solve at one point and quietly make the
+		// scoring tests pass for the wrong reason.
+		PointsBase: 4,
 	}
 }
 
@@ -168,29 +240,61 @@ func TestAuthorizedFailsClosed(t *testing.T) {
 	s, _, _, _ := fixture(t, opts)
 
 	for _, id := range []string{"", snowflake(1), "anyone"} {
-		if s.Authorized(id) {
-			t.Errorf("Authorized(%q) = true with no admin configured; it must fail closed", id)
+		if s.Authorized(Requester{UserID: id}) {
+			t.Errorf("Authorized(%q) = true with no admin configured and no Administrator bit; "+
+				"it must fail closed", id)
 		}
 	}
 
 	opts.AdminUserID = snowflake(77)
 	s2, _, _, _ := fixture(t, opts)
-	if !s2.Authorized(snowflake(77)) {
+	if !s2.Authorized(Requester{UserID: snowflake(77)}) {
 		t.Error("the configured admin was refused")
 	}
-	if s2.Authorized(snowflake(78)) {
+	if s2.Authorized(Requester{UserID: snowflake(78)}) {
 		t.Error("a non-admin was authorized")
 	}
-	if s2.Authorized("") {
-		t.Error("an empty user ID was authorized against a configured admin")
+	if s2.Authorized(Requester{}) {
+		t.Error("a zero-value Requester was authorized; \"we could not tell\" has to mean no")
 	}
 }
+
+// TestAdministratorsMayStartGames is M25's widening, and it is one function wider rather than a
+// second check: the failure mode a second copy has is the empty case, which fails OPEN, and no
+// behavioural test can cover the command nobody has written yet.
+//
+// The bootstrap admin ID is a single person, so a bot whose word games only start when one
+// specific Discord user is awake is a bot whose word games mostly do not start. Anyone Discord
+// already trusts with Administrator is somebody the server has made that decision about.
+func TestAdministratorsMayStartGames(t *testing.T) {
+	opts := enabled()
+	opts.AdminUserID = "" // nobody is the bootstrap admin
+	s, _, _, _ := fixture(t, opts)
+
+	admin := Requester{UserID: snowflake(500), Permissions: discordgo.PermissionAdministrator}
+	if !s.Authorized(admin) {
+		t.Error("a guild administrator was refused with no bootstrap admin set; the whole point " +
+			"of the widening is that the server's own answer counts")
+	}
+
+	// A permission that is not Administrator is not authorization. Manage Messages is the one
+	// worth pinning, because the bot asks for it itself and a bitwise test written with & on the
+	// wrong constant would let every moderator through.
+	mod := Requester{UserID: snowflake(501), Permissions: discordgo.PermissionManageMessages}
+	if s.Authorized(mod) {
+		t.Error("Manage Messages authorized an operator command; only Administrator does")
+	}
+}
+
+// admin builds a Requester that Authorized accepts on the bootstrap-ID path, for the tests
+// whose subject is not authorization.
+func admin(id string) Requester { return Requester{UserID: id} }
 
 // TestWordgameOnRequestNeedsAuthorization, which is the only authorization check the bot has.
 func TestWordgameOnRequestNeedsAuthorization(t *testing.T) {
 	s, guard, _, _ := fixture(t, enabled())
 
-	if consumed := s.Command("!wordgame", "", "c1", snowflake(999), noNames); !consumed {
+	if consumed := s.Command("!wordgame", "", "c1", Requester{UserID: snowflake(999)}, noNames); !consumed {
 		t.Error("an unauthorized !wordgame was not consumed; it is still a command rather than " +
 			"something to reply to")
 	}
@@ -198,7 +302,7 @@ func TestWordgameOnRequestNeedsAuthorization(t *testing.T) {
 		t.Errorf("an unauthorized !wordgame started a game: %v", posts)
 	}
 
-	if consumed := s.Command("!wordgame", "", "c1", snowflake(1), noNames); !consumed {
+	if consumed := s.Command("!wordgame", "", "c1", admin(snowflake(1)), noNames); !consumed {
 		t.Error("an authorized !wordgame was not consumed")
 	}
 	if posts := guard.posts(); len(posts) != 1 || !strings.Contains(posts[0], "Unscramble") {
@@ -335,7 +439,7 @@ func TestTheSweepEndsExpiredGames(t *testing.T) {
 func TestTheWeeklyResetCatchesUp(t *testing.T) {
 	s, _, _, _ := fixture(t, enabled())
 
-	s.board.AddWin(snowflake(42), "winner", time.Second)
+	s.board.AddWin(snowflake(42), "winner", time.Second, 1)
 	if got := len(s.board.Entries()); got != 1 {
 		t.Fatalf("the board holds %d entries, want the win just recorded", got)
 	}
@@ -359,7 +463,7 @@ func TestTheLeaderboardCommandWorksWithTheGameOff(t *testing.T) {
 	opts.Enabled = false
 	s, guard, _, _ := fixture(t, opts)
 
-	if consumed := s.Command("!leaderboard", "", "c1", snowflake(42), noNames); !consumed {
+	if consumed := s.Command("!leaderboard", "", "c1", admin(snowflake(42)), noNames); !consumed {
 		t.Error("!leaderboard was not consumed with word games off")
 	}
 	// An embed now, not a code block. The board is deliberately NOT gated on the feature
@@ -373,7 +477,7 @@ func TestTheLeaderboardCommandWorksWithTheGameOff(t *testing.T) {
 // TestAnUnknownCommandIsNotConsumed, so ordinary chat is not swallowed.
 func TestAnUnknownCommandIsNotConsumed(t *testing.T) {
 	s, _, _, _ := fixture(t, enabled())
-	if s.Command("!nonsense", "", "c1", snowflake(42), noNames) {
+	if s.Command("!nonsense", "", "c1", admin(snowflake(42)), noNames) {
 		t.Error("an unrecognized command was consumed")
 	}
 }
@@ -404,12 +508,16 @@ func noNames(userID string) string { return userID }
 
 // ------------------------------------------------------- the word-game pass, M21b
 
-// TestTheSweepRevealsAHintByEditingTheAnnouncement.
+// TestTheSweepRepostsTheAnnouncementToDeliverAHint.
 //
-// An EDIT rather than a new message, so the hint arrives where people are already looking
-// instead of scrolling the puzzle away. Through the guard like everything else: an edit can
-// introduce a mention the original did not have.
-func TestTheSweepRevealsAHintByEditingTheAnnouncement(t *testing.T) {
+// M21b made this an EDIT for a stated reason: the hint arrives "where people are already
+// looking". That holds only while the announcement is still on screen, and in the channels this
+// bot lives in it is not, so an edit to a card twenty messages up is invisible and the feature
+// meant to rescue a stalling puzzle did nothing at the one moment it mattered. M25 reposts.
+//
+// The ordering is the part with teeth, and it is asserted below: the new card goes up BEFORE the
+// old one comes down.
+func TestTheSweepRepostsTheAnnouncementToDeliverAHint(t *testing.T) {
 	dict, err := wordgame.LoadDictionary("", wordgame.DictionaryOptions{MinLength: 5, MaxLength: 12})
 	if err != nil {
 		t.Fatalf("LoadDictionary: %v", err)
@@ -438,24 +546,34 @@ func TestTheSweepRevealsAHintByEditingTheAnnouncement(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 
 	s.sweep()
-	edits := guard.edits()
-	if len(edits) != 1 {
-		t.Fatalf("the sweep made %d edits, want the hint", len(edits))
+
+	posts = guard.posts()
+	if len(posts) != 2 {
+		t.Fatalf("posts = %d, want the puzzle and then the card that replaced it", len(posts))
 	}
-	for _, content := range edits {
-		if !strings.Contains(content, "Hint") {
-			t.Errorf("the edit is not a hint:\n%s", content)
-		}
-		if !strings.Contains(content, "Unscramble") {
-			t.Error("the edit dropped the puzzle, so the scramble is no longer readable")
-		}
+	if hint := posts[1]; !strings.Contains(hint, "Hint") {
+		t.Errorf("the repost is not a hint:\n%s", hint)
+	}
+	if !strings.Contains(posts[1], "Unscramble") {
+		t.Error("the repost dropped the puzzle, so the scramble is no longer readable")
+	}
+	if got := guard.edits(); len(got) != 0 {
+		t.Errorf("the hint was delivered by editing (%v); that is the behaviour M25 replaced, "+
+			"and an edit does not reach anybody who has scrolled past the puzzle", got)
 	}
 
-	// Once. A second sweep editing the same message again is work for nothing.
-	guard.edited = nil
+	// The superseded card is removed, so the channel is not left showing two live puzzles. It
+	// is deleted AFTER the replacement went up, which is the ordering that matters: the other
+	// way round, a refused send leaves a live puzzle with nothing to look at until it times out.
+	if got := guard.deleted(); len(got) != 1 {
+		t.Errorf("deleted = %v, want exactly the one card the repost replaced", got)
+	}
+
+	// Once. A second sweep on the same rung would delete the card people are reading and put an
+	// identical one back.
 	s.sweep()
-	if got := guard.edits(); len(got) != 0 {
-		t.Errorf("the hint was applied twice: %v", got)
+	if got := guard.posts(); len(got) != 2 {
+		t.Errorf("the same rung was delivered twice: %d posts", len(got))
 	}
 }
 
@@ -464,7 +582,7 @@ func TestTheSweepRevealsAHintByEditingTheAnnouncement(t *testing.T) {
 func TestAPlantedWordBecomesThePuzzle(t *testing.T) {
 	s, guard, manager, _ := fixture(t, enabled())
 
-	if consumed := s.Command("!wordgame", "banana", "c1", snowflake(1), noNames); !consumed {
+	if consumed := s.Command("!wordgame", "banana", "c1", admin(snowflake(1)), noNames); !consumed {
 		t.Fatal("!wordgame with a word was not consumed")
 	}
 	if manager.Active() != 1 {
@@ -485,7 +603,7 @@ func TestAPlantedWordBecomesThePuzzle(t *testing.T) {
 func TestAnUnusableWordIsRefusedOutLoudNamingTheRules(t *testing.T) {
 	s, guard, manager, _ := fixture(t, enabled())
 
-	if consumed := s.Command("!wordgame", "aaaaa", "c1", snowflake(1), noNames); !consumed {
+	if consumed := s.Command("!wordgame", "aaaaa", "c1", admin(snowflake(1)), noNames); !consumed {
 		t.Fatal("a refused !wordgame was not consumed; it is still a command")
 	}
 	if manager.Active() != 0 {
@@ -506,7 +624,7 @@ func TestAnUnusableWordIsRefusedOutLoudNamingTheRules(t *testing.T) {
 func TestAPlantedWordFromANonAdminStartsNothing(t *testing.T) {
 	s, guard, manager, _ := fixture(t, enabled())
 
-	if consumed := s.Command("!wordgame", "banana", "c1", snowflake(999), noNames); !consumed {
+	if consumed := s.Command("!wordgame", "banana", "c1", admin(snowflake(999)), noNames); !consumed {
 		t.Error("an unauthorized !wordgame was not consumed")
 	}
 	if manager.Active() != 0 {
@@ -535,7 +653,7 @@ func TestTheLeaderboardResolvesOnlyTheNamesItRenders(t *testing.T) {
 	for i := range 200 {
 		id := snowflake(1000 + i)
 		for range 200 - i {
-			s.board.AddWin(id, "player", time.Second)
+			s.board.AddWin(id, "player", time.Second, 1)
 		}
 	}
 
@@ -546,7 +664,7 @@ func TestTheLeaderboardResolvesOnlyTheNamesItRenders(t *testing.T) {
 	}
 
 	// The viewer sits well outside the top ten, so their own row is resolved too.
-	s.Command("!leaderboard", "", "c1", snowflake(1150), names)
+	s.Command("!leaderboard", "", "c1", admin(snowflake(1150)), names)
 
 	// Ten rows plus the viewer on the word-game board. The chat board is empty in this
 	// fixture, so it needs none.
@@ -565,7 +683,7 @@ func TestANameOnBothBoardsIsResolvedOnce(t *testing.T) {
 	s, _, _, _ := fixture(t, enabled())
 
 	viewer := snowflake(500)
-	s.board.AddWin(viewer, "player", time.Second)
+	s.board.AddWin(viewer, "player", time.Second, 1)
 
 	// The same person also has chat activity.
 	if err := s.store.Update(func(w *storage.Writer) error {
@@ -575,7 +693,7 @@ func TestANameOnBothBoardsIsResolvedOnce(t *testing.T) {
 	}
 
 	seen := map[string]int{}
-	s.Command("!leaderboard", "", "c1", viewer, func(userID string) string {
+	s.Command("!leaderboard", "", "c1", admin(viewer), func(userID string) string {
 		seen[userID]++
 		return "name"
 	})
@@ -592,12 +710,12 @@ func TestTheBoardShowsTheViewerTheirOwnRank(t *testing.T) {
 	for i := range 30 {
 		id := snowflake(2000 + i)
 		for range 30 - i {
-			s.board.AddWin(id, "player", time.Second)
+			s.board.AddWin(id, "player", time.Second, 1)
 		}
 	}
 
 	viewer := snowflake(2017) // eighteenth by score
-	s.Command("!leaderboard", "", "c1", viewer, func(userID string) string { return "user-" + userID })
+	s.Command("!leaderboard", "", "c1", admin(viewer), func(userID string) string { return "user-" + userID })
 
 	embeds := guard.posted()
 	if len(embeds) != 1 {
@@ -616,15 +734,18 @@ func TestTheBoardShowsTheViewerTheirOwnRank(t *testing.T) {
 // indistinguishable from a bug.
 func TestTheBoardTellsAViewerWithNoScoreThatTheyHaveNone(t *testing.T) {
 	s, guard, _, _ := fixture(t, enabled())
-	s.board.AddWin(snowflake(3001), "somebody", time.Second)
+	s.board.AddWin(snowflake(3001), "somebody", time.Second, 1)
 
-	s.Command("!leaderboard", "", "c1", snowflake(9999), func(userID string) string { return "n" })
+	s.Command("!leaderboard", "", "c1", admin(snowflake(9999)), func(userID string) string { return "n" })
 
 	embeds := guard.posted()
 	if len(embeds) != 1 {
 		t.Fatalf("got %d embeds, want 1", len(embeds))
 	}
-	if !strings.Contains(embeds[0].Fields[0].Value, "no wins this week") {
+	// "points", not "wins": the column holds points and that is what the board ranks by. A
+	// column of points labelled wins invites the reading that somebody with 12 has won twelve
+	// games, which is the misreading the unit argument in renderBoard's doc is about.
+	if !strings.Contains(embeds[0].Fields[0].Value, "no points this week") {
 		t.Errorf("a viewer with no wins is not told so:\n%s", embeds[0].Fields[0].Value)
 	}
 }
@@ -635,7 +756,7 @@ func TestARefusedBoardIsNotRetriedAsPlainText(t *testing.T) {
 	s, guard, _, _ := fixture(t, enabled())
 	guard.refuse = true
 
-	if consumed := s.Command("!leaderboard", "", "c1", snowflake(1), noNames); !consumed {
+	if consumed := s.Command("!leaderboard", "", "c1", admin(snowflake(1)), noNames); !consumed {
 		t.Error("!leaderboard was not consumed when the guard refused it")
 	}
 	if got := guard.posts(); len(got) != 0 {

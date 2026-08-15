@@ -209,6 +209,10 @@ type Config struct {
 	WordGameMaxLength         int           // PEREGRINE_WORDGAME_MAX_LENGTH
 	WordGameSweepTick         time.Duration // PEREGRINE_WORDGAME_SWEEP_TICK
 	WordGameHintAfter         time.Duration // PEREGRINE_WORDGAME_HINT_AFTER
+	WordGameHintLevels        int           // PEREGRINE_WORDGAME_HINT_LEVELS
+	WordGamePointsBase        int           // PEREGRINE_WORDGAME_POINTS_BASE
+	WordGameGauntletMax       int           // PEREGRINE_WORDGAME_GAUNTLET_MAX
+	WordGameGauntletGap       time.Duration // PEREGRINE_WORDGAME_GAUNTLET_GAP
 
 	// Corpus snapshots. Off by default, because there is no safe guess for a path and
 	// writing megabytes somewhere the operator did not choose is worse than not backing up.
@@ -518,6 +522,22 @@ func Load() (*Config, error) {
 		// has to be expressible.
 		WordGameHintAfter: l.dur("PEREGRINE_WORDGAME_HINT_AFTER", 30*time.Second, 0, time.Hour),
 
+		// How many rungs the hint ladder has. A word too short to support that many gets fewer,
+		// because a rung that reveals nothing new must not cost a point, so this is a ceiling
+		// rather than a promise. Six is where a twelve-letter word runs out of concessions that
+		// still leave a puzzle.
+		WordGameHintLevels: l.intVal("PEREGRINE_WORDGAME_HINT_LEVELS", 3, 1, 6),
+
+		// What a puzzle solved with nothing revealed is worth. Every delivered rung takes one
+		// off, floored at one, so this and HINT_LEVELS together set how steeply waiting costs.
+		WordGamePointsBase: l.intVal("PEREGRINE_WORDGAME_POINTS_BASE", 4, 1, 100),
+
+		// The most puzzles one !wordgame <n> may queue, and the pause between one concluding
+		// and its successor appearing. The cap is clamped rather than refused at the Manager, so
+		// this is the operator's answer to "how long may somebody make this channel play".
+		WordGameGauntletMax: l.intVal("PEREGRINE_WORDGAME_GAUNTLET_MAX", 10, 1, 50),
+		WordGameGauntletGap: l.dur("PEREGRINE_WORDGAME_GAUNTLET_GAP", 5*time.Second, 0, 5*time.Minute),
+
 		BackupDir:  l.str("PEREGRINE_BACKUP_DIR", ""),
 		BackupTick: l.dur("PEREGRINE_BACKUP_TICK", 24*time.Hour, time.Minute, 30*24*time.Hour),
 		BackupKeep: l.intVal("PEREGRINE_BACKUP_KEEP", 7, 1, 1000),
@@ -591,6 +611,20 @@ func Load() (*Config, error) {
 				"hint would be due after the puzzle has already ended and would never appear. "+
 				"Set it lower, or to 0 to turn hints off",
 			cfg.WordGameHintAfter, cfg.WordGameTimeout))
+	}
+
+	// A points base the ladder can reach means the bottom rungs are free: the score floors at
+	// one, so once the base is spent every further hint costs the player nothing and the
+	// wait-or-guess decision the ladder exists to create stops existing. The knob is not wired
+	// to nothing, which is worse in its own way: it is wired to a game that quietly has no
+	// stakes. Same relationship mistake as the two above, named the same way.
+	if cfg.WordGameHintAfter > 0 && cfg.WordGamePointsBase <= cfg.WordGameHintLevels {
+		l.errs = append(l.errs, fmt.Errorf(
+			"PEREGRINE_WORDGAME_POINTS_BASE=%d is not above PEREGRINE_WORDGAME_HINT_LEVELS=%d, "+
+				"so a puzzle that runs the whole hint ladder is worth the same as one that runs "+
+				"all but the last rung, and the later hints cost nothing. Set the base above the "+
+				"rung count",
+			cfg.WordGamePointsBase, cfg.WordGameHintLevels))
 	}
 
 	if len(l.errs) > 0 {

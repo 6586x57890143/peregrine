@@ -54,6 +54,20 @@ type Entry struct {
 	// nanosecond integer that nobody reading the persisted file can interpret, and this file
 	// is read by hand when a week of wins goes wrong.
 	FastestMS int64 `json:"fastest_ms,omitempty"`
+
+	// Points is what the board actually ranks by, and Wins is kept beside it as the count of
+	// puzzles taken.
+	//
+	// They differ because a solve is worth more the fewer hints were on screen when it landed.
+	// Wins alone made every round identical: the same payout for a word guessed cold as for
+	// one guessed off a mask showing half its letters, so there was no reason to answer early
+	// and no decision to make. Points give the hint ladder a price and the ladder gives points
+	// a clock.
+	//
+	// omitempty like the three above, so a board written before this existed still loads. What
+	// it CANNOT do is rank correctly, since every entry would read zero; games.Init converts
+	// one on load. See BackfillPoints.
+	Points int `json:"points,omitempty"`
 }
 
 // wireLeaderboard is the persisted shape.
@@ -110,11 +124,13 @@ func NewLeaderboard(now time.Time) *Leaderboard {
 // corpus to ask a question this package answers.
 func StartOfWeekUTC(t time.Time) time.Time { return corpus.StartOfWeekUTC(t) }
 
-// AddWin records a win and the time it took.
+// AddWin records a win, the time it took and what it was worth.
 //
 // solveTime may be zero, which records no personal best: a caller that does not know how long
-// the puzzle took should not claim it was instant.
-func (l *Leaderboard) AddWin(userID, username string, solveTime time.Duration) {
+// the puzzle took should not claim it was instant. points below one is raised to one, because
+// every solve is worth something: a player who needed the whole ladder still beat everybody
+// else in the channel to the answer.
+func (l *Leaderboard) AddWin(userID, username string, solveTime time.Duration, points int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -122,6 +138,7 @@ func (l *Leaderboard) AddWin(userID, username string, solveTime time.Duration) {
 	e.UserID = userID
 	e.Username = username // refreshed, because people rename themselves
 	e.Wins++
+	e.Points += max(points, 1)
 
 	// A streak is consecutive wins, so winning again extends it and anybody else winning
 	// starts it over at one. The previous holder's Streak is deliberately NOT cleared here:
@@ -247,8 +264,11 @@ func (l *Leaderboard) Entries() []Entry {
 		out = append(out, e)
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if out[i].Wins != out[j].Wins {
-			return out[i].Wins > out[j].Wins
+		// Points rather than wins, matching Scores and therefore the rendered board: two
+		// orderings of one tally is finding 28's shape, and the disagreement would surface as
+		// a board whose rows do not match the numbers beside them.
+		if out[i].Points != out[j].Points {
+			return out[i].Points > out[j].Points
 		}
 		return out[i].Username < out[j].Username
 	})
@@ -268,9 +288,43 @@ func (l *Leaderboard) Scores() map[string]int {
 
 	out := make(map[string]int, len(l.scores))
 	for id, e := range l.scores {
-		out[id] = e.Wins
+		out[id] = e.Points
 	}
 	return out
+}
+
+// BackfillPoints converts a board written before points existed, and reports how many entries
+// it changed.
+//
+// perWin is what one old win is worth, and the caller passes the full no-hint value, which is
+// deliberately generous. The alternative was ranking a week already in progress off a Points
+// field that is zero for everybody, which shows an empty board to a server that has been
+// playing all week. Overpaying the existing entries preserves their ORDER, which is the part
+// players actually notice, and the next weekly reset makes the whole question moot.
+//
+// It lives here and takes perWin as an argument because internal/wordgame reads no
+// configuration; games.Init supplies the number and calls this once on load.
+//
+// Idempotent: an entry that already has points is left alone, so a second call after a win has
+// landed cannot inflate anybody.
+func (l *Leaderboard) BackfillPoints(perWin int) int {
+	if perWin < 1 {
+		perWin = 1
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	converted := 0
+	for id, e := range l.scores {
+		if e.Points != 0 || e.Wins <= 0 {
+			continue
+		}
+		e.Points = e.Wins * perWin
+		l.scores[id] = e
+		converted++
+	}
+	return converted
 }
 
 // Row is one line of a rendered board.

@@ -370,14 +370,26 @@ func TestAHintIsSweptOnceAndOnlyWhenItIsDue(t *testing.T) {
 	if len(due) != 1 || due[0].ChannelID != "chan" {
 		t.Fatalf("due hints = %v, want one for chan", due)
 	}
-	first, letters := due[0].Hint()
-	if first != "p" || letters != len("peregrine") {
-		t.Errorf("Hint() = %q, %d, want \"p\", %d", first, letters, len("peregrine"))
+	if got := due[0].Letters(); got != len("peregrine") {
+		t.Errorf("Letters() = %d, want %d", got, len("peregrine"))
 	}
 
-	// Twice would edit the announcement again with the same text, for nothing.
+	// The rung is still due until the caller says it landed, which is M25's split: DueHints no
+	// longer advances the level, because a repost the guard refuses must not charge the winner
+	// for a hint nobody saw.
+	if got := m.DueHints(); len(got) != 1 {
+		t.Errorf("an unacknowledged hint stopped being due (%d), so a refused repost would be "+
+			"silently skipped rather than retried", len(got))
+	}
+	m.HintDelivered("chan", 1)
+
+	// Acknowledged, so the same rung must not come round again: it would repost the identical
+	// card and delete the one people are looking at, for nothing.
 	if got := m.DueHints(); len(got) != 0 {
-		t.Error("the same hint came due twice")
+		t.Error("the same hint came due twice after being acknowledged")
+	}
+	if got := due[0].Mask(); !strings.HasPrefix(got, "p ") {
+		t.Errorf("Mask() = %q, want it to open on the revealed first letter", got)
 	}
 }
 
@@ -687,7 +699,7 @@ func TestLeaderboardResetsOnANewWeekAndCatchesUp(t *testing.T) {
 	// A Wednesday.
 	start := time.Date(2024, 6, 5, 12, 0, 0, 0, time.UTC)
 	l := NewLeaderboard(start)
-	l.AddWin("u1", "alice", time.Second)
+	l.AddWin("u1", "alice", time.Second, 1)
 
 	if l.MaybeReset(start.Add(time.Hour)) {
 		t.Error("reset within the same week")
@@ -712,7 +724,7 @@ func TestLeaderboardResetsOnANewWeekAndCatchesUp(t *testing.T) {
 
 	// Idempotent: a second tick in the same week must not reset again, or a win recorded
 	// between ticks would vanish.
-	l.AddWin("u2", "bob", time.Second)
+	l.AddWin("u2", "bob", time.Second, 1)
 	if l.MaybeReset(next.Add(time.Hour)) {
 		t.Error("reset twice in one week, discarding a win")
 	}
@@ -756,7 +768,7 @@ func TestLeaderboardMarshalsUnderTheLock(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			l.AddWin("u"+string(rune('a'+i%26)), "player", time.Second)
+			l.AddWin("u"+string(rune('a'+i%26)), "player", time.Second, 1)
 		}(i)
 	}
 	for range 50 {
@@ -785,9 +797,9 @@ func TestLeaderboardRoundTripsAndReadsTheOldFormat(t *testing.T) {
 	now := time.Date(2024, 6, 5, 12, 0, 0, 0, time.UTC)
 
 	original := NewLeaderboard(now)
-	original.AddWin("u1", "alice", time.Second)
-	original.AddWin("u1", "alice", time.Second)
-	original.AddWin("u2", "bob", time.Second)
+	original.AddWin("u1", "alice", time.Second, 1)
+	original.AddWin("u1", "alice", time.Second, 1)
+	original.AddWin("u2", "bob", time.Second, 1)
 
 	encoded, err := json.Marshal(original)
 	if err != nil {
@@ -848,19 +860,19 @@ func TestLeaderboardRoundTripsAndReadsTheOldFormat(t *testing.T) {
 func TestAStreakBelongsToTheCurrentWinnerOnly(t *testing.T) {
 	l := NewLeaderboard(time.Now())
 
-	l.AddWin("u1", "alice", 2*time.Second)
+	l.AddWin("u1", "alice", 2*time.Second, 1)
 	if _, ok := l.Streak(); ok {
 		t.Error("one win was reported as a streak. That line would appear after every game")
 	}
 
-	l.AddWin("u1", "alice", 3*time.Second)
+	l.AddWin("u1", "alice", 3*time.Second, 1)
 	e, ok := l.Streak()
 	if !ok || e.UserID != "u1" || e.Streak != 2 {
 		t.Errorf("streak = %+v, %v, want alice on 2", e, ok)
 	}
 
 	// Somebody else winning ends it rather than shortening it.
-	l.AddWin("u2", "bob", 4*time.Second)
+	l.AddWin("u2", "bob", 4*time.Second, 1)
 	if _, ok := l.Streak(); ok {
 		t.Error("alice's streak survived bob winning")
 	}
@@ -877,9 +889,9 @@ func TestAStreakBelongsToTheCurrentWinnerOnly(t *testing.T) {
 func TestFastestKeepsThePersonalBestAndTheWeeklyRecord(t *testing.T) {
 	l := NewLeaderboard(time.Now())
 
-	l.AddWin("u1", "alice", 5*time.Second)
-	l.AddWin("u2", "bob", 2*time.Second)
-	l.AddWin("u1", "alice", 3*time.Second) // alice improves, but not past bob
+	l.AddWin("u1", "alice", 5*time.Second, 1)
+	l.AddWin("u2", "bob", 2*time.Second, 1)
+	l.AddWin("u1", "alice", 3*time.Second, 1) // alice improves, but not past bob
 
 	e, ok := l.Fastest()
 	if !ok || e.UserID != "u2" || e.FastestMS != 2000 {
@@ -894,7 +906,7 @@ func TestFastestKeepsThePersonalBestAndTheWeeklyRecord(t *testing.T) {
 
 	// A win with no measured time records no record, rather than claiming an instant solve.
 	l2 := NewLeaderboard(time.Now())
-	l2.AddWin("u1", "alice", 0)
+	l2.AddWin("u1", "alice", 0, 1)
 	if _, ok := l2.Fastest(); ok {
 		t.Error("a win with no solve time was recorded as the fastest of the week")
 	}
@@ -905,8 +917,8 @@ func TestFastestKeepsThePersonalBestAndTheWeeklyRecord(t *testing.T) {
 func TestTheWeeklyResetClearsTheStreakToo(t *testing.T) {
 	now := time.Date(2024, 6, 5, 12, 0, 0, 0, time.UTC)
 	l := NewLeaderboard(now)
-	l.AddWin("u1", "alice", time.Second)
-	l.AddWin("u1", "alice", time.Second)
+	l.AddWin("u1", "alice", time.Second, 1)
+	l.AddWin("u1", "alice", time.Second, 1)
 	if _, ok := l.Streak(); !ok {
 		t.Fatal("no streak to reset")
 	}
@@ -924,10 +936,10 @@ func TestTheWeeklyResetClearsTheStreakToo(t *testing.T) {
 
 func TestLeaderboardEntriesAreStablyOrdered(t *testing.T) {
 	l := NewLeaderboard(time.Now())
-	l.AddWin("u1", "zoe", time.Second)
-	l.AddWin("u2", "adam", time.Second)
-	l.AddWin("u3", "carol", time.Second)
-	l.AddWin("u3", "carol", time.Second)
+	l.AddWin("u1", "zoe", time.Second, 1)
+	l.AddWin("u2", "adam", time.Second, 1)
+	l.AddWin("u3", "carol", time.Second, 1)
+	l.AddWin("u3", "carol", time.Second, 1)
 
 	for range 20 {
 		got := l.Entries()
