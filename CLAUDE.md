@@ -48,6 +48,13 @@ go run ./cmd/bot -compact ./markov.new      # reclaim free pages; bbolt never sh
 go run ./cmd/bot -purge-author 123456789    # undo one author's contribution to diversity counts
 ```
 
+`-corpus-report` is a corpus mode but not one of those three, because it opens **read-only**
+and writes nothing. That means a shared flock rather than an exclusive one, so it cannot run
+against a corpus a live bot is holding and the intended input is a snapshot:
+```sh
+PEREGRINE_DB_PATH=./snapshot.db go run ./cmd/bot -corpus-report
+```
+
 `-tuning-report` is not one of those and takes no lock: it reads a directory of JSON lines
 rather than the corpus, so it needs no `.env`, no token and no database, and runs against an
 archive pulled off the host with `scp`.
@@ -650,6 +657,55 @@ Backups are in-process, in `internal/plugins/backup`: `Store.Backup` takes a rea
 **`PEREGRINE_BACKUP_DIR` must be a writable mount in a container.** The image runs `read_only: true`, so any path outside a volume or bind fails on the first write, and a relative path resolves against the distroless working directory. `docker-compose.prod.yml` binds `./backups` to `/backups` for this, and it is deliberately **outside** the corpus volume so that losing or removing that volume does not take the snapshots with it. Each snapshot is a full copy, so the disk cost is `KEEP` times the corpus size.
 
 `markov.db`, the whisper model and the ffmpeg binary are all gitignored. `voicenotes/models/ggml-small.bin` is 465 MiB, over GitHub's hard 100 MiB per-file limit, so a commit containing it cannot be pushed at all and the only remedy is rewriting history. `.dockerignore` exists for the same weight: the working tree is around 692 MB and `COPY . .` would ship all of it into the builder on every build.
+
+## The corpus report, and what the first real measurement changed
+
+`-corpus-report` walks a corpus and prints its distributions. `internal/corpus/stats.go` is
+the shape of the answer, `internal/storage/report.go` is the walk, `internal/maintenance`
+renders it. Read `SPEC.md` findings 53 to 56 before touching the engine's constants: they are
+what the first run found, and three of them corrected an estimate that a scaling argument had
+got wrong by an order of magnitude.
+
+**`storage.OpenReadOnly` is the half that makes the mode safe, and it is not a convenience.**
+`storage.Open` creates every missing bucket, stamps a schema version onto a file that has none,
+and can run `upgradeToV2`, which **empties the image cache**. All three are right for a bot
+starting up and wrong for a report: a mode that mutates the corpus it is measuring has changed
+the thing it was asked to describe. The version-1 case is refused rather than migrated, because
+migrating is a write. `TestOpenReadOnlyWritesNothing` compares the file byte for byte.
+
+**It reports raw distributions and evaluates nothing.** Teaching a maintenance mode the scorer's
+formulas would couple it to `markov`'s constants and give the two a way to disagree, which is
+finding 28's shape. So it prints the admission curve at every candidate threshold and marks
+which one is configured, rather than printing a recommendation. What a distribution implies for
+a logit belongs in `internal/markov`, in a test built at these magnitudes.
+
+**`CorpusStats` is a `Store` method and deliberately not a `Reader` one.** These are unbounded
+cursor walks, and a `Reader` is the type the generation hot path holds inside the one read
+transaction a reply gets. Hanging a whole-bucket walk off it is a footgun aimed at the innermost
+loop in the bot. It is affordable here because the caller is a maintenance mode running once
+against a snapshot.
+
+**One pass answers three questions**, because the n-gram bucket is keyed `<prefix> NUL <next>`
+and bbolt cursors walk in key order: every edge sharing a prefix arrives contiguously, so the
+author histogram, the probability mass and the per-prefix branch factor all fall out of one
+sequential scan in constant memory.
+
+**Both admission shares are reported, and only the second predicts behaviour.** Generation
+samples in proportion to probability, so refusing 93.8% of edges and refusing 76.3% of the mass
+are different outcomes; on the real corpus those are the same threshold. A report that printed
+the edge share alone would misdescribe the gate in the direction that makes it look harmless.
+
+**The end sentinel gets its own line because it is not a word.** `learn.Learner.Message` appends
+it before the topic loop, so its topic count is exactly the number of messages learned and it is
+the maximum of every distribution in the report. Without the line, "max 19387, messages learned
+19387" reads as a double-count bug. It is also finding 53: the sentinel being a topic entry is
+why `Significance` pays it the saturated maximum at every step.
+
+**The sentinel is a parameter to `CorpusStats`, not a constant in `storage`.** Storage is the
+bottom layer and must not learn what a word means, which is the same rule `ScanTopics` states
+about its filters living in `health`. `internal/learn` and `internal/markov` each define the
+sentinel with a test pinning that they agree; a third definition down here would be a third
+thing to keep in step.
 
 ## The tuning export, and why the engine grew an observer
 
