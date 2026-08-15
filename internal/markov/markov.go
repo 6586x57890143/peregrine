@@ -163,13 +163,49 @@ type Params struct {
 	KNRawMix float64
 
 	// MinDistinctAuthors is how many different people must have produced a
-	// continuation before the bot will generate it, independent of how often it was
-	// seen.
+	// continuation before the bot will generate it, once that continuation carries
+	// enough weight for the question to matter. See SoloRepeatLimit for the second
+	// half of the rule, which is what "enough weight" means.
 	//
 	// n-gram weight is raw frequency, so repeating a phrase is a direct write to the
 	// model and one determined user can teach the bot to say anything. This turns
 	// that attack from persistence into collusion (SPEC.md section 4, A6).
 	MinDistinctAuthors int
+
+	// SoloRepeatLimit is the largest count at which an edge only ONE person produced
+	// is still admitted. 0 disables the allowance, restoring the pre-M24 gate.
+	//
+	// # Why the gate needed a second number
+	//
+	// Requiring k authors regardless of count conflates two different things: an edge
+	// one person said once, which is a sparse corpus, and an edge one person said
+	// hundreds of times, which is the shape A6 actually describes. M23's measurement of
+	// a real corpus found 92.82% of edges with a single author and, among those, exactly
+	// ONE seen ten times or more and NONE seen twenty times or more. So the k=2 gate was
+	// refusing 93.8% of the edges and 76.3% of the probability mass to defend against a
+	// shape with one instance in it, leaving 0.93 admissible continuations per prefix at
+	// order 1 and essentially none above it (SPEC.md section 8, finding 54).
+	//
+	// # Why the allowance keys on count specifically
+	//
+	// Because count is what makes poisoning work. Weight in this model IS raw frequency,
+	// so a phrase repeated twice carries two counts against a corpus mass in the
+	// hundreds of thousands and cannot steer anything; a phrase repeated hundreds of
+	// times is the attack. Keying the allowance on the same quantity the attack uses is
+	// what keeps this a narrowing of the gate rather than a hole in it: the cost of
+	// writing an arbitrary phrase into the generatable graph goes from "two accounts"
+	// to "one account and SoloRepeatLimit+1 messages", and past that point corroboration
+	// is required exactly as before.
+	//
+	// The honest statement of what this costs is in SPEC.md section 4: input filtering
+	// lowers the rate and only the emit gate bounds the result. This is an input-side
+	// control being sized against measured data, not the thing standing between the bot
+	// and something the operator has to answer for.
+	SoloRepeatLimit int
+
+	// SoloMaxOrder is the longest context at which the SoloRepeatLimit allowance
+	// applies. 0 means no order restriction.
+	SoloMaxOrder int
 
 	// MinWords and MaxWords bound sentence length. The target is sampled between them
 	// once per sentence, skewed short: a forty-word Markov ramble reads as a

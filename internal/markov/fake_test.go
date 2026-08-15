@@ -230,6 +230,14 @@ func testParams() Params {
 		KNDiscount:         0.75,
 		KNRawMix:           0.25,
 		MinDistinctAuthors: 0,
+		// The PRODUCTION default, not the neutral value, and that matters more than it
+		// looks. The gate tests set MinDistinctAuthors themselves, and if this stayed 0
+		// every one of them plus the whole golden harness would exercise the pre-M24 gate
+		// while the bot ran the post-M24 one. A harness that omits a code path reports on
+		// a bot that does not exist, which this repo has now found four times (M14, M16,
+		// M19 and finding 53). A test that wants the old gate sets this to 0 and says so.
+		SoloRepeatLimit:    2,
+		SoloMaxOrder:       2,
 		MinWords:           4,
 		MaxWords:           18,
 		CooccurrenceWindow: 5,
