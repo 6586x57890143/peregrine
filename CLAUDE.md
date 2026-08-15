@@ -48,6 +48,13 @@ go run ./cmd/bot -compact ./markov.new      # reclaim free pages; bbolt never sh
 go run ./cmd/bot -purge-author 123456789    # undo one author's contribution to diversity counts
 ```
 
+`-corpus-report` is a corpus mode but not one of those three, because it opens **read-only**
+and writes nothing. That means a shared flock rather than an exclusive one, so it cannot run
+against a corpus a live bot is holding and the intended input is a snapshot:
+```sh
+PEREGRINE_DB_PATH=./snapshot.db go run ./cmd/bot -corpus-report
+```
+
 `-tuning-report` is not one of those and takes no lock: it reads a directory of JSON lines
 rather than the corpus, so it needs no `.env`, no token and no database, and runs against an
 archive pulled off the host with `scp`.
@@ -507,17 +514,28 @@ The engine is `internal/markov` as of M7a. Read `SPEC.md` §5 for the full speci
 
 **Prefix lookups are lowercased at the point of lookup, and that is defence rather than a fixed bug.** Learning lowercases the prefix before storing it; the generation path did not lowercase before looking it up. M6b added it, and the honest position is that it changed no behavior: every producer of the generation prefix is already lowercase, because the seed's candidates are all interned from lowercased sources, every later word is a stored successor token, and the one branch that could have introduced a raw prompt word is unreachable with a non-empty corpus. The reason to normalize anyway is that the alternative is an invariant held by five separate producers agreeing, none of which states it, against a lookup whose failure mode is silently returning no candidates. M7 normalizes once at the storage boundary. `TestGenerateWithAMixedCasePromptFindsTheCorpus` says in its own comment that it does not distinguish the two implementations, because a test that looks like a regression pin and is not one is worse than no test.
 
-**The author-diversity gate applies to all THREE producers of words, not just the sampler.** This was a hole until M11c and it is worth reading before touching any of them. Generation puts a word into a sentence from three places: `eligible()` filters the sampler's candidates, `Jump` picks a token when the chain dead-ends, and `Seed` picks the first word. The last two read the co-occurrence indexes, which store a count and a position sum and no author attribution whatsoever, so a phrase one person repeated forty times was refused by the sampler at every step and then handed straight back by the jump. That is A6 defeated by a check at one of three producers, which is A1's shape one milestone after the principle naming it was written down (`SPEC.md` §8, finding 31).
+**The author-diversity gate applies to all THREE producers of words, not just the sampler.** This was a hole until M11c and it is worth reading before touching any of them. Generation puts a word into a sentence from three places: `eligible()` filters the sampler's candidates, `Jump` picks a token when the chain dead-ends, and `Seed` picks the first word. The last two read the co-occurrence indexes, which store a count and a position sum and no author attribution whatsoever, so a phrase one person repeated forty times was refused by the sampler at every step and then handed straight back by the jump. That is A6 defeated by a check at one of three producers, which is A1's shape one milestone after the principle naming it was written down (`SPEC.md` §8, finding 31). M24 collapsed the remaining duplication: `admits` and `attested` both call one `admissible`, so a change to the rule cannot reach two of the three producers and miss the last.
 
 `Generator.attested` is the check, and two of its asymmetries are deliberate. The end sentinel is exempt in `eligible()` and **not** in `attested`, because "the only thing following this word is the end of a message somebody once sent" is not evidence that several people use it. And a seed derived from the **prompt** is exempt, because echoing somebody's own words back is not poisoning: refusing to would make the bot least responsive exactly when it was addressed directly.
 
-**The author-diversity gate is a filter, not a logit, and it does not relax.** A penalty is something a determined poisoner can out-repeat. When the filter empties the candidate set the step is a dead end and the sentence ends early; relaxing the threshold when it bites would make it not a control. The end sentinel is exempt, because gating it would mean a sentence cannot end until several people ended a message the same way. **Know the operational consequence before you debug it as an outage:** at the default of 2, a young corpus has almost no continuation with two authors, so the bot is close to mute until ingestion catches up.
+**The author-diversity gate is a filter, not a logit, and it does not relax.** A penalty is something a determined poisoner can out-repeat. When the filter empties the candidate set the step is a dead end and the sentence ends early; relaxing the threshold when it bites would make it not a control. The end sentinel is exempt, because gating it would mean a sentence cannot end until several people ended a message the same way.
+
+**As of M24 the gate has three dimensions, and `admissible` in `score.go` is the only place they are stated.** An edge is generatable if `k` distinct people produced it, or if one person produced it, it carries almost no weight, and the context is short. Both extra clauses come from measurements rather than from taste, and they answer different questions:
+
+- **Count**, because weight in this model IS raw frequency. The gate used to refuse an edge one person said once exactly as hard as one they said five hundred times, which conflates a sparse corpus with the concentration A6 describes. On the real corpus that cost 93.8% of the edges to defend against a shape with one instance in it (`SPEC.md` §8, finding 54).
+- **Context length**, because a single-author edge found at a long prefix is not a rare phrase, it is somebody's sentence. Allowing them at every order took the golden fixture's recitation rate from 2.4% to 19.8% *and* lowered the share of distinct output: a chain following one source message is quoting rather than varying (finding 57). Read it as **one or two words is shared vocabulary, three or more is somebody's phrasing.**
+
+**The allowance requires at least one real author, and that is not a nil check.** A zero-author edge is the bot's own output, since `learnMessage` passes an empty author for its own messages precisely so self-learning cannot bootstrap eligibility. Its replies re-enter the corpus through `selfLearn`, so a count-keyed allowance that ignored authorship would let every sentence the bot produced make its own continuations admissible, tightening with every reply.
+
+**Know the operational consequence before you debug it as an outage:** the bot is still quieter on a young corpus, because the count allowance needs a real author and the order cap keeps high-order contexts gated. At 19,387 messages the shipped settings leave 53.24% of prefixes with no admissible continuation, down from 75.40%.
 
 **`Step.Position` is a fraction of the sentence's TARGET, and that is the same scale the corpus records.** The learn path stores a word's position as `j/len(words)`, spread over all of [0, 1), and the scorer compares `Position` against it directly in `TopicGravity`, `NameTopic`, both of `NameAssoc`'s nested gates and `Connective`. Both walk loops used to divide by `Length.Max`, which is a different scale: with a median target near 7 against a cap of 18, a reply swept 0 to 0.39 and stopped, so a word the corpus sees late in a message was damped for the *entire* sentence and `Connective`'s late-dampening branch at 0.85 was unreachable. Set it from `Length.Progress` and nothing else. The method exists because production and the golden harness had the same wrong copy, and a harness that computes progress differently from the bot reports on a bot that does not exist. Note that `seed.go` preferring early-position words is correct and stays: it is choosing where a sentence *starts*, which is the deliberate contrast with `bestPivot`.
 
 **Every draw on the generation path goes through `markov.Source`, including the two that did not.** The length target used to construct a `markov.DefaultSource{}` inline and the persona post-pass was called as `Style(nil, ...)`, so `internal/generate` could not produce the same text twice under a seed. `Generator.source()` is the single answer now; production still passes nil and still has no shared generator to race on, because `DefaultSource` is stateless. Reproducibility is load-bearing rather than tidy: a printed difference has to be attributable to the change that caused it.
 
 **One length model, and do not add a second.** A target is sampled per sentence between `MIN_WORDS` and `MAX_WORDS`, skewed short; the end token is penalized below the floor, eased to neutral at the target, and rewarded past it with a cap. That single mechanism replaced three that could disagree, so a new length rule anywhere else recreates the problem. The floor penalty is finite rather than `-Inf` on purpose: a context whose only continuation is the sentinel must still be able to end. Short and punchy reads as a joke; long reads as a malfunction.
+
+**A second one had already grown, and it was not in `length.go`.** `Significance` rewards globally frequent words and applied to every candidate including the sentinel, and the learn path appends the sentinel before the topic loop, so its topic count is exactly the number of messages learned: on the real corpus 19,387, which is 15.5% of all tokens. `tanh(sqrt(n)/12)` is 1.000 at that magnitude, so the end token collected the full weight at every step against a median candidate's twelfth of it, worth about 1.20x odds on ending and strongest exactly in the band where `EndEarly` is trying to hold the sentence open. M24 exempts it (`SPEC.md` §8, finding 53). **The lesson is where the second mechanism came from:** nobody added a length rule, a scoring term simply turned out to be reading a structural marker's frequency as evidence about a word. When you add a term that reads a corpus-wide count, ask what the sentinel's value of it is.
 
 **A decision to stay silent carries a reason, and the caller logs it.** `generate.Sentence` returns a typed `Outcome` alongside the string: `CorpusEmpty` points at ingestion, `TooShort` points at the author-diversity gate. That exists because the reply path used to return on an empty string with no log line at all, so a correctly working bot on a young corpus was indistinguishable from a broken trigger, while the autonomous poster had logged the identical condition since it was written (`SPEC.md` §8, finding 32). The bot's silence is a feature; the operator's is a bug. If you add a third reason, add it to the enum rather than logging a generic line.
 
@@ -627,6 +645,8 @@ Once set it fails **closed**: a missing file, an unreadable file, a malformed li
 
 **Poisoning is cheap unless generation requires author diversity.** n-gram weight is raw frequency, so repeating a phrase is a direct write to the model, and one determined user can teach the bot to say anything. `PEREGRINE_MIN_DISTINCT_AUTHORS` requires a continuation to have come from `k` distinct authors before the bot will *generate* it, independent of how often it was seen. That turns the attack from persistence into collusion. The counts have been maintained since M6b and **the gate reads them as of M7a**, defaulting to 2, so the safe direction is what an operator gets by doing nothing.
 
+**M24 narrowed that from "regardless of how often" to "once it has been said more than twice", and the cost is stated rather than hidden.** Writing an arbitrary phrase into the generatable graph now costs one account and three messages instead of two accounts, at short contexts only. That is a real reduction and it was taken deliberately, because the measurement said the old rule refused 93.8% of a real corpus to defend against a concentration that occurred once in it. The honest framing is §4's own: input filtering lowers the rate and **only the emit gate bounds the result**. `PEREGRINE_SOLO_REPEAT_LIMIT=0` restores the pre-M24 gate exactly, which is the lever if a live server turns out to poison itself.
+
 It is a **filter, not a penalty**, and it does not relax when it empties the candidate set: the step becomes a dead end and the sentence ends early. A safety control that yields the moment it has an effect is not a control. The end sentinel is the one exemption, because gating a sentence's ability to end on how other people ended theirs is a length bug wearing a safety hat. The consequence worth knowing in advance: on a corpus in its first hours almost nothing has two distinct authors, so the bot is nearly mute. That is the gate working, and the fix is more people in the corpus rather than a lower threshold.
 
 The bot's own output is excluded from those counts, and the exclusion is a comparison in `learnMessage`: if the author's user ID equals `botID`, an empty author is passed to `LearnNgram`, which does not count an empty author. That matters because self-learning feeds the bot's replies back into the corpus under the bot's own identity, so without the comparison anything it said once would carry a diversity count of one from the moment it said it, bootstrapped by the bot rather than by people. `TestLearnMessageExcludesTheBotFromAuthorDiversity` pins it.
@@ -650,6 +670,55 @@ Backups are in-process, in `internal/plugins/backup`: `Store.Backup` takes a rea
 **`PEREGRINE_BACKUP_DIR` must be a writable mount in a container.** The image runs `read_only: true`, so any path outside a volume or bind fails on the first write, and a relative path resolves against the distroless working directory. `docker-compose.prod.yml` binds `./backups` to `/backups` for this, and it is deliberately **outside** the corpus volume so that losing or removing that volume does not take the snapshots with it. Each snapshot is a full copy, so the disk cost is `KEEP` times the corpus size.
 
 `markov.db`, the whisper model and the ffmpeg binary are all gitignored. `voicenotes/models/ggml-small.bin` is 465 MiB, over GitHub's hard 100 MiB per-file limit, so a commit containing it cannot be pushed at all and the only remedy is rewriting history. `.dockerignore` exists for the same weight: the working tree is around 692 MB and `COPY . .` would ship all of it into the builder on every build.
+
+## The corpus report, and what the first real measurement changed
+
+`-corpus-report` walks a corpus and prints its distributions. `internal/corpus/stats.go` is
+the shape of the answer, `internal/storage/report.go` is the walk, `internal/maintenance`
+renders it. Read `SPEC.md` findings 53 to 56 before touching the engine's constants: they are
+what the first run found, and three of them corrected an estimate that a scaling argument had
+got wrong by an order of magnitude.
+
+**`storage.OpenReadOnly` is the half that makes the mode safe, and it is not a convenience.**
+`storage.Open` creates every missing bucket, stamps a schema version onto a file that has none,
+and can run `upgradeToV2`, which **empties the image cache**. All three are right for a bot
+starting up and wrong for a report: a mode that mutates the corpus it is measuring has changed
+the thing it was asked to describe. The version-1 case is refused rather than migrated, because
+migrating is a write. `TestOpenReadOnlyWritesNothing` compares the file byte for byte.
+
+**It reports raw distributions and evaluates nothing.** Teaching a maintenance mode the scorer's
+formulas would couple it to `markov`'s constants and give the two a way to disagree, which is
+finding 28's shape. So it prints the admission curve at every candidate threshold and marks
+which one is configured, rather than printing a recommendation. What a distribution implies for
+a logit belongs in `internal/markov`, in a test built at these magnitudes.
+
+**`CorpusStats` is a `Store` method and deliberately not a `Reader` one.** These are unbounded
+cursor walks, and a `Reader` is the type the generation hot path holds inside the one read
+transaction a reply gets. Hanging a whole-bucket walk off it is a footgun aimed at the innermost
+loop in the bot. It is affordable here because the caller is a maintenance mode running once
+against a snapshot.
+
+**One pass answers three questions**, because the n-gram bucket is keyed `<prefix> NUL <next>`
+and bbolt cursors walk in key order: every edge sharing a prefix arrives contiguously, so the
+author histogram, the probability mass and the per-prefix branch factor all fall out of one
+sequential scan in constant memory.
+
+**Both admission shares are reported, and only the second predicts behaviour.** Generation
+samples in proportion to probability, so refusing 93.8% of edges and refusing 76.3% of the mass
+are different outcomes; on the real corpus those are the same threshold. A report that printed
+the edge share alone would misdescribe the gate in the direction that makes it look harmless.
+
+**The end sentinel gets its own line because it is not a word.** `learn.Learner.Message` appends
+it before the topic loop, so its topic count is exactly the number of messages learned and it is
+the maximum of every distribution in the report. Without the line, "max 19387, messages learned
+19387" reads as a double-count bug. It is also finding 53: the sentinel being a topic entry is
+why `Significance` pays it the saturated maximum at every step.
+
+**The sentinel is a parameter to `CorpusStats`, not a constant in `storage`.** Storage is the
+bottom layer and must not learn what a word means, which is the same rule `ScanTopics` states
+about its filters living in `health`. `internal/learn` and `internal/markov` each define the
+sentinel with a test pinning that they agree; a third definition down here would be a third
+thing to keep in step.
 
 ## The tuning export, and why the engine grew an observer
 

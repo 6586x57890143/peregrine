@@ -847,7 +847,13 @@ func (g *Generator) attested(word string) bool {
 		// on how other people ended theirs is a length bug wearing a safety hat. It is NOT
 		// exempt here: "the only thing following this word is the end of a message somebody
 		// once sent" is not evidence that several people use the word.
-		if s.Token != EndToken && s.Authors >= uint32(min) {
+		//
+		// admissible rather than a second copy of the comparison, so the count allowance
+		// M24 added reaches this producer too. The version of this line that predates it is
+		// exactly the shape of finding 31, where the gate existed at one of three places
+		// that put a word into a sentence and the other two handed refused phrases straight
+		// back.
+		if s.Token != EndToken && g.admissible(s.Count, s.Authors, 1) {
 			return true
 		}
 	}

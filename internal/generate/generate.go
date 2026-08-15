@@ -61,6 +61,8 @@ type Options struct {
 	KNDiscount         float64
 	KNRawMix           float64
 	MinDistinctAuthors int
+	SoloRepeatLimit    int
+	SoloMaxOrder       int
 	PromptRelevance    float64
 	RoastChance        float64
 }
@@ -79,6 +81,8 @@ func (o Options) Params() markov.Params {
 		KNDiscount:         o.KNDiscount,
 		KNRawMix:           o.KNRawMix,
 		MinDistinctAuthors: o.MinDistinctAuthors,
+		SoloRepeatLimit:    o.SoloRepeatLimit,
+		SoloMaxOrder:       o.SoloMaxOrder,
 		PromptRelevance:    o.PromptRelevance,
 	}
 }

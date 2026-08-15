@@ -175,7 +175,7 @@ func (g *Generator) eligible(cands []candidate) []candidate {
 
 	out := cands[:0]
 	for _, c := range cands {
-		if g.admits(c.token, c.authors) {
+		if g.admits(c.token, c.count, c.authors, c.order) {
 			out = append(out, c)
 		}
 	}
@@ -197,15 +197,54 @@ func (g *Generator) eligible(cands []candidate) []candidate {
 // has to pass the gate. Enumeration keeps LOOKING at lower orders until enough survivors
 // exist; it never admits one that failed. The gate still does not relax when it bites, and
 // when no order supplies survivors the step is still a dead end.
-func (g *Generator) admits(token string, authors uint32) bool {
+func (g *Generator) admits(token string, count uint64, authors uint32, order int) bool {
+	// The end sentinel is structural rather than content: gating it on author diversity
+	// would mean a sentence cannot end until several people have ended a message the same
+	// way, which is a length bug wearing a safety hat.
+	return token == EndToken || g.admissible(count, authors, order)
+}
+
+// admissible is the author-diversity gate for one edge, with no exemptions at all.
+//
+// It is separate from admits because the two callers disagree about the end sentinel and
+// agree about everything else, and because seed.go's attested asks the same question of an
+// edge it found by a different route. Three copies of a safety control is how one of them
+// ends up a version behind, which is finding 31's shape: A6 was already defeated once by a
+// check that existed at one of three producers of words.
+//
+// # The two clauses
+//
+// Corroboration admits an edge outright: k different people produced it, which is what
+// SPEC.md section 4 A6 asks for and what turns poisoning from persistence into collusion.
+//
+// Below SoloRepeatLimit an edge is admitted on the strength of carrying no weight. See
+// Params.SoloRepeatLimit for why count is the right quantity to key that on and what it
+// costs. M23 measured the alternative: without this clause the gate refuses 93.8% of the
+// edges in a real corpus, and generation degenerates into a near-deterministic order-1
+// walk that every dial in front of it is powerless to vary (finding 54).
+//
+// # Why the allowance requires at least one author
+//
+// It is not a nil check. An edge with ZERO authors is the bot's own output: learnMessage
+// passes an empty author for its own messages, and LearnNgram does not count an empty
+// author, specifically so that self-learning cannot bootstrap a phrase into eligibility.
+// A count-keyed allowance that ignored authors entirely would undo that, and it would undo
+// it in the worst available way: the bot's replies re-enter the corpus through selfLearn,
+// so every sentence it produced would make its own continuations admissible, and the loop
+// would tighten with every reply. The allowance is for edges that a PERSON produced and
+// nobody else has echoed yet.
+func (g *Generator) admissible(count uint64, authors uint32, order int) bool {
 	min := g.params.MinDistinctAuthors
 	if min <= 0 {
 		return true
 	}
-	// The end sentinel is structural rather than content: gating it on author diversity
-	// would mean a sentence cannot end until several people have ended a message the same
-	// way, which is a length bug wearing a safety hat.
-	return token == EndToken || authors >= uint32(min)
+	if authors >= uint32(min) {
+		return true
+	}
+	if limit := g.params.SoloMaxOrder; limit > 0 && order > limit {
+		return false
+	}
+	return authors >= 1 && count <= uint64(g.params.SoloRepeatLimit)
 }
 
 // assocCache holds the co-occurrence maps one sentence needs, loaded once.
@@ -328,8 +367,30 @@ func (g *Generator) heuristics(s *Step, c candidate, assoc assocCache) float64 {
 
 	// Global significance. Squashed, so a word seen ten thousand times does not
 	// outrank the model.
-	if n := g.corpus.TopicCount(tok); n > 0 {
-		logit += w.Significance * math.Tanh(math.Sqrt(float64(n))/12.0)
+	//
+	// THE END SENTINEL IS EXCLUDED, and it is the reason this branch has a guard at all
+	// (SPEC.md section 8, finding 53). The learn path appends the sentinel before the
+	// topic loop runs, so its topic count is exactly the number of messages learned:
+	// measured on a real corpus that is 19,387, which is 15.5% of all tokens and 5.7
+	// times the next entry. tanh(sqrt(19387)/12) is 1.000 to three places, so the
+	// sentinel was collecting the FULL Significance weight at every step of every
+	// sentence while a median candidate collected a twelfth of it.
+	//
+	// That made this a second length model. The comment on endLogit below says the length
+	// model is the only place length influences generation, which is the whole reason
+	// three competing mechanisms were collapsed into one, and this was quietly a fourth:
+	// worth about 1.20x odds on ending, applied at every step, strongest exactly in the
+	// band between Min and Target where EndEarly is trying to hold the sentence open.
+	//
+	// It is fixed here rather than by keeping the sentinel out of the topic bucket,
+	// because the count itself is correct and load-bearing elsewhere: TotalTopicCount is
+	// the unigram denominator for KNRawMix, and the end symbol genuinely is part of that
+	// distribution. What was wrong was reading a structural marker's frequency as
+	// evidence that a WORD is significant.
+	if tok != EndToken {
+		if n := g.corpus.TopicCount(tok); n > 0 {
+			logit += w.Significance * math.Tanh(math.Sqrt(float64(n))/12.0)
+		}
 	}
 
 	// A learned display name.
