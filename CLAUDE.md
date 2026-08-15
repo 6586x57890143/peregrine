@@ -349,6 +349,34 @@ H2 does that instead, which is why **the header is more load-bearing now than it
 embed, not less**: without a box to make the message findable in a scroll, the scramble being a
 header is the only thing that catches a skimming eye.
 
+**A puzzle opens on `✨ unscramble ✨` and the budget moved to pay for it.** The call to
+action is worth a line; what matters is that the line was paid for openly. The shape test went
+from two and three to three and four in the same change, rather than the line arriving against a
+stale number, because a budget nobody is allowed to change is a budget people route around.
+
+**A gauntlet ends with a recap, and the recap is a report.** Every number in it is ordinary points
+that have already gone to the weekly board: nothing is scored twice and nothing is scored
+differently inside a run. What it adds is the thing a run has that a lone puzzle does not, which
+is a result. The recap is the match and the board is the season, which is why it sits beside the
+pointer at `!leaderboard` rather than replacing it.
+
+**The run tally lives on the `Manager`, and three of its properties are load-bearing.** It sits
+beside `queued`/`rounds`/`readyAt` rather than in the service, because gauntlet state living in
+two places is finding 28's shape. It stores the **display name at win time**, like `AddWin` does,
+because the render path has no name resolver and resolving at render time would put REST calls on
+the end of a run. And it is **taken, not read**: whoever prints the standings owns them, so a
+tally cannot outlive the run it describes, which is the per-channel leak this repo has already
+shipped twice. `Abandon` clears it for runs that never get printed.
+
+**It records against the GAME's `Rounds`, never against "is a gauntlet running".** `StartWord`
+deletes the queue the moment the LAST round starts, so a run is already not-running by the time
+its final puzzle is solved. Gating on that would have silently dropped the win that closes every
+single run, which is the sort of thing that looks like a rounding error in the recap forever.
+
+**Both endings go through one `finishRun`.** The closing message used to be sent from the win path
+only, so a run whose last round nobody got just stopped: finding 32's shape on the ending most
+likely to read as a crash, since a run ending badly is exactly when silence looks like failure.
+
 **The chrome is deadpan lowercase, and that is the opposite of what "match the register"
 implies.** This furniture repeats on every single puzzle, and a fixed joke stops being funny by
 the fourth time. Peregrine's chaos belongs in the generated text, which varies; the message around
