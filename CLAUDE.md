@@ -326,6 +326,36 @@ start, and deferring to the decision the server already made beats maintaining a
 opinion about it. The failure mode a second copy would have is the empty case, which fails
 **open**, and no behavioural test can cover the command nobody has written yet.
 
+**A puzzle card is two lines, three when hinted, and that is pinned by a test.** M27's pass: no
+title, no fields, no footer, everything in the description with one `-#` subtext line at the
+bottom. The state colour carries what the title used to. The countdown is what forces this rather
+than taste: Discord renders `<t:N:R>` in descriptions and field values only, **never in a footer
+or a title**, so the one part of the card that most wants to be small cannot use the small slot,
+and subtext is the only way to get footer-sized text into a description. The letter count
+disappears once a rung lands, because the mask says it more directly and dropping it is what
+keeps the subtext to one line as it gains the round and hint counters. The mask is **not** wrapped
+in backticks: `hidden` is an escaped underscore, and inside an inline code span a backslash is
+literal, so backticks would render `p \_ \_ e`.
+
+**The chrome is deadpan lowercase, and that is the opposite of what "match the register"
+implies.** This furniture repeats on every single puzzle, and a fixed joke stops being funny by
+the fourth time. Peregrine's chaos belongs in the generated text, which varies; the card around it
+should be flat and get out of the way.
+
+**The leaderboard's two inline fields and eleventh slot survived the pass deliberately.** Both are
+measured decisions rather than styling: the columns sit side by side on a desktop and stack on a
+phone, which is what replaced a fixed-width code-block table that scrolled off screen for most
+readers, and the divider plus the viewer's own row under it is the whole reason ranking is
+competition ranking computed from scores alone. Restyling either away would undo a measurement for
+a preference.
+
+**Assert on the embed, not on the copy.** A dozen tests pinned behaviour through prose, so a
+restyle looked like a dozen regressions: `Contains(post, "Unscramble")` is really asking whether a
+puzzle went up. The structural checks read the state colour now, which is the field that says
+which of four things a card is. Copy assertions survive only where the copy IS the behaviour: the
+round numbering, the stake being visible before the first hint, and the refusal that names the
+length bounds.
+
 **Puzzles are embeds, and Components V2 is deliberately not adopted yet.** `Guard.SendEmbed`
 already runs `CheckEmit` over every text field, so the richer card cost no new gate surface. V2
 exists in discordgo v0.29 and the one thing it uniquely buys is a button beside the text, but

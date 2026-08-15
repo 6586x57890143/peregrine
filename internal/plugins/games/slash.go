@@ -139,7 +139,7 @@ func (s *Service) onInteraction(_ *discordgo.Session, ic *discordgo.InteractionC
 // which stays silent on purpose, and the difference is exactly that this answer is private.
 func (s *Service) handleInteraction(i *discordgo.Interaction) {
 	if !s.opts.Enabled || !s.manager.Available() {
-		s.guard.Respond(i, "Word games are switched off right now.", true)
+		s.guard.Respond(i, "word games are off right now", true)
 		return
 	}
 
@@ -156,7 +156,7 @@ func (s *Service) handleInteraction(i *discordgo.Interaction) {
 		}
 		// Ephemerally, which is the whole point: the person who asked learns why, and nobody
 		// else learns that the command exists.
-		s.guard.Respond(i, "You need Administrator in this server to start a word game.", true)
+		s.guard.Respond(i, "you need Administrator here to start a word game", true)
 		return
 	}
 
@@ -180,17 +180,17 @@ func (s *Service) startWordFor(i *discordgo.Interaction, word string) {
 	switch {
 	case err == nil:
 	case errors.Is(err, wordgame.ErrGameInProgress):
-		s.guard.Respond(i, "A word game is already running in this channel.", true)
+		s.guard.Respond(i, "a game is already running here", true)
 		return
 	case errors.Is(err, wordgame.ErrUnusableWord):
 		minLen, maxLen := s.manager.WordBounds()
 		s.guard.Respond(i, fmt.Sprintf(
-			"I cannot scramble that. A puzzle word has to be %d to %d letters, letters only, "+
-				"and use at least two different ones.", minLen, maxLen), true)
+			"cannot scramble that. a puzzle word is %d to %d letters, letters only, and "+
+				"needs at least two different ones", minLen, maxLen), true)
 		return
 	default:
 		log.Printf("[WORDGAME] /%s failed to start a game: %v", commandName, err)
-		s.guard.Respond(i, "Something went wrong starting that puzzle.", true)
+		s.guard.Respond(i, "something went wrong starting that", true)
 		return
 	}
 
@@ -198,11 +198,11 @@ func (s *Service) startWordFor(i *discordgo.Interaction, word string) {
 		s.manager.Abandon(i.ChannelID)
 		// The guard refused the puzzle, so the operator is told rather than left watching an
 		// empty channel. This is the case M21b could only put in the log.
-		s.guard.Respond(i, "I could not post there. The channel is on the ignore list, or "+
-			"writes are paused.", true)
+		s.guard.Respond(i, "could not post there: the channel is on the ignore list, or "+
+			"writes are paused", true)
 		return
 	}
-	s.guard.Respond(i, "Puzzle posted.", true)
+	s.guard.Respond(i, "posted", true)
 	log.Printf("[WORDGAME] Started a game in channel %s from /%s.", i.ChannelID, commandName)
 }
 
@@ -214,22 +214,22 @@ func (s *Service) startGauntletFor(i *discordgo.Interaction, n int) {
 	case errors.Is(err, wordgame.ErrGauntletInProgress):
 		remaining, total := s.manager.Gauntlet(i.ChannelID)
 		s.guard.Respond(i, fmt.Sprintf(
-			"A gauntlet is already running here: %d of %d still to go.", remaining, total), true)
+			"a gauntlet is already running here: %d of %d to go", remaining, total), true)
 		return
 	default:
 		log.Printf("[WORDGAME] /%s failed to queue a gauntlet: %v", commandName, err)
-		s.guard.Respond(i, "Something went wrong starting that gauntlet.", true)
+		s.guard.Respond(i, "something went wrong starting that", true)
 		return
 	}
 
 	// Answered BEFORE the first puzzle goes up, because an interaction has three seconds and
 	// starting a puzzle is a REST call of its own. The alternative is a deferred response, which
 	// is a second shape of answer to maintain for no gain here.
-	msg := fmt.Sprintf("Gauntlet of %d starting.", queued)
+	msg := fmt.Sprintf("gauntlet of %d starting", queued)
 	if queued < n {
 		// Said, rather than silently clamped. An operator who asked for fifty and got ten
 		// should learn that from the bot rather than by counting.
-		msg = fmt.Sprintf("Gauntlet of %d starting. (%d is the most I will queue at once.)",
+		msg = fmt.Sprintf("gauntlet of %d starting (%d is the most I queue at once)",
 			queued, queued)
 	}
 	s.guard.Respond(i, msg, true)

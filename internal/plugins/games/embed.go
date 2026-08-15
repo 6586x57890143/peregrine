@@ -49,27 +49,32 @@ var medals = []string{"🥇", "🥈", "🥉"}
 // leaderboardEmbed renders both boards as one message.
 func leaderboardEmbed(wins, chat wordgame.Board, nextReset time.Time, footer string) *discordgo.MessageEmbed {
 	return &discordgo.MessageEmbed{
-		Title: "🏆 Weekly Leaderboard",
+		Title: "weekly leaderboard",
 		// A Discord relative timestamp rather than a rendered duration, so it stays correct in
 		// every reader's timezone and keeps counting down without the bot editing anything.
-		Description: fmt.Sprintf("Resets <t:%d:R>", nextReset.Unix()),
+		//
+		// As SUBTEXT since M27: the reset is context for the board rather than a statement in
+		// its own right, and it used to render at the same size as the thing it annotates.
+		Description: subtext(fmt.Sprintf("resets <t:%d:R>", nextReset.Unix())),
 		Color:       0xF1C40F,
 		Fields: []*discordgo.MessageEmbedField{
 			{
-				Name: "Word Scramble",
-				// "points", not "wins", because that is what the column now holds and what the
-				// board ranks by. The unit names the numbers for exactly this reason: two
-				// columns of bare integers under one heading invite the reading that they are
-				// comparable, and a column of points labelled "wins" invites the worse reading
-				// that somebody with 12 has won twelve games.
+				// The unit lives in the field NAME, so it is said once rather than on every row.
+				// "points", not "wins", because that is what the column holds and what the board
+				// ranks by: two columns of bare integers under one heading invite the reading
+				// that they are comparable, and a column of points labelled "wins" invites the
+				// worse reading that somebody with 12 has won twelve games.
+				Name:  "scramble · points",
 				Value: renderBoard(wins, "points"),
 				// Inline, so the two boards sit side by side on a desktop and stack on a
 				// phone. That is the whole reason this is a field pair rather than one long
-				// description.
+				// description, and M27 deliberately did NOT restyle it away: what it replaced
+				// was a fixed-width code-block table that scrolled off screen for most of the
+				// people looking at it.
 				Inline: true,
 			},
 			{
-				Name:   "Chat",
+				Name:   "chat · messages",
 				Value:  renderBoard(chat, "messages"),
 				Inline: true,
 			},
@@ -84,7 +89,7 @@ func leaderboardEmbed(wins, chat wordgame.Board, nextReset time.Time, footer str
 // of bare integers under one heading invites the reading that they are comparable.
 func renderBoard(b wordgame.Board, unit string) string {
 	if len(b.Top) == 0 {
-		return "_Nobody yet this week._"
+		return "_nobody yet_"
 	}
 
 	var sb strings.Builder
@@ -105,14 +110,18 @@ func renderBoard(b wordgame.Board, unit string) string {
 		// Said rather than omitted. A missing row is indistinguishable from a bug, and "you
 		// have none" is a real answer to the question that was asked.
 		sb.WriteString("　\n")
-		fmt.Fprintf(&sb, "_You have no %s this week._\n", unit)
+		fmt.Fprintf(&sb, "_no %s this week_\n", unit)
 	}
 	return strings.TrimRight(sb.String(), "\n")
 }
 
 // line renders one row: a medal or a rank, the name, and the score.
+//
+// The medals stay for the top three. They are instantly readable and they are the one place on
+// either card where an emoji earns the space it takes; everything below gets a code chip, which
+// is what lines the names up in a proportional font.
 func line(r wordgame.Row) string {
-	rank := fmt.Sprintf("`%2d.`", r.Rank)
+	rank := fmt.Sprintf("`%2d`", r.Rank)
 	if r.Rank >= 1 && r.Rank <= len(medals) {
 		rank = medals[r.Rank-1]
 	}
@@ -125,7 +134,8 @@ func line(r wordgame.Row) string {
 	}
 	// Runes rather than bytes, because a nickname is full of emoji and accented characters and
 	// byte slicing splits them into a replacement glyph (M0).
-	return fmt.Sprintf("%s **%s** %s", rank, wordgame.TruncateRunes(name, 16), commas(r.Score))
+	return fmt.Sprintf("%s **%s**%s%s",
+		rank, wordgame.TruncateRunes(name, 16), sep, commas(r.Score))
 }
 
 // leaderboardFooter is the one-line summary under both boards.
@@ -135,20 +145,22 @@ func line(r wordgame.Row) string {
 // desktop. Each part is omitted when it has nothing to say: an empty week says the counts and
 // stops, rather than printing "fastest: nobody".
 func leaderboardFooter(b *wordgame.Leaderboard, wins, chat wordgame.Board, names func(string) string) string {
-	parts := []string{fmt.Sprintf("%s playing, %s talking this week",
+	parts := []string{fmt.Sprintf("%s playing, %s talking",
 		plural(wins.Players, "player"), plural(chat.Players, "person", "people"))}
 
 	if e, ok := b.Fastest(); ok {
-		parts = append(parts, fmt.Sprintf("fastest solve %s by %s",
+		parts = append(parts, fmt.Sprintf("fastest %s by %s",
 			seconds(e.FastestMS), wordgame.TruncateRunes(names(e.UserID), 16)))
 	}
 	// Only the current winner can be on a streak, and only from two wins up. A line that
 	// appeared after every single game would be noise rather than news.
 	if e, ok := b.Streak(); ok {
-		parts = append(parts, fmt.Sprintf("%s is on %d in a row",
+		parts = append(parts, fmt.Sprintf("%s on %d in a row",
 			wordgame.TruncateRunes(names(e.UserID), 16), e.Streak))
 	}
-	return strings.Join(parts, " | ")
+	// The same separator the cards use. "this week" is dropped from the counts because the title
+	// already says weekly and the subtext already says when it resets.
+	return strings.Join(parts, sep)
 }
 
 // seconds renders a solve time. Two decimals, because a scramble is usually solved in single

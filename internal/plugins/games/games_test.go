@@ -149,6 +149,45 @@ func (g *fakeGuard) Delete(_, messageID string) bool {
 	return true
 }
 
+// The structural assertions, M27.
+//
+// Most of the tests here used to ask "did the bot say the word Unscramble", which is really
+// asking "did a puzzle go up" and answering it through prose. That made an embed restyle look
+// like a dozen regressions, so the checks that are about STRUCTURE now read the embed: the state
+// colour is not decoration, it is the one field that says which of four things this card is.
+//
+// Copy assertions survive only where the copy IS the behaviour: the round numbering, the stake
+// being visible before the first hint, and the refusal that names the length bounds.
+
+// maskFragment is what an unrevealed letter looks like on a card.
+//
+// The escaped underscore from internal/wordgame's hidden constant, spelled out here rather than
+// imported, because it is unexported there and because a test that read the same constant the
+// renderer does could not tell a mask from an empty string.
+const maskFragment = `\_ \_`
+
+// cards returns every embed the bot posted with the given state colour.
+func (g *fakeGuard) cards(colour int) []*discordgo.MessageEmbed {
+	var out []*discordgo.MessageEmbed
+	for _, e := range g.posted() {
+		if e != nil && e.Color == colour {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// onePuzzle asserts that exactly one live puzzle card went up, and returns it.
+func onePuzzle(t *testing.T, g *fakeGuard) *discordgo.MessageEmbed {
+	t.Helper()
+	live := g.cards(colourLive)
+	if len(live) != 1 {
+		t.Fatalf("posted %d live puzzle cards, want 1. All posts:\n%s",
+			len(live), strings.Join(g.posts(), "\n---\n"))
+	}
+	return live[0]
+}
+
 func (g *fakeGuard) posts() []string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -305,9 +344,7 @@ func TestWordgameOnRequestNeedsAuthorization(t *testing.T) {
 	if consumed := s.Command("!wordgame", "", "c1", admin(snowflake(1)), noNames); !consumed {
 		t.Error("an authorized !wordgame was not consumed")
 	}
-	if posts := guard.posts(); len(posts) != 1 || !strings.Contains(posts[0], "Unscramble") {
-		t.Errorf("posts = %v, want a scramble announcement", posts)
-	}
+	onePuzzle(t, guard)
 }
 
 // ---------------------------------------------------------------- the game
@@ -499,9 +536,7 @@ func TestIntervalModePicksAChannelWithTraffic(t *testing.T) {
 		tracker.Note("c1", snowflake(42))
 	}
 	s.startInterval()
-	if posts := guard.posts(); len(posts) != 1 || !strings.Contains(posts[0], "Unscramble") {
-		t.Errorf("posts = %v, want a scramble in the channel with traffic", posts)
-	}
+	onePuzzle(t, guard)
 }
 
 func noNames(userID string) string { return userID }
@@ -551,11 +586,17 @@ func TestTheSweepRepostsTheAnnouncementToDeliverAHint(t *testing.T) {
 	if len(posts) != 2 {
 		t.Fatalf("posts = %d, want the puzzle and then the card that replaced it", len(posts))
 	}
-	if hint := posts[1]; !strings.Contains(hint, "Hint") {
-		t.Errorf("the repost is not a hint:\n%s", hint)
+	// Structural rather than by wording. The colour is the field that says which of the four
+	// states a card is in, and a mask is the thing a hint actually adds.
+	hinted := guard.cards(colourHinted)
+	if len(hinted) != 1 {
+		t.Fatalf("posted %d hinted cards, want 1:\n%s", len(hinted), strings.Join(posts, "\n---\n"))
 	}
-	if !strings.Contains(posts[1], "Unscramble") {
-		t.Error("the repost dropped the puzzle, so the scramble is no longer readable")
+	if !strings.Contains(hinted[0].Description, maskFragment) {
+		t.Errorf("the repost carries no mask, so it is not a hint:\n%s", hinted[0].Description)
+	}
+	if !strings.Contains(hinted[0].Description, "hint 1/") {
+		t.Errorf("the repost does not say which rung it is:\n%s", hinted[0].Description)
 	}
 	if got := guard.edits(); len(got) != 0 {
 		t.Errorf("the hint was delivered by editing (%v); that is the behaviour M25 replaced, "+
@@ -722,7 +763,7 @@ func TestTheBoardShowsTheViewerTheirOwnRank(t *testing.T) {
 		t.Fatalf("got %d embeds, want 1", len(embeds))
 	}
 	value := embeds[0].Fields[0].Value
-	if !strings.Contains(value, "18.") {
+	if !strings.Contains(value, "`18`") {
 		t.Errorf("the viewer sits at 18th and the board does not show it:\n%s", value)
 	}
 	if !strings.Contains(value, "user-"+viewer) {
