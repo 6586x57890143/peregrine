@@ -9,8 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bwmarrin/discordgo"
-
 	"github.com/6586x57890143/peregrine/internal/activity"
 	"github.com/6586x57890143/peregrine/internal/core"
 	"github.com/6586x57890143/peregrine/internal/dbtest"
@@ -178,16 +176,20 @@ func TestASolvedPuzzleIsNotStillWorthItsOpeningStake(t *testing.T) {
 
 	s.Guess("c1", snowflake(620), theWord, snowflake(44), "cat")
 
-	// Found by its state colour rather than by its wording, so a copy change is not a failure
-	// here. What is being asserted is that the card and the board agree about one number.
-	won := guard.cards(colourSolved)
-	if len(won) != 1 {
-		t.Fatalf("posted %d solved cards, want 1:\n%s",
-			len(won), strings.Join(guard.posts(), "\n---\n"))
+	// What is asserted is that the message and the board agree about one number. Found by the
+	// winner's name rather than by the wording around it, so a copy change is not a failure.
+	var won string
+	for _, p := range guard.posts() {
+		if strings.Contains(p, "**cat**") {
+			won = p
+		}
 	}
-	if !strings.Contains(won[0].Description, "3 pts") {
+	if won == "" {
+		t.Fatalf("no win announcement in:\n%s", strings.Join(guard.posts(), "\n---\n"))
+	}
+	if !strings.Contains(won, "3 pts") {
 		t.Errorf("the win announces a different number from the one the board recorded "+
-			"(%d):\n%s", s.board.Scores()[snowflake(44)], won[0].Description)
+			"(%d):\n%s", s.board.Scores()[snowflake(44)], won)
 	}
 }
 
@@ -287,65 +289,60 @@ func fixtureDict(t *testing.T, opts Options, mopts wordgame.Options) (
 	return s, guard, manager, tracker
 }
 
-// ---------------------------------------------------------------- the shape of a card, M27
+// ------------------------------------------------------- the shape of a message, M27 and M28
 
-// TestACardIsTwoLinesAndThreeWhenHinted.
+// TestAPuzzleIsTwoLinesAndThreeWhenHinted.
 //
-// The requirement this design pass exists to meet, pinned because it is the kind that erodes one
-// well-meaning addition at a time. The version M25 shipped spent four embed slots on two facts:
-// a title saying "Word Scramble" above a word scramble, a description telling the reader to
-// unscramble the scrambled word, a field for the hint and a three-clause footer.
+// The requirement the design pass exists to meet, pinned because it is the kind that erodes one
+// well-meaning addition at a time. What M25 shipped spent four embed slots on two facts: a title
+// saying "Word Scramble" above a word scramble, a description telling the reader to unscramble
+// the scrambled word, a field for the hint and a three-clause footer.
 //
-// Line COUNT rather than character count, because the failure being prevented is vertical: a card
-// that takes half a screen in a busy channel is one people scroll past.
-func TestACardIsTwoLinesAndThreeWhenHinted(t *testing.T) {
+// M28 took the embed away entirely, on feedback that a card every few minutes is a bot that keeps
+// interrupting. The line budget is the part that survives both, and it is the part that mattered:
+// the failure being prevented is vertical, because a message taking half a screen in a busy
+// channel is one people scroll past.
+func TestAPuzzleIsTwoLinesAndThreeWhenHinted(t *testing.T) {
 	s, guard, _, _ := fixtureHinting(t)
 	s.start("c1")
 
-	live := onePuzzle(t, guard)
-	assertCardShape(t, live, 2, "live")
+	assertPuzzleShape(t, onePuzzle(t, guard), 2, "live")
 
 	time.Sleep(20 * time.Millisecond)
 	s.sweep()
 
-	hinted := guard.cards(colourHinted)
+	hinted := guard.hintedPuzzles()
 	if len(hinted) != 1 {
-		t.Fatalf("posted %d hinted cards, want 1", len(hinted))
+		t.Fatalf("posted %d hinted announcements, want 1", len(hinted))
 	}
-	assertCardShape(t, hinted[0], 3, "hinted")
+	assertPuzzleShape(t, hinted[0], 3, "hinted")
 
-	// And the mask replaced the letter count rather than joining it, which is what keeps the
+	// And the mask REPLACED the letter count rather than joining it, which is what keeps the
 	// subtext to one line as it gains the round and hint counters.
-	if strings.Contains(hinted[0].Description, "letters") {
-		t.Errorf("the hinted card still counts letters as well as showing them:\n%s",
-			hinted[0].Description)
+	if strings.Contains(hinted[0], "letters") {
+		t.Errorf("the hinted message still counts letters as well as showing them:\n%s", hinted[0])
 	}
 }
 
-// assertCardShape checks a card is description-only and no taller than it should be.
-func assertCardShape(t *testing.T, e *discordgo.MessageEmbed, maxLines int, state string) {
+// assertPuzzleShape checks a puzzle message is no taller than it should be and annotates itself
+// in exactly one place.
+func assertPuzzleShape(t *testing.T, msg string, maxLines int, state string) {
 	t.Helper()
 
-	// Description-only. A title, a field or a footer would each add a line of chrome, and the
-	// state colour is carrying what the title used to.
-	if e.Title != "" {
-		t.Errorf("%s card has a title (%q); the colour says which state it is", state, e.Title)
-	}
-	if len(e.Fields) != 0 {
-		t.Errorf("%s card uses %d fields; a field adds a bold header nobody reads", state, len(e.Fields))
-	}
-	if e.Footer != nil {
-		t.Errorf("%s card has a footer; the countdown has to live in the description, so the "+
-			"metadata joins it there rather than being split across two slots", state)
+	lines := strings.Split(msg, "\n")
+	if len(lines) > maxLines {
+		t.Errorf("%s message is %d lines, want at most %d:\n%s", state, len(lines), maxLines, msg)
 	}
 
-	if got := len(strings.Split(e.Description, "\n")); got > maxLines {
-		t.Errorf("%s card is %d lines, want at most %d:\n%s", state, got, maxLines, e.Description)
+	// The scramble leads, as a header. Without an embed's box around it that is the only thing
+	// making the puzzle catch the eye of somebody skimming, so it is load-bearing rather than
+	// decorative.
+	if !strings.HasPrefix(msg, "## ") {
+		t.Errorf("%s message does not open on the scramble as a header:\n%s", state, msg)
 	}
 
 	// Exactly one subtext line, at the bottom. Two would defeat the point, and one in the middle
 	// would put small grey text above full-size text.
-	lines := strings.Split(e.Description, "\n")
 	subs := 0
 	for i, l := range lines {
 		if !strings.HasPrefix(l, "-# ") {
@@ -353,10 +350,10 @@ func assertCardShape(t *testing.T, e *discordgo.MessageEmbed, maxLines int, stat
 		}
 		subs++
 		if i != len(lines)-1 {
-			t.Errorf("%s card has subtext above body text (line %d):\n%s", state, i+1, e.Description)
+			t.Errorf("%s message has subtext above body text (line %d):\n%s", state, i+1, msg)
 		}
 	}
 	if subs != 1 {
-		t.Errorf("%s card has %d subtext lines, want exactly 1:\n%s", state, subs, e.Description)
+		t.Errorf("%s message has %d subtext lines, want exactly 1:\n%s", state, subs, msg)
 	}
 }
