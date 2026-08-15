@@ -85,9 +85,7 @@ func TestAnAdministratorCanStartAPuzzleWithNoBootstrapAdmin(t *testing.T) {
 
 	s.handleInteraction(interaction(snowflake(500), discordgo.PermissionAdministrator))
 
-	if posts := guard.posts(); len(posts) != 1 || !strings.Contains(posts[0], "Unscramble") {
-		t.Fatalf("posts = %v, want the puzzle in the channel", posts)
-	}
+	onePuzzle(t, guard)
 	replies := guard.responded()
 	if len(replies) != 1 || !replies[0].ephemeral {
 		t.Errorf("responses = %v, want one ephemeral acknowledgement", replies)
@@ -103,13 +101,7 @@ func TestThePuzzleIsPublicAndTheAcknowledgementIsNot(t *testing.T) {
 
 	s.handleInteraction(interaction(snowflake(1), 0)) // the bootstrap admin
 
-	posts := guard.posts()
-	if len(posts) != 1 {
-		t.Fatalf("posts = %v, want the puzzle", posts)
-	}
-	if !strings.Contains(posts[0], "Unscramble") {
-		t.Errorf("the channel did not get the puzzle:\n%s", posts[0])
-	}
+	puzzle := onePuzzle(t, guard)
 
 	replies := guard.responded()
 	if len(replies) != 1 {
@@ -118,7 +110,7 @@ func TestThePuzzleIsPublicAndTheAcknowledgementIsNot(t *testing.T) {
 	if !replies[0].ephemeral {
 		t.Error("the acknowledgement was public, so the command announces itself twice")
 	}
-	if strings.Contains(replies[0].content, "Unscramble") {
+	if strings.Contains(replies[0].content, puzzle.Description) {
 		t.Error("the puzzle was sent as the ephemeral answer, so only the caller can play it")
 	}
 }
@@ -192,7 +184,7 @@ func TestACountRunsAGauntletAndAWordPlantsOne(t *testing.T) {
 		s.handleInteraction(interaction(snowflake(1), 0, countOpt(3)))
 
 		posts := guard.posts()
-		if len(posts) != 1 || !strings.Contains(posts[0], "Round 1 of 3") {
+		if len(posts) != 1 || !strings.Contains(posts[0], "round 1/3") {
 			t.Fatalf("posts = %v, want round one of a run of three", posts)
 		}
 	})
@@ -223,7 +215,7 @@ func TestACountRunsAGauntletAndAWordPlantsOne(t *testing.T) {
 		s.handleInteraction(interaction(snowflake(1), 0, wordOpt("banana"), countOpt(2)))
 
 		posts := guard.posts()
-		if len(posts) != 1 || !strings.Contains(posts[0], "Round 1 of 2") {
+		if len(posts) != 1 || !strings.Contains(posts[0], "round 1/2") {
 			t.Fatalf("posts = %v, want a run rather than a planted word", posts)
 		}
 	})
