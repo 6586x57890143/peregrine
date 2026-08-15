@@ -153,6 +153,80 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
+// OpenReadOnly opens a corpus for inspection without writing a single byte to it.
+//
+// # Why Open cannot be used instead
+//
+// Open calls initialize, which creates every missing bucket, stamps a schema version
+// onto a file that has none, and can run upgradeToV2, which EMPTIES THE IMAGE CACHE.
+// Every one of those is correct for a bot starting up and wrong for a report: a mode
+// that mutates the corpus it is measuring has changed the thing it was asked to
+// describe, and the image-cache migration would do it destructively.
+//
+// bbolt's ReadOnly takes a SHARED flock, so this deliberately cannot run against a
+// corpus a live bot is holding: that fails on the same five-second timeout with the
+// same message, which is the honest outcome. The intended input is a snapshot, and
+// internal/plugins/backup already produces consistent ones via tx.WriteTo. An external
+// `cp markov.db` is still not a backup and is still not a valid input here, for the
+// reasons on Store.Backup.
+//
+// The schema check is a READ of the same key initialize writes, and it refuses the same
+// two cases with the same explanations, because a reader that tolerates a layout the
+// writer refuses would walk a pre-M6 corpus and print confident nonsense about it. The
+// version 1 case is refused rather than migrated: migrating is a write.
+func OpenReadOnly(path string) (*Store, error) {
+	db, err := bbolt.Open(path, 0600, &bbolt.Options{ReadOnly: true, Timeout: 5 * time.Second})
+	if err != nil {
+		return nil, fmt.Errorf("open corpus read-only at %s (is another process holding it?): %w", path, err)
+	}
+
+	s := &Store{db: db}
+	if err := s.checkSchema(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// checkSchema is initialize's version check with every write removed.
+func (s *Store) checkSchema() error {
+	return s.db.View(func(tx *bbolt.Tx) error {
+		meta := tx.Bucket([]byte(bucketMeta))
+		if meta == nil {
+			// No meta bucket at all. On a writable open this would simply be created; here
+			// it means the file was written by a layout that had no meta bucket, which is
+			// the pre-M6 one.
+			return fmt.Errorf("%w: this corpus has no meta bucket, so it was written by the "+
+				"pre-M6 layout, which stored a JSON successor map per key and is not readable "+
+				"by this binary", ErrSchemaMismatch)
+		}
+
+		stored := meta.Get([]byte(metaSchemaVersion))
+		switch {
+		case stored == nil:
+			if populated(tx) {
+				return fmt.Errorf("%w: this corpus holds data but carries no schema version, "+
+					"so it was written by the pre-M6 layout and is not readable by this binary",
+					ErrSchemaMismatch)
+			}
+			// An empty, unstamped file. Nothing to report on, and stamping it would be a
+			// write, so say so rather than printing a page of zeroes.
+			return fmt.Errorf("%w: this corpus is empty and unstamped, so there is nothing "+
+				"to report on", ErrSchemaMismatch)
+
+		case decodeUint64(stored) == SchemaVersion:
+			return nil
+
+		default:
+			// Includes version 1, which Open migrates and this cannot: the migration is a
+			// write. Compacting or copying it through a normal Open first is the answer.
+			return fmt.Errorf("%w: corpus is version %d, this binary speaks version %d. A "+
+				"read-only open cannot migrate it, because migrating is a write",
+				ErrSchemaMismatch, decodeUint64(stored), SchemaVersion)
+		}
+	})
+}
+
 func (s *Store) initialize() error {
 	return s.db.Update(func(tx *bbolt.Tx) error {
 		for _, name := range allBuckets {

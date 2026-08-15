@@ -56,6 +56,8 @@ func (s *Service) params() map[string]float64 {
 		"kn_discount":          d.KNDiscount,
 		"kn_raw_mix":           d.KNRawMix,
 		"min_distinct_authors": float64(d.MinDistinctAuthors),
+		"solo_repeat_limit":    float64(d.SoloRepeatLimit),
+		"solo_max_order":       float64(d.SoloMaxOrder),
 		"prompt_relevance":     d.PromptRelevance,
 		"roast_chance":         d.RoastChance,
 	}

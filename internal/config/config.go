@@ -80,6 +80,8 @@ type Config struct {
 	KNDiscount           float64 // PEREGRINE_KN_DISCOUNT
 	KNRawMix             float64 // PEREGRINE_KN_RAW_MIX
 	MinDistinctAuthors   int     // PEREGRINE_MIN_DISTINCT_AUTHORS
+	SoloRepeatLimit      int     // PEREGRINE_SOLO_REPEAT_LIMIT
+	SoloMaxOrder         int     // PEREGRINE_SOLO_MAX_ORDER
 	MinWords             int     // PEREGRINE_MIN_WORDS
 	MaxWords             int     // PEREGRINE_MAX_WORDS
 	CooccurrenceWindow   int     // PEREGRINE_COOCCURRENCE_WINDOW
@@ -366,6 +368,34 @@ func Load() (*Config, error) {
 		// on a live server: the default is 2 so that the safe direction is what an
 		// operator gets by doing nothing.
 		MinDistinctAuthors: l.intVal("PEREGRINE_MIN_DISTINCT_AUTHORS", 2, 0, 100),
+
+		// The count half of the same control, added in M24 after the first measurement of
+		// a real corpus (SPEC.md section 8, finding 54). An edge one person produced is
+		// admitted while its count is at or below this, because weight in this model is
+		// raw frequency and an edge with two occurrences cannot steer anything.
+		//
+		// The default is 2 rather than a rounder number because the measurement says the
+		// choice barely matters for output and therefore should be made on the safety
+		// side: in a 19,387-message corpus, 241,649 single-author edges exist, 3,184 of
+		// them reach a count of 2, and only 366 reach 3. Raising this to 5 would recover
+		// another 320 edges out of a quarter of a million, and would let one account write
+		// twice as much before corroboration is required.
+		//
+		// 0 disables the allowance and restores the pre-M24 gate exactly, which is the
+		// escape hatch if a live server turns out to poison itself.
+		SoloRepeatLimit: l.intVal("PEREGRINE_SOLO_REPEAT_LIMIT", 2, 0, 100),
+
+		// The order half, and it is the one that turned out to be load-bearing. A
+		// continuation reachable from a long context reproduces that much of somebody's
+		// original message, so allowing single-author edges at every order buys recitation
+		// rather than recombination: on the golden fixture it took the recitation rate from
+		// 2.4% to 19.8% against a 10% bar AND lowered the share of distinct output, because
+		// a chain following one source message is not varying (SPEC.md finding 57).
+		//
+		// 2 rather than 3 because both measured acceptably and 2 measured slightly better
+		// on variety, so the tie goes to the more conservative. 0 removes the order
+		// restriction, which is the configuration that failed the recitation bar.
+		SoloMaxOrder: l.intVal("PEREGRINE_SOLO_MAX_ORDER", 2, 0, 8),
 
 		// Length, live as of M7b. The old bound was 30 + rand(15) words, which is a
 		// paragraph. The cap's upper limit of 100 is deliberately well above anything
