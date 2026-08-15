@@ -299,14 +299,18 @@ func fixtureDict(t *testing.T, opts Options, mopts wordgame.Options) (
 // the scrambled word, a field for the hint and a three-clause footer.
 //
 // M28 took the embed away entirely, on feedback that a card every few minutes is a bot that keeps
-// interrupting. The line budget is the part that survives both, and it is the part that mattered:
-// the failure being prevented is vertical, because a message taking half a screen in a busy
-// channel is one people scroll past.
+// interrupting. The line budget is the part that survives every pass, and it is the part that
+// mattered: the failure being prevented is vertical, because a message taking half a screen in a
+// busy channel is one people scroll past.
+//
+// M29 spent one of those lines deliberately, on the call to action, and the budget moved from two
+// and three to three and four rather than the line being smuggled in against a stale number. A
+// budget nobody is allowed to change is a budget people route around.
 func TestAPuzzleIsTwoLinesAndThreeWhenHinted(t *testing.T) {
 	s, guard, _, _ := fixtureHinting(t)
 	s.start("c1")
 
-	assertPuzzleShape(t, onePuzzle(t, guard), 2, "live")
+	assertPuzzleShape(t, onePuzzle(t, guard), 3, "live")
 
 	time.Sleep(20 * time.Millisecond)
 	s.sweep()
@@ -315,7 +319,7 @@ func TestAPuzzleIsTwoLinesAndThreeWhenHinted(t *testing.T) {
 	if len(hinted) != 1 {
 		t.Fatalf("posted %d hinted announcements, want 1", len(hinted))
 	}
-	assertPuzzleShape(t, hinted[0], 3, "hinted")
+	assertPuzzleShape(t, hinted[0], 4, "hinted")
 
 	// And the mask REPLACED the letter count rather than joining it, which is what keeps the
 	// subtext to one line as it gains the round and hint counters.
@@ -334,11 +338,14 @@ func assertPuzzleShape(t *testing.T, msg string, maxLines int, state string) {
 		t.Errorf("%s message is %d lines, want at most %d:\n%s", state, len(lines), maxLines, msg)
 	}
 
-	// The scramble leads, as a header. Without an embed's box around it that is the only thing
-	// making the puzzle catch the eye of somebody skimming, so it is load-bearing rather than
-	// decorative.
-	if !strings.HasPrefix(msg, "## ") {
-		t.Errorf("%s message does not open on the scramble as a header:\n%s", state, msg)
+	// The call to action leads and the scramble is the header under it. The header is what makes
+	// a puzzle catch the eye of somebody skimming, since there is no embed box left to do it, so
+	// its being a header is load-bearing rather than decorative.
+	if !strings.HasPrefix(msg, "✨ ") {
+		t.Errorf("%s message does not open on the call to action:\n%s", state, msg)
+	}
+	if !strings.Contains(msg, "\n## ") {
+		t.Errorf("%s message does not carry the scramble as a header:\n%s", state, msg)
 	}
 
 	// Exactly one subtext line, at the bottom. Two would defeat the point, and one in the middle

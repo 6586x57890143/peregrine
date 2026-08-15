@@ -179,10 +179,15 @@ const maskFragment = `\_ \_`
 // them fails when the feature breaks and not when somebody rewrites a sentence.
 
 // puzzles returns every message that is a puzzle announcement, live or hinted.
+//
+// Identified by the header line carrying the scramble rather than by the message's first line,
+// because the call to action sits above it. Contains rather than HasPrefix for exactly that
+// reason: the header stopped being the opening line when the sparkles came back, and a prefix
+// check silently matched nothing.
 func (g *fakeGuard) puzzles() []string {
 	var out []string
 	for _, p := range g.posts() {
-		if strings.HasPrefix(p, "## ") {
+		if strings.Contains(p, "\n## ") || strings.HasPrefix(p, "## ") {
 			out = append(out, p)
 		}
 	}

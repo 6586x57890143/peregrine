@@ -305,6 +305,12 @@ func (s *Service) Guess(channelID, messageID, content, authorID, displayName str
 	// been worth on its own. A second scoring economy for runs would mean two ways to reach one
 	// leaderboard and a reason to argue about which was the real one.
 	s.board.AddWin(authorID, displayName, solveTime, points)
+	if won.Rounds > 0 {
+		// Asked of the GAME rather than of the Manager, because StartWord deletes the queue when
+		// the last round starts: a gauntlet is already "not running" by the time its final
+		// puzzle is solved, so anything gating on that would drop the win closing every run.
+		s.manager.RecordRunWin(channelID, authorID, displayName, points)
+	}
 	if err := s.save(); err != nil {
 		log.Printf("[WORDGAME] failed to persist a win: %v", err)
 	}
@@ -317,9 +323,19 @@ func (s *Service) Guess(channelID, messageID, content, authorID, displayName str
 	// one that broke, which is the shape finding 32 names: the bot's silence is a feature, the
 	// player's inability to tell what it meant is not.
 	if won.Rounds > 0 && won.Round == won.Rounds {
-		s.guard.Send(channelID, gauntletDoneMessage(won.Rounds))
+		s.finishRun(channelID, won.Rounds)
 	}
 	return true
+}
+
+// finishRun announces the end of a gauntlet and recaps what everybody took from it.
+//
+// One place, called from BOTH endings. It used to be inline in the win path only, so a run whose
+// last round timed out simply stopped with nothing said: finding 32's shape again, and the exact
+// thing this message exists to prevent. A run ending badly is the ending most likely to leave
+// people wondering whether the bot broke.
+func (s *Service) finishRun(channelID string, rounds int) {
+	s.guard.Send(channelID, gauntletDoneMessage(rounds, s.manager.TakeRunTally(channelID)))
 }
 
 // Command handles !wordgame and !leaderboard, and reports whether it recognized one.
@@ -610,6 +626,13 @@ func (s *Service) sweep() {
 		}
 		s.guard.Delete(g.ChannelID, g.MessageID)
 		log.Printf("[WORDGAME] Game timed out in channel %s.", g.ChannelID)
+
+		// A run whose LAST round nobody got still ends, and used to end in silence: the closing
+		// message was sent from the win path only, so the ending most likely to leave people
+		// wondering whether the bot broke was the one that said nothing.
+		if g.Rounds > 0 && g.Round == g.Rounds {
+			s.finishRun(g.ChannelID, g.Rounds)
+		}
 	}
 
 	// Gauntlet successors after the expiries, so a puzzle that just timed out can owe its
