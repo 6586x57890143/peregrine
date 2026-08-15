@@ -46,6 +46,11 @@ type Guard interface {
 	SendEmbed(channelID string, embed *discordgo.MessageEmbed) (*discordgo.Message, bool)
 	Edit(channelID, messageID, content string) bool
 	Delete(channelID, messageID string) bool
+
+	// The interaction half, M26. Respond is a gated send like every other method here;
+	// RegisterCommands is a write routed through the guard so it is logged and has one home.
+	Respond(i *discordgo.Interaction, content string, ephemeral bool) bool
+	RegisterCommands(appID string, commands []*discordgo.ApplicationCommand) bool
 }
 
 // Mode selects how puzzles start.
@@ -117,6 +122,12 @@ type Service struct {
 	loops       sync.WaitGroup
 	cancelLoops context.CancelFunc
 	logger      *slog.Logger
+
+	// The slash command's two dependencies, both filled in by Init from core.Deps. Nil in
+	// tests that do not exercise it, which every path here tolerates: a service that needed a
+	// gateway to be testable would be the shape internal/wordgame exists to avoid.
+	session    *discordgo.Session
+	dispatcher *core.Dispatcher
 }
 
 // New builds the service.
@@ -137,6 +148,16 @@ func (s *Service) Name() string { return "games" }
 // anything, unlike the corpus.
 func (s *Service) Init(deps core.Deps) error {
 	s.logger = deps.Logger
+	s.session = deps.Session
+	s.dispatcher = deps.Dispatcher
+
+	// Registered HERE rather than in Start, for the reason chat.Init states about its own
+	// handlers: discordgo begins dispatching inside session.Open, and Open happens between
+	// Init and Start, so a handler registered in Start drops everything that arrived in that
+	// window. For an interaction that means a command that silently never answers.
+	if s.session != nil {
+		s.session.AddHandler(s.onInteraction)
+	}
 
 	if err := s.store.View(func(r *storage.Reader) error {
 		v, err := r.GetBlob(storage.BlobLeaderboard, "current")
@@ -207,6 +228,13 @@ func (s *Service) Start(ctx context.Context) error {
 
 	for _, l := range loops {
 		core.RunLoop(loopCtx, &s.loops, s.logger, l)
+	}
+
+	// After READY, because it is a REST call and this is the first moment the bot's own
+	// application ID is knowable. Registration is idempotent and the set is a bulk overwrite,
+	// so doing it on every startup is how a renamed or removed command stops being visible.
+	if s.opts.Enabled {
+		s.registerCommands()
 	}
 	return nil
 }

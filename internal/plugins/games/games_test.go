@@ -31,6 +31,10 @@ type fakeGuard struct {
 	deletes []string
 	edited  map[string]string
 	refuse  bool
+
+	responses     []response
+	registered    []*discordgo.ApplicationCommand
+	registeredApp string
 }
 
 func (g *fakeGuard) Edit(_, messageID, content string) bool {
@@ -104,6 +108,38 @@ func (g *fakeGuard) Send(_, content string) (*discordgo.Message, bool) {
 	}
 	g.sent = append(g.sent, content)
 	return &discordgo.Message{ID: snowflake(870000 + len(g.sent))}, true
+}
+
+// responded records what the ephemeral half of a slash command said, separately from posts()
+// because the whole point of the split is that these two go to different audiences: a test that
+// merged them could not tell a public puzzle from a private refusal.
+type response struct {
+	content   string
+	ephemeral bool
+}
+
+func (g *fakeGuard) Respond(_ *discordgo.Interaction, content string, ephemeral bool) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.refuse {
+		return false
+	}
+	g.responses = append(g.responses, response{content: content, ephemeral: ephemeral})
+	return true
+}
+
+func (g *fakeGuard) RegisterCommands(appID string, commands []*discordgo.ApplicationCommand) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.registeredApp = appID
+	g.registered = commands
+	return true
+}
+
+func (g *fakeGuard) responded() []response {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]response(nil), g.responses...)
 }
 
 func (g *fakeGuard) Delete(_, messageID string) bool {

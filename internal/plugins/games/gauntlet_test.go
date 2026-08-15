@@ -249,6 +249,17 @@ func fixtureGauntlet(t *testing.T) (*Service, *fakeGuard, *wordgame.Manager, *ac
 	})
 }
 
+// fixtureDictOpts is fixtureGauntlet with different service Options, for the tests whose subject
+// is a flag rather than the game.
+func fixtureDictOpts(t *testing.T, opts Options) (*Service, *fakeGuard, *wordgame.Manager, *activity.Tracker) {
+	t.Helper()
+	return fixtureDict(t, opts, wordgame.Options{
+		Timeout:     time.Minute,
+		AnnounceTTL: 30 * time.Second,
+		GauntletMax: 10,
+	})
+}
+
 // fixtureDict wires the service over a one-word dictionary.
 func fixtureDict(t *testing.T, opts Options, mopts wordgame.Options) (
 	*Service, *fakeGuard, *wordgame.Manager, *activity.Tracker,
