@@ -159,33 +159,56 @@ func (g *fakeGuard) Delete(_, messageID string) bool {
 // Copy assertions survive only where the copy IS the behaviour: the round numbering, the stake
 // being visible before the first hint, and the refusal that names the length bounds.
 
-// maskFragment is what an unrevealed letter looks like on a card.
+// maskFragment is what an unrevealed letter looks like in a puzzle message.
 //
 // The escaped underscore from internal/wordgame's hidden constant, spelled out here rather than
 // imported, because it is unexported there and because a test that read the same constant the
 // renderer does could not tell a mask from an empty string.
 const maskFragment = `\_ \_`
 
-// cards returns every embed the bot posted with the given state colour.
-func (g *fakeGuard) cards(colour int) []*discordgo.MessageEmbed {
-	var out []*discordgo.MessageEmbed
-	for _, e := range g.posted() {
-		if e != nil && e.Color == colour {
-			out = append(out, e)
+// The structural assertions.
+//
+// Most of these tests used to ask "did the bot say the word Unscramble", which is really asking
+// "did a puzzle go up" and answering it through prose, so a copy change looked like a dozen
+// regressions. M27 moved them onto the embed's state colour; M28 took the embed away again, so
+// they read the message's PAYLOAD instead: the header line that carries the scramble, the mask
+// that only a hinted puzzle has, and the rung counter that only appears once one has landed.
+//
+// That is a better anchor than either. A colour was decoration the renderer happened to set, and
+// prose is wording; these are the things the message exists to convey, so a test asserting on
+// them fails when the feature breaks and not when somebody rewrites a sentence.
+
+// puzzles returns every message that is a puzzle announcement, live or hinted.
+func (g *fakeGuard) puzzles() []string {
+	var out []string
+	for _, p := range g.posts() {
+		if strings.HasPrefix(p, "## ") {
+			out = append(out, p)
 		}
 	}
 	return out
 }
 
-// onePuzzle asserts that exactly one live puzzle card went up, and returns it.
-func onePuzzle(t *testing.T, g *fakeGuard) *discordgo.MessageEmbed {
+// onePuzzle asserts that exactly one puzzle announcement went up, and returns it.
+func onePuzzle(t *testing.T, g *fakeGuard) string {
 	t.Helper()
-	live := g.cards(colourLive)
+	live := g.puzzles()
 	if len(live) != 1 {
-		t.Fatalf("posted %d live puzzle cards, want 1. All posts:\n%s",
+		t.Fatalf("posted %d puzzle announcements, want 1. All posts:\n%s",
 			len(live), strings.Join(g.posts(), "\n---\n"))
 	}
 	return live[0]
+}
+
+// hintedPuzzles are the announcements carrying a revealed mask.
+func (g *fakeGuard) hintedPuzzles() []string {
+	var out []string
+	for _, p := range g.puzzles() {
+		if strings.Contains(p, maskFragment) {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func (g *fakeGuard) posts() []string {
@@ -586,17 +609,15 @@ func TestTheSweepRepostsTheAnnouncementToDeliverAHint(t *testing.T) {
 	if len(posts) != 2 {
 		t.Fatalf("posts = %d, want the puzzle and then the card that replaced it", len(posts))
 	}
-	// Structural rather than by wording. The colour is the field that says which of the four
-	// states a card is in, and a mask is the thing a hint actually adds.
-	hinted := guard.cards(colourHinted)
+	// Structural rather than by wording: a mask is the thing a hint actually adds, and the rung
+	// counter only appears once one has landed.
+	hinted := guard.hintedPuzzles()
 	if len(hinted) != 1 {
-		t.Fatalf("posted %d hinted cards, want 1:\n%s", len(hinted), strings.Join(posts, "\n---\n"))
+		t.Fatalf("posted %d hinted announcements, want 1:\n%s",
+			len(hinted), strings.Join(posts, "\n---\n"))
 	}
-	if !strings.Contains(hinted[0].Description, maskFragment) {
-		t.Errorf("the repost carries no mask, so it is not a hint:\n%s", hinted[0].Description)
-	}
-	if !strings.Contains(hinted[0].Description, "hint 1/") {
-		t.Errorf("the repost does not say which rung it is:\n%s", hinted[0].Description)
+	if !strings.Contains(hinted[0], "hint 1/") {
+		t.Errorf("the repost does not say which rung it is:\n%s", hinted[0])
 	}
 	if got := guard.edits(); len(got) != 0 {
 		t.Errorf("the hint was delivered by editing (%v); that is the behaviour M25 replaced, "+

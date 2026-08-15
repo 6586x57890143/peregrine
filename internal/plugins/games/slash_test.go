@@ -110,7 +110,7 @@ func TestThePuzzleIsPublicAndTheAcknowledgementIsNot(t *testing.T) {
 	if !replies[0].ephemeral {
 		t.Error("the acknowledgement was public, so the command announces itself twice")
 	}
-	if strings.Contains(replies[0].content, puzzle.Description) {
+	if strings.Contains(replies[0].content, puzzle) {
 		t.Error("the puzzle was sent as the ephemeral answer, so only the caller can play it")
 	}
 }
