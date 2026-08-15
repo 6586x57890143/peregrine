@@ -76,6 +76,12 @@ type Session interface {
 	// in front of the whole server, so the one place that knows how to gate text should be
 	// the one place that sets it.
 	UpdateStatusComplex(usd discordgo.UpdateStatusData) error
+
+	// The interaction half, added in M26 with the first slash command this bot has ever
+	// registered. Responding is a SEND and is gated like one; registering is a write and is
+	// here for the reason Delete is, so that every Discord call has one place that logs it.
+	InteractionRespond(interaction *discordgo.Interaction, resp *discordgo.InteractionResponse, options ...discordgo.RequestOption) error
+	ApplicationCommandBulkOverwrite(appID, guildID string, commands []*discordgo.ApplicationCommand, options ...discordgo.RequestOption) ([]*discordgo.ApplicationCommand, error)
 }
 
 // EmitGate is the outbound half of internal/safety. *safety.Gate satisfies it.
@@ -398,6 +404,118 @@ func (g *Guard) Unreact(channelID, messageID, emoji, userID string) bool {
 		g.log.Info("discord reaction removal failed", "channel", channelID, "message", messageID, "err", err)
 		return false
 	}
+	return true
+}
+
+// Respond answers a slash command, gated and suppressed exactly like a channel send.
+//
+// # An ephemeral reply is still the bot speaking
+//
+// "Only the person who asked can see it" narrows who is harmed; it does not change whether the
+// bot said it. So this runs the same CheckEmit and the same pause switch as everything else, and
+// sets AllowedMentions explicitly rather than trusting that a private message cannot ping. The
+// text arriving here is assembled from things people typed, exactly like a reply is.
+//
+// The ignore list applies too, on the interaction's channel. An operator who said "not in there"
+// meant it about the whole bot, and a slash command is a way into a channel like any other.
+//
+// ephemeral is the caller's choice rather than this package's, because the two answers a command
+// gives want different audiences: a refusal belongs to the person refused, and a puzzle belongs
+// to the channel.
+func (g *Guard) Respond(i *discordgo.Interaction, content string, ephemeral bool) bool {
+	if i == nil {
+		return false
+	}
+	if !g.permit(i.ChannelID, content, "respond") {
+		return false
+	}
+
+	data := &discordgo.InteractionResponseData{
+		Content:         content,
+		AllowedMentions: allowedMentions(),
+	}
+	if ephemeral {
+		data.Flags = discordgo.MessageFlagsEphemeral
+	}
+
+	if err := g.session.InteractionRespond(i, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: data,
+	}); err != nil {
+		// An Error, matching Send rather than Delete: somebody typed a command and got
+		// nothing, and Discord gives an interaction three seconds before it shows the user a
+		// failure of its own. A silent one here is a bot that looks broken to the one person
+		// who was definitely paying attention.
+		g.log.Error("discord interaction response failed", "channel", i.ChannelID, "err", err)
+		return false
+	}
+	return true
+}
+
+// RespondEmbed is Respond with an embed, gated over every text field like SendEmbed.
+func (g *Guard) RespondEmbed(i *discordgo.Interaction, embed *discordgo.MessageEmbed, ephemeral bool) bool {
+	if i == nil || embed == nil {
+		return false
+	}
+	if !g.permit(i.ChannelID, embedText(embed), "respond-embed") {
+		return false
+	}
+
+	data := &discordgo.InteractionResponseData{
+		Embeds:          []*discordgo.MessageEmbed{embed},
+		AllowedMentions: allowedMentions(),
+	}
+	if ephemeral {
+		data.Flags = discordgo.MessageFlagsEphemeral
+	}
+
+	if err := g.session.InteractionRespond(i, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: data,
+	}); err != nil {
+		g.log.Error("discord interaction embed response failed", "channel", i.ChannelID, "err", err)
+		return false
+	}
+	return true
+}
+
+// RegisterCommands replaces the bot's application commands with exactly this set.
+//
+// # Not content-gated, and not pause-gated
+//
+// A command definition is the bot's own text, written in this repository and never assembled
+// from anything a user typed, so there is nothing for CheckEmit to judge; it is the same
+// category as the emoji an operator configured for React. And PAUSE_ALL_WRITES is a mute, not a
+// deregistration: refusing this during an incident would leave the commands registered anyway,
+// since they persist on Discord's side, while making the next clean startup fail to correct
+// them. The pause stops the bot SAYING things, and Respond above is where that bites.
+//
+// It is routed through the guard regardless, for the reason Delete is: one place knows about
+// every Discord call and logs it, and a command registered from somewhere else is a command
+// nobody can find the source of.
+//
+// A bulk overwrite rather than one create per command, because it is idempotent and it DELETES
+// what is no longer listed. Creating individually leaves a renamed or dropped command visible in
+// every client forever, which an operator can only fix by hand.
+func (g *Guard) RegisterCommands(appID string, commands []*discordgo.ApplicationCommand) bool {
+	if appID == "" {
+		// Empty means the bot's identity was not resolved, and registering against an empty
+		// application ID is a REST call that cannot succeed. Named rather than attempted,
+		// because the failure otherwise reads as a Discord problem.
+		g.log.Error("refusing to register application commands with no application ID")
+		return false
+	}
+
+	// Global rather than per guild. Guild commands appear instantly and global ones can take
+	// up to an hour to propagate, but guild registration means enumerating guilds and
+	// re-registering on every join, which is a second thing to keep in step for a bot whose
+	// commands are the same everywhere.
+	registered, err := g.session.ApplicationCommandBulkOverwrite(appID, "", commands)
+	if err != nil {
+		g.log.Error("discord command registration failed", "err", err)
+		return false
+	}
+	g.log.Info("application commands registered", "count", len(registered))
 	return true
 }
 
