@@ -43,6 +43,28 @@ func TestNothingBypassesTheGuard(t *testing.T) {
 		"ChannelMessageDelete":      true,
 		"MessageReactionAdd":        true,
 		"MessageReactionRemove":     true,
+
+		// Interactions, added in M26 with the first slash command this bot has ever had.
+		//
+		// An interaction response is a SEND: it puts text in front of people, it can carry a
+		// mention, and it is exactly as capable of saying something the operator has to answer
+		// for as a channel message. Adding the handler without adding these would have opened a
+		// speaking path that skips CheckEmit, PAUSE_ALL_WRITES and PEREGRINE_IGNORE_CHANNELS
+		// all at once, which is the same gap the split left when MessageReactionRemove was
+		// missing, on a bigger surface.
+		//
+		// Ephemeral does not exempt anything. "Only the person who asked can see it" narrows
+		// who is harmed, not whether the bot said it, and the pause switch is about the bot
+		// being quiet rather than about the audience.
+		"InteractionRespond":      true,
+		"InteractionResponseEdit": true,
+		"FollowupMessageCreate":   true,
+
+		// Registration is not speaking, and is here for the other reason Delete is in the
+		// guard: every Discord write has one place that knows about it and logs it. A command
+		// registered from somewhere else is a command nobody can find the source of.
+		"ApplicationCommandCreate":        true,
+		"ApplicationCommandBulkOverwrite": true,
 	}
 
 	// Empty, and that is the point. Every adapter that used to be permitted here has been

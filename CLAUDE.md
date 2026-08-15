@@ -241,6 +241,10 @@ The dictionary load used to be `log.Fatalf`, so a missing 64 KB word list killed
 
 **`MaybeStart` asks the counter outside its own lock**, because the counter is another package's mutex and holding one lock while taking another is how a lock-ordering deadlock gets built. Nothing needs the count and the game map to be consistent with each other; the worst case is a game started on a count that was true a microsecond ago.
 
+**`/wordgame` is the blessed path and `!wordgame` still works.** A soft move: nobody's muscle memory breaks. The slash command is what M21b's dilemma needed, because its answers can be **ephemeral**. Answering a non-admin in the channel advertises that the command exists and that they are not allowed to use it, so the bang command refuses in silence, and the case that actually bit was the operator's own: with `PEREGRINE_BOOTSTRAP_ADMIN_USER_ID` unset the check fails closed and refuses the person who deployed the bot, with the reason only in the log. A private reply says no to the person who asked and to nobody else.
+
+**Every exit from the interaction handler answers, which is finding 32 inverted.** The bot staying quiet in a channel is a design decision; an interaction that is never responded to is Discord showing the caller a red failure after three seconds. The acknowledgement is ephemeral and the **puzzle is a normal channel post**, which is the split that makes this worth doing: what everybody should see goes to the channel, what only the operator needs goes to the operator. Permissions arrive already computed in the payload, so this path makes no REST call and consults no cache, and feeds the same one `Authorized` the bang path resolves from the state cache. The handler registers in `Init` (discordgo dispatches inside `Open`, which happens between `Init` and `Start`) and dispatches through `core.Dispatcher`; command registration happens in `Start`, because it is a REST call and the first moment the application ID is knowable.
+
 **A refusal that says nothing is the bug, not the silence itself.** `!wordgame` used to `return` on
 an unauthorized caller with no log line and no reply, which is indistinguishable from a broken
 bot. The case that actually bit is the operator's: with `PEREGRINE_BOOTSTRAP_ADMIN_USER_ID`
@@ -250,13 +254,85 @@ too. It stays silent **in the channel**, which is a different decision: answerin
 advertises that the command exists and that they are not allowed to use it. That is finding 32's
 shape in a command rather than in the reply path.
 
-**A hint is not a fourth timer.** `HintAt` is a field on the `Game` and `DueHints` is swept by
-the sweep that already expires puzzles, so it costs no goroutine and inherits `RunLoop`'s panic
-isolation and context binding for free. It **edits** the announcement rather than posting again,
-so the hint arrives where people are already looking, and a game whose announcement the guard
-refused is skipped rather than returned, because there is nothing to edit.
+**A hint is not a fourth timer.** `NextHintAt` is a field on the `Game` and `DueHints` is swept
+by the sweep that already expires puzzles, so it costs no goroutine and inherits `RunLoop`'s
+panic isolation and context binding for free. A game whose announcement the guard refused is
+skipped rather than returned, because there is nothing to replace.
 `PEREGRINE_WORDGAME_HINT_AFTER` at or above `PEREGRINE_WORDGAME_TIMEOUT` is a startup error
 naming both: a hint due after the puzzle has ended is a knob wired to nothing.
+
+**M25 made the hint a LADDER, and reversed M21b's edit into a repost.** Both halves are in
+`internal/wordgame/hint.go` and the reasoning is worth knowing before either is undone:
+
+- **The rungs are a price, not a gift.** A solve is worth `PointsBase` less the rungs actually
+  delivered, floored at one, so waiting for more letters is a trade against guessing now. That
+  is the only decision this game has ever offered a player; before it, every round paid the same
+  and the only skill was typing speed. `PEREGRINE_WORDGAME_POINTS_BASE` at or below
+  `PEREGRINE_WORDGAME_HINT_LEVELS` is a startup error naming both, because a floored score makes
+  the last rungs free and the trade quietly stops existing. That is worse than a knob wired to
+  nothing: the feature still looks like it works.
+- **The reveal ORDER is fixed once, at start.** That is what makes rung k a superset of rung
+  k-1. Drawing positions per rung would let a letter shown at rung 2 disappear at rung 3, and a
+  hint that takes something back is worse than no hint. The opening letter always leads.
+- **The configured rung count is a ceiling, not a promise.** `ladder()` drops a rung that would
+  reveal nothing the one below it did not, and keeps at least two letters hidden however far it
+  goes, so a short word gets a SHORTER ladder rather than rungs a player pays for and learns
+  nothing from. `Game.Rungs()` is the real number and the schedule divides by it.
+- **`DueHints` does not mutate, and `HintDelivered` is the acknowledgement.** The guard can
+  refuse a repost, and advancing the level anyway charges the eventual winner for help nobody
+  saw. It also returns **copies** carrying the PENDING level: the live games are still in the
+  map where `Guess` and `Announced` write to them, and the caller has to render the card as it
+  *will* look or the repost goes out as a hint card with no hint on it. Both were found by
+  tests rather than by reading.
+- **A repost, and the new card goes up BEFORE the old one comes down.** M21b chose an edit
+  because a hint "arrives where people are already looking", which holds only while the
+  announcement is still on screen; in a busy channel an edit to a card twenty messages up is
+  invisible, so the feature meant to rescue a stalling puzzle did nothing at the one moment it
+  mattered. Deleting first would open a window where a live puzzle has no card at all, and a
+  refused or rate-limited send never closes it. Same shape as backup's temp-then-rename.
+  `Announced` returns the superseded ID so nothing leaks when a win races the repost.
+
+**`announce` must not abandon the game, and the caller decides.** It serves two moments that
+want opposite things from a refusal: a puzzle whose FIRST card was refused is invisible and has
+to be abandoned or it blocks the channel until it times out, whereas a puzzle whose HINT was
+refused still has its original card up and is perfectly playable. Folding the abandon into the
+shared function deleted live games, and the test that found it was asking what a refused hint
+costs the winner.
+
+**A gauntlet advances on the previous puzzle CONCLUDING, not on a clock.** `!wordgame <n>`
+queues a run; the first puzzle starts immediately and every later one comes from `DueStarts`,
+collected by the sweep, so a slow round pushes the rest back instead of stacking puzzles. Both
+endings count, because recording only the solve would stall a run on the ending nobody is around
+for. The queue maps are bounded by `MaxChannels` (this repo has shipped an unbounded per-channel
+map twice) and live in memory only: a gauntlet is a five-minute event, so a restart dropping it
+is correct, where a week of wins is not re-derivable and is persisted. A run cancels on
+`Abandon`, because the guard refuses for reasons that do not clear on their own and the
+alternative is marching the whole gauntlet through the same refusal one puzzle at a time. A
+gauntlet win is an **ordinary** win worth ordinary points: the run is pacing, not a second
+scoring economy.
+
+**The board ranks by points and `BackfillPoints` converts a week already in progress.** It lives
+in `games.Init` rather than in `internal/wordgame` because `PointsBase` is configuration and that
+package reads none, which is the same rule `ScanTopics` states about its filters living in
+`health`. Old wins convert at the full no-hint value, which is generous on purpose: the
+alternative ranks an active server off a field that is zero for everybody, overpaying preserves
+the ORDER players actually notice, and the next weekly reset makes it moot.
+
+**`Authorized` widened to guild Administrator and is still one function.** It takes a
+`Requester` carrying Discord's computed permissions, resolved from the **state cache** on the
+bang path (no REST call, available since M3 added `IntentsGuilds`) and failing closed on a miss.
+A bot whose games only start when one specific user is awake is a bot whose games mostly do not
+start, and deferring to the decision the server already made beats maintaining a worse second
+opinion about it. The failure mode a second copy would have is the empty case, which fails
+**open**, and no behavioural test can cover the command nobody has written yet.
+
+**Puzzles are embeds, and Components V2 is deliberately not adopted yet.** `Guard.SendEmbed`
+already runs `CheckEmit` over every text field, so the richer card cost no new gate surface. V2
+exists in discordgo v0.29 and the one thing it uniquely buys is a button beside the text, but
+its flag **disables `content` and `embeds`**, so `embedText` would stop covering these messages
+and a recursive component walker would become load-bearing safety code, over an interface whose
+unknown types a walker silently skips. Paying that for layout polish while the payoff needs an
+interaction handler nobody has built is the wrong order.
 
 **A planted word is held to the dictionary's own rules, through the same function.**
 `LoadDictionary` excludes words with fewer than two distinct letters *specifically* because
@@ -474,7 +550,11 @@ discordgo will not stop it. Its send helpers build a request with a nil `Allowed
 
 **Deletes are not content-gated and reactions are.** A delete says nothing and cannot ping, so gating it would stop the bot cleaning up during exactly the incident it needs to. A reaction is the bot visibly participating, so `PAUSE_ALL_WRITES` has to stop it. `Unreact` is the mirror image and is *not* pause-gated: taking a reaction back is withdrawing, and refusing it would leave the bot's mark on someone's message with no way to remove it until the pause lifts.
 
-**A forbidden-call list is only as good as its enumeration.** The M10b split dropped a `MessageReactionRemove` call and `TestNothingBypassesTheGuard` did not notice, because that method was missing from the list. When the guard grows a method, the list grows with it.
+**A forbidden-call list is only as good as its enumeration.** The M10b split dropped a `MessageReactionRemove` call and `TestNothingBypassesTheGuard` did not notice, because that method was missing from the list. When the guard grows a method, the list grows with it. M26 is the same lesson applied before the fact rather than after: `InteractionRespond` was absent, so a slash command handler written first and gated later would have opened a speaking path skipping `CheckEmit`, `PAUSE_ALL_WRITES` and `PEREGRINE_IGNORE_CHANNELS` at once. The list entry went in **before** the handler, so the test was failing for the right reason while the feature was built.
+
+**An interaction response is a send, and ephemeral exempts nothing.** `Guard.Respond` and `Guard.RespondEmbed` run the same content gate, the same pause switch, the same ignore list and the same explicit `AllowedMentions` as a channel message. "Only the person who asked can see it" narrows who is harmed, not whether the bot said it, and the pause is about the bot being quiet rather than about the audience. A failed response logs at **Error**, unlike a failed delete: somebody typed a command, Discord gives an interaction three seconds before showing them a failure of its own, and a silent one is a bot that looks broken to the one person definitely paying attention.
+
+**`Guard.RegisterCommands` is deliberately neither content nor pause gated.** A command definition is the bot's own text from this repository, never assembled from anything a user typed, so there is nothing for `CheckEmit` to judge; it is React's category rather than Send's. And the pause is a **mute, not a deregistration**: commands persist on Discord's side, so refusing this during an incident would leave them registered anyway while making the next clean startup fail to correct them. It is routed through the guard for the reason `Delete` is, so every Discord call has one place that logs it. A **bulk overwrite** rather than per-command creates, because it deletes what is no longer listed: creating individually leaves a renamed or dropped command visible in every client forever.
 
 **`PEREGRINE_IGNORE_CHANNELS` is enforced in the guard, not the reply path.** An operator setting it means "not in there", not "not in reply to a message in there", so the autonomous poster and word games have to respect it. It does not stop *learning* from those channels, which is the same asymmetry `PAUSE_ALL_WRITES` has.
 

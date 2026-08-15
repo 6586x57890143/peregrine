@@ -25,11 +25,33 @@ type fakeSession struct {
 	reactErr    error
 	unreactErr  error
 	presenceErr error
+
+	responses       []*discordgo.InteractionResponse
+	respondErr      error
+	registered      []*discordgo.ApplicationCommand
+	registeredApp   string
+	registeredGuild string
+	registerErr     error
 }
 
 func (f *fakeSession) UpdateStatusComplex(usd discordgo.UpdateStatusData) error {
 	f.presences = append(f.presences, usd)
 	return f.presenceErr
+}
+
+func (f *fakeSession) InteractionRespond(_ *discordgo.Interaction, resp *discordgo.InteractionResponse, _ ...discordgo.RequestOption) error {
+	f.responses = append(f.responses, resp)
+	return f.respondErr
+}
+
+func (f *fakeSession) ApplicationCommandBulkOverwrite(appID, guildID string, commands []*discordgo.ApplicationCommand, _ ...discordgo.RequestOption) ([]*discordgo.ApplicationCommand, error) {
+	f.registeredApp = appID
+	f.registeredGuild = guildID
+	f.registered = commands
+	if f.registerErr != nil {
+		return nil, f.registerErr
+	}
+	return commands, nil
 }
 
 func (f *fakeSession) ChannelMessageSendComplex(channelID string, data *discordgo.MessageSend, _ ...discordgo.RequestOption) (*discordgo.Message, error) {
@@ -564,5 +586,190 @@ func TestAFailedPresenceUpdateReportsFailure(t *testing.T) {
 
 	if g.Presence("watching 12 n-grams") {
 		t.Error("Presence reported success after the session returned an error")
+	}
+}
+
+// ---------------------------------------------------------------- interactions, M26
+
+// TestAnEphemeralResponseIsStillGated.
+//
+// The whole reason InteractionRespond was added to the forbidden list. An interaction response
+// puts text in front of somebody and can carry a mention, so it is a send; "only the person who
+// asked can see it" narrows who is harmed, not whether the bot said it.
+//
+// A slash command is also the surface an operator reaches for during an incident, which is
+// exactly when PAUSE_ALL_WRITES is on, so a response that ignored the pause would be a hole
+// opening at the worst moment.
+func TestAnEphemeralResponseIsStillGated(t *testing.T) {
+	f := &fakeSession{}
+	g := newGuard(f, &blockAll{})
+
+	i := &discordgo.Interaction{ChannelID: "c1"}
+	if g.Respond(i, "anything at all", true) {
+		t.Error("an ephemeral response was sent past a refusing gate")
+	}
+	if len(f.responses) != 0 {
+		t.Errorf("the refused response reached Discord anyway: %v", f.responses)
+	}
+}
+
+// TestAResponseSuppressesMentions, set explicitly rather than trusted to be impossible.
+//
+// Whether an ephemeral message can ping is the same kind of question as whether an embed can,
+// and allowedMentions' own comment refuses to lean on that sort of reading: setting the field
+// costs one struct and depends on nothing.
+func TestAResponseSuppressesMentions(t *testing.T) {
+	f := &fakeSession{}
+	g := newGuard(f, allowAll{})
+
+	if !g.Respond(&discordgo.Interaction{ChannelID: "c1"}, "hello", true) {
+		t.Fatal("Respond refused an ordinary message")
+	}
+	if len(f.responses) != 1 {
+		t.Fatalf("responses = %d, want 1", len(f.responses))
+	}
+
+	data := f.responses[0].Data
+	if data.AllowedMentions == nil {
+		t.Fatal("the response carries no AllowedMentions, so Discord parses every mention in it")
+	}
+	am := data.AllowedMentions
+	if am.Parse == nil || len(am.Parse) != 0 {
+		t.Errorf("Parse = %v, want an explicitly empty slice", am.Parse)
+	}
+	if am.Roles == nil || am.Users == nil {
+		t.Error("Roles or Users is nil, which marshals as null rather than as an empty array")
+	}
+	if am.RepliedUser {
+		t.Error("RepliedUser is true")
+	}
+	if data.Flags&discordgo.MessageFlagsEphemeral == 0 {
+		t.Error("the ephemeral flag was not set, so a private answer went to the whole channel")
+	}
+}
+
+// TestAPublicResponseIsNotEphemeral, because the caller chooses the audience: a refusal belongs
+// to the person refused and a puzzle belongs to the channel.
+func TestAPublicResponseIsNotEphemeral(t *testing.T) {
+	f := &fakeSession{}
+	g := newGuard(f, allowAll{})
+
+	if !g.Respond(&discordgo.Interaction{ChannelID: "c1"}, "hello", false) {
+		t.Fatal("Respond refused an ordinary message")
+	}
+	if f.responses[0].Data.Flags&discordgo.MessageFlagsEphemeral != 0 {
+		t.Error("a response asked to be public was sent ephemeral")
+	}
+}
+
+// TestAResponseInAnIgnoredChannelIsRefused. An operator who said "not in there" meant it about
+// the whole bot, and a slash command is a way into a channel like any other.
+func TestAResponseInAnIgnoredChannelIsRefused(t *testing.T) {
+	f := &fakeSession{}
+	g := newGuard(f, allowAll{}, "c1")
+
+	if g.Respond(&discordgo.Interaction{ChannelID: "c1"}, "hello", true) {
+		t.Error("a response was sent into an ignored channel")
+	}
+	if g.Respond(&discordgo.Interaction{ChannelID: "c1"}, "hello", false) {
+		t.Error("a public response was sent into an ignored channel")
+	}
+	if len(f.responses) != 0 {
+		t.Errorf("responses reached Discord from an ignored channel: %v", f.responses)
+	}
+}
+
+// TestARespondEmbedIsGatedOverEveryField, matching SendEmbed. A blocklisted word in a field
+// value is exactly as much of an incident as one in the description, and which of them it landed
+// in is an accident of how the caller built the embed.
+func TestARespondEmbedIsGatedOverEveryField(t *testing.T) {
+	f := &fakeSession{}
+	g := newGuard(f, blockMatching{bad: "badword"})
+
+	embed := &discordgo.MessageEmbed{
+		Title:  "fine",
+		Fields: []*discordgo.MessageEmbedField{{Name: "fine", Value: "badword"}},
+	}
+	if g.RespondEmbed(&discordgo.Interaction{ChannelID: "c1"}, embed, true) {
+		t.Error("an embed with a blocked word in a FIELD was responded with")
+	}
+	if len(f.responses) != 0 {
+		t.Errorf("it reached Discord anyway: %v", f.responses)
+	}
+}
+
+// TestANilInteractionIsRefusedRatherThanPanicking. The handler builds these from a gateway
+// payload, and a malformed one must not take the process down: a panic here is one feature's bad
+// day becoming everybody's.
+func TestANilInteractionIsRefusedRatherThanPanicking(t *testing.T) {
+	f := &fakeSession{}
+	g := newGuard(f, allowAll{})
+
+	if g.Respond(nil, "hello", true) {
+		t.Error("a nil interaction was answered")
+	}
+	if g.RespondEmbed(nil, &discordgo.MessageEmbed{Title: "x"}, true) {
+		t.Error("a nil interaction was answered with an embed")
+	}
+	if g.RespondEmbed(&discordgo.Interaction{ChannelID: "c1"}, nil, true) {
+		t.Error("a nil embed was sent")
+	}
+}
+
+// TestRegisteringCommandsIsABulkOverwrite.
+//
+// Idempotent, and it DELETES what is no longer listed. Creating commands one at a time leaves a
+// renamed or dropped command visible in every client forever, which an operator can only fix by
+// hand and will not think to.
+func TestRegisteringCommandsIsABulkOverwrite(t *testing.T) {
+	f := &fakeSession{}
+	g := newGuard(f, allowAll{})
+
+	cmds := []*discordgo.ApplicationCommand{{Name: "wordgame", Description: "start a puzzle"}}
+	if !g.RegisterCommands("app1", cmds) {
+		t.Fatal("registration was refused")
+	}
+	if f.registeredApp != "app1" {
+		t.Errorf("registered against app %q, want app1", f.registeredApp)
+	}
+	if f.registeredGuild != "" {
+		t.Errorf("registered against guild %q, want global registration: per-guild means "+
+			"enumerating guilds and re-registering on every join", f.registeredGuild)
+	}
+	if len(f.registered) != 1 {
+		t.Errorf("registered %d commands, want 1", len(f.registered))
+	}
+}
+
+// TestRegisteringWithNoApplicationIDIsNamedRatherThanAttempted. An empty ID means the bot's
+// identity was not resolved, and a REST call that cannot succeed produces a Discord error that
+// reads like Discord's fault.
+func TestRegisteringWithNoApplicationIDIsNamedRatherThanAttempted(t *testing.T) {
+	f := &fakeSession{}
+	g := newGuard(f, allowAll{})
+
+	if g.RegisterCommands("", []*discordgo.ApplicationCommand{{Name: "wordgame"}}) {
+		t.Error("registration was attempted with no application ID")
+	}
+	if f.registered != nil {
+		t.Error("it called Discord anyway")
+	}
+}
+
+// TestRegisteringIsNotPauseGated, which is deliberate and worth stating because everything else
+// that reaches Discord here is.
+//
+// A command definition is the bot's own text from this repository, never assembled from anything
+// a user typed, so there is nothing for the content gate to judge. And the pause is a MUTE, not a
+// deregistration: commands persist on Discord's side, so refusing this during an incident would
+// leave them registered anyway while making the next clean startup fail to correct them. What
+// the pause has to stop is the bot SAYING things, which is Respond.
+func TestRegisteringIsNotPauseGated(t *testing.T) {
+	f := &fakeSession{}
+	g := newGuard(f, &blockAll{})
+
+	if !g.RegisterCommands("app1", []*discordgo.ApplicationCommand{{Name: "wordgame"}}) {
+		t.Error("registration was refused by the emit gate; a command definition is not " +
+			"user text, and a paused bot still needs its commands to be correct")
 	}
 }

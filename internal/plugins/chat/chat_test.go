@@ -23,6 +23,7 @@ import (
 	"github.com/6586x57890143/peregrine/internal/generate"
 	"github.com/6586x57890143/peregrine/internal/learn"
 	"github.com/6586x57890143/peregrine/internal/names"
+	"github.com/6586x57890143/peregrine/internal/plugins/games"
 	"github.com/6586x57890143/peregrine/internal/plugins/images"
 	"github.com/6586x57890143/peregrine/internal/safety"
 	"github.com/6586x57890143/peregrine/internal/storage"
@@ -87,9 +88,10 @@ func (i *fakeImages) MaybeRepost(string, bool)                                  
 func (i *fakeImages) Forget(ids ...string)                                        { i.forgot = append(i.forgot, ids...) }
 
 type fakeGames struct {
-	guesses  int
-	commands []string
-	consume  bool
+	guesses    int
+	commands   []string
+	requesters []games.Requester
+	consume    bool
 }
 
 func (g *fakeGames) Guess(string, string, string, string, string) bool {
@@ -97,11 +99,12 @@ func (g *fakeGames) Guess(string, string, string, string, string) bool {
 	return false
 }
 
-func (g *fakeGames) Command(cmd, arg, _, _ string, _ func(string) string) bool {
+func (g *fakeGames) Command(cmd, arg, _ string, who games.Requester, _ func(string) string) bool {
 	if arg != "" {
 		cmd += " " + arg
 	}
 	g.commands = append(g.commands, cmd)
+	g.requesters = append(g.requesters, who)
 	return g.consume
 }
 
