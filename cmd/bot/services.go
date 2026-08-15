@@ -84,6 +84,8 @@ func registerServices(
 		KNDiscount:         cfg.KNDiscount,
 		KNRawMix:           cfg.KNRawMix,
 		MinDistinctAuthors: cfg.MinDistinctAuthors,
+		SoloRepeatLimit:    cfg.SoloRepeatLimit,
+		SoloMaxOrder:       cfg.SoloMaxOrder,
 		PromptRelevance:    cfg.PromptRelevanceBoost,
 		RoastChance:        cfg.RoastChance,
 	}

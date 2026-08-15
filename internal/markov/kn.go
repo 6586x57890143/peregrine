@@ -44,6 +44,10 @@ type candidate struct {
 	count   uint64
 	authors uint32
 
+	// order is the LONGEST context this continuation was found at, which is the one
+	// that decides how much of somebody's original message following it reproduces.
+	order int
+
 	// logProb is log P(token | context) from interpolated Kneser-Ney, and logit is
 	// that plus every heuristic. They are kept separate so a test can assert about
 	// the model without the heuristics, and so the golden harness can print both.
@@ -289,6 +293,7 @@ func (m *model) enumerate(ctxs []string) ([]candidate, error) {
 	type seen struct {
 		count   uint64
 		authors uint32
+		order   int
 	}
 	pool := make(map[string]seen)
 
@@ -337,9 +342,9 @@ func (m *model) enumerate(ctxs []string) ([]candidate, error) {
 			if _, dup := pool[s.Token]; dup {
 				continue
 			}
-			pool[s.Token] = seen{count: s.Count, authors: s.Authors}
+			pool[s.Token] = seen{count: s.Count, authors: s.Authors, order: m.minCtxWords}
 			added++
-			if m.g.admits(s.Token, s.Authors) {
+			if m.g.admits(s.Token, s.Count, s.Authors, m.minCtxWords) {
 				survivors++
 			}
 		}
@@ -386,6 +391,7 @@ func (m *model) enumerate(ctxs []string) ([]candidate, error) {
 			token:   t,
 			count:   s.count,
 			authors: s.authors,
+			order:   s.order,
 			logProb: math.Log(p),
 		})
 	}
