@@ -2,6 +2,7 @@ package games
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
@@ -11,7 +12,7 @@ import (
 
 // The puzzle's rendering.
 //
-// # Why an embed rather than the plain strings it replaces
+// # Why an embed rather than the plain strings it replaced
 //
 // The same argument embed.go makes about the leaderboard, plus one this feature has that the
 // leaderboard does not: a puzzle has STATE. It is live, or it has been hinted, or it was solved,
@@ -23,13 +24,29 @@ import (
 // A Discord relative timestamp counts down on its own, in the reader's own timezone, without the
 // bot editing anything, which is the same reason the leaderboard renders its reset that way.
 //
+// # The M27 pass: a card is two lines, three when hinted
+//
+// The first version of this spent four embed slots (title, description, a field, footer) on what
+// is really two facts, and read like a productivity app in a server whose bot talks in lowercase.
+// It said "Unscramble this word:" above a scrambled word, titled itself "Word Scramble" on a card
+// whose entire content is a word scramble, and closed with a three-clause footer.
+//
+// So: description only. The scramble is a header, the mask sits under it, and everything else
+// collapses into ONE line of subtext. The four state colours are unchanged and are now doing the
+// work the deleted title used to.
+//
+// The copy is deadpan lowercase, and that is the opposite of what "match the server's register"
+// naively implies. This chrome repeats on EVERY puzzle, and a fixed joke stops being funny by the
+// fourth time; peregrine's chaos belongs in the generated text, which varies. Furniture should be
+// flat and get out of the way.
+//
 // # Everything here still goes through Guard.SendEmbed
 //
 // Which runs CheckEmit over EVERY text field rather than the description alone. The winner's
 // nickname is interpolated into one of these, and a nickname is user-controlled text: even a
 // message the bot composes itself is untrusted-input-shaped. Nothing here needed a new gate,
-// which is precisely why this milestone renders embeds and not Components V2, whose flag
-// disables embeds and would have made a recursive component walker load-bearing safety code.
+// which is precisely why this renders embeds and not Components V2, whose flag disables embeds
+// and would have made a recursive component walker load-bearing safety code.
 
 // Puzzle state colours. Discord's own palette, so they read as intentional next to every other
 // bot in the server rather than as arbitrary hex.
@@ -40,48 +57,71 @@ const (
 	colourTimeout = 0xED4245 // red
 )
 
+// sep joins the parts of a subtext line.
+//
+// A middle dot rather than the pipe this used to use, because a pipe reads as a table that is not
+// there. It is also not one of the four characters CI's prose check bans, which a real dash would
+// have been.
+const sep = " · "
+
 // puzzleEmbed renders a live puzzle, at whatever rung its ladder has reached.
 //
-// One function for the announcement and every repost of it, because they are the same message
-// at different moments and two builders would be two places for the round number or the stake to
-// go stale.
+// One function for the announcement and every repost of it, because they are the same card at
+// different moments and two builders would be two places for the round number or the stake to go
+// stale.
 func puzzleEmbed(g *wordgame.Game, points int) *discordgo.MessageEmbed {
-	e := &discordgo.MessageEmbed{
-		Title: puzzleTitle(g),
-		// The scramble on its own line and nothing else, because it is the one thing being
-		// asked and everything else on this card is context for it.
-		Description: fmt.Sprintf("Unscramble this word:\n# %s\n\nEnds <t:%d:R>",
-			g.Scrambled, g.ExpiresAt.Unix()),
-		Color:  colourLive,
-		Footer: &discordgo.MessageEmbedFooter{Text: puzzleFooter(g, points)},
+	lines := []string{"## " + g.Scrambled}
+	meta := []string{}
+
+	if g.Rounds > 0 {
+		meta = append(meta, fmt.Sprintf("round %d/%d", g.Round, g.Rounds))
 	}
 
+	colour := colourLive
 	if g.HintLevel > 0 {
-		e.Color = colourHinted
-		e.Fields = []*discordgo.MessageEmbedField{{
-			Name:  fmt.Sprintf("💡 Hint %d of %d", g.HintLevel, g.Rungs()),
-			Value: g.Mask(),
-		}}
+		colour = colourHinted
+		// NOT wrapped in backticks, and that is a collision with existing code rather than a
+		// preference. hidden in internal/wordgame/hint.go is an ESCAPED underscore, because an
+		// underscore is italic markup and a mask is mostly underscores; inside an inline code
+		// span a backslash is literal, so backticks would render "p \_ \_ e". Monospace
+		// alignment is not worth either un-escaping that constant or growing a second Mask.
+		lines = append(lines, g.Mask())
+		meta = append(meta, fmt.Sprintf("hint %d/%d", g.HintLevel, g.Rungs()))
+	} else {
+		// The letter count earns its place only until a rung lands. After that the mask says the
+		// same thing more directly, and dropping it is what keeps the subtext to one line as it
+		// gains the round and hint counters.
+		meta = append(meta, plural(g.Letters(), "letter"))
 	}
-	return e
+
+	meta = append(meta,
+		fmt.Sprintf("worth %d", points),
+		fmt.Sprintf("ends <t:%d:R>", g.ExpiresAt.Unix()),
+	)
+	lines = append(lines, subtext(meta...))
+
+	return &discordgo.MessageEmbed{
+		Description: strings.Join(lines, "\n"),
+		Color:       colour,
+	}
 }
 
 // solvedEmbed announces a win.
 func solvedEmbed(winner, word string, solveTime time.Duration, points int) *discordgo.MessageEmbed {
 	return &discordgo.MessageEmbed{
-		Title: "🎉 Solved",
-		Description: fmt.Sprintf("**%s** got **%s** in %.2f seconds.",
-			wordgame.TruncateRunes(winner, 32), word, solveTime.Seconds()),
-		Color:  colourSolved,
-		Footer: &discordgo.MessageEmbedFooter{Text: fmt.Sprintf("%s earned", plural(points, "point"))},
+		Description: fmt.Sprintf("**%s** got **%s**\n%s",
+			wordgame.TruncateRunes(winner, 32), word,
+			subtext(fmt.Sprintf("%.2fs", solveTime.Seconds()), fmt.Sprintf("%d pts", points))),
+		Color: colourSolved,
 	}
 }
 
 // timeoutEmbed announces that nobody got it.
+//
+// One line, and no consolation. The colour says it went badly and the word says what it was.
 func timeoutEmbed(word string) *discordgo.MessageEmbed {
 	return &discordgo.MessageEmbed{
-		Title:       "⏰ Time's up",
-		Description: fmt.Sprintf("Nobody got it. The word was **%s**.", word),
+		Description: fmt.Sprintf("nobody got **%s**", word),
 		Color:       colourTimeout,
 	}
 }
@@ -89,34 +129,33 @@ func timeoutEmbed(word string) *discordgo.MessageEmbed {
 // gauntletDoneEmbed closes out a run.
 //
 // A run that just stops is indistinguishable from a run that broke, which is finding 32's shape:
-// the bot going quiet is fine, an operator or a player being unable to tell whether that was the
-// design is not. It carries no standings of its own, because a gauntlet win is an ordinary win
-// and the weekly board is where wins are counted.
+// the bot going quiet is fine, a player being unable to tell whether that was the design is not.
+// It carries no standings of its own, because a gauntlet win is an ordinary win and the weekly
+// board is where wins are counted.
 func gauntletDoneEmbed(rounds int) *discordgo.MessageEmbed {
 	return &discordgo.MessageEmbed{
-		Title:       "🏁 Gauntlet complete",
-		Description: fmt.Sprintf("That was all %s. Check `!leaderboard` for the damage.", plural(rounds, "round")),
-		Color:       colourSolved,
+		Description: fmt.Sprintf("that's all %s\n%s",
+			plural(rounds, "round"), subtext("`!leaderboard` for the damage")),
+		Color: colourSolved,
 	}
 }
 
-// puzzleTitle names the puzzle and places it in a run when there is one.
-func puzzleTitle(g *wordgame.Game) string {
-	if g.Rounds > 0 {
-		return fmt.Sprintf("🔤 Word Scramble - Round %d of %d", g.Round, g.Rounds)
-	}
-	return "🔤 Word Scramble"
-}
-
-// puzzleFooter is the stake and the shape of the answer.
+// subtext renders one small grey line from its non-empty parts.
 //
-// The stake is the entire reason the ladder exists, so it is on the card from the first moment
-// rather than appearing once it starts falling: a player who cannot see what a puzzle is worth
-// before the first hint has no decision to make about waiting for one.
-func puzzleFooter(g *wordgame.Game, points int) string {
-	s := fmt.Sprintf("Worth %s | %s", plural(points, "point"), plural(g.Letters(), "letter"))
-	if g.HintLevel < g.Rungs() {
-		return s + " | a hint costs a point"
+// "-#" is Discord's subtext markdown, which is the only way to get footer-sized text into a
+// DESCRIPTION. It has to be the description rather than the actual footer, because the countdown
+// lives on this line and Discord renders <t:N:R> in descriptions and field values only, never in
+// a footer or a title. So the one part of the card that most wants to be small is also the one
+// part that cannot use the small slot.
+func subtext(parts ...string) string {
+	kept := parts[:0]
+	for _, p := range parts {
+		if p != "" {
+			kept = append(kept, p)
+		}
 	}
-	return s
+	if len(kept) == 0 {
+		return ""
+	}
+	return "-# " + strings.Join(kept, sep)
 }

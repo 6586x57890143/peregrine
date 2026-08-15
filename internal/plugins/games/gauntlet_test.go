@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bwmarrin/discordgo"
+
 	"github.com/6586x57890143/peregrine/internal/activity"
 	"github.com/6586x57890143/peregrine/internal/core"
 	"github.com/6586x57890143/peregrine/internal/dbtest"
@@ -36,7 +38,7 @@ func TestAGauntletRunsItsRoundsThroughTheSweep(t *testing.T) {
 	if len(posts) != 1 {
 		t.Fatalf("posts = %d, want the first round", len(posts))
 	}
-	if !strings.Contains(posts[0], "Round 1 of 3") {
+	if !strings.Contains(posts[0], "round 1/3") {
 		t.Errorf("the first card does not place itself in the run:\n%s", posts[0])
 	}
 
@@ -56,7 +58,7 @@ func TestAGauntletRunsItsRoundsThroughTheSweep(t *testing.T) {
 	if len(posts) < 3 {
 		t.Fatalf("posts = %d, want the puzzle, the win and round two", len(posts))
 	}
-	if !strings.Contains(posts[len(posts)-1], "Round 2 of 3") {
+	if !strings.Contains(posts[len(posts)-1], "round 2/3") {
 		t.Errorf("the sweep did not start round two:\n%s", posts[len(posts)-1])
 	}
 }
@@ -75,7 +77,7 @@ func TestTheLastRoundSaysTheRunIsOver(t *testing.T) {
 
 	var sawDone bool
 	for _, p := range guard.posts() {
-		if strings.Contains(p, "Gauntlet complete") {
+		if strings.Contains(p, "that's all") {
 			sawDone = true
 		}
 	}
@@ -161,7 +163,7 @@ func TestTheStakeIsOnTheCardBeforeTheFirstHint(t *testing.T) {
 	if len(posts) != 1 {
 		t.Fatalf("posts = %v", posts)
 	}
-	if !strings.Contains(posts[0], "Worth 4 points") {
+	if !strings.Contains(posts[0], "worth 4") {
 		t.Errorf("the opening card does not say what the puzzle is worth:\n%s", posts[0])
 	}
 }
@@ -176,18 +178,16 @@ func TestASolvedPuzzleIsNotStillWorthItsOpeningStake(t *testing.T) {
 
 	s.Guess("c1", snowflake(620), theWord, snowflake(44), "cat")
 
-	var win string
-	for _, p := range guard.posts() {
-		if strings.Contains(p, "Solved") {
-			win = p
-		}
+	// Found by its state colour rather than by its wording, so a copy change is not a failure
+	// here. What is being asserted is that the card and the board agree about one number.
+	won := guard.cards(colourSolved)
+	if len(won) != 1 {
+		t.Fatalf("posted %d solved cards, want 1:\n%s",
+			len(won), strings.Join(guard.posts(), "\n---\n"))
 	}
-	if win == "" {
-		t.Fatalf("no win announcement in %v", guard.posts())
-	}
-	if !strings.Contains(win, "3 points") {
+	if !strings.Contains(won[0].Description, "3 pts") {
 		t.Errorf("the win announces a different number from the one the board recorded "+
-			"(%d):\n%s", s.board.Scores()[snowflake(44)], win)
+			"(%d):\n%s", s.board.Scores()[snowflake(44)], won[0].Description)
 	}
 }
 
@@ -285,4 +285,78 @@ func fixtureDict(t *testing.T, opts Options, mopts wordgame.Options) (
 		t.Fatalf("Init: %v", err)
 	}
 	return s, guard, manager, tracker
+}
+
+// ---------------------------------------------------------------- the shape of a card, M27
+
+// TestACardIsTwoLinesAndThreeWhenHinted.
+//
+// The requirement this design pass exists to meet, pinned because it is the kind that erodes one
+// well-meaning addition at a time. The version M25 shipped spent four embed slots on two facts:
+// a title saying "Word Scramble" above a word scramble, a description telling the reader to
+// unscramble the scrambled word, a field for the hint and a three-clause footer.
+//
+// Line COUNT rather than character count, because the failure being prevented is vertical: a card
+// that takes half a screen in a busy channel is one people scroll past.
+func TestACardIsTwoLinesAndThreeWhenHinted(t *testing.T) {
+	s, guard, _, _ := fixtureHinting(t)
+	s.start("c1")
+
+	live := onePuzzle(t, guard)
+	assertCardShape(t, live, 2, "live")
+
+	time.Sleep(20 * time.Millisecond)
+	s.sweep()
+
+	hinted := guard.cards(colourHinted)
+	if len(hinted) != 1 {
+		t.Fatalf("posted %d hinted cards, want 1", len(hinted))
+	}
+	assertCardShape(t, hinted[0], 3, "hinted")
+
+	// And the mask replaced the letter count rather than joining it, which is what keeps the
+	// subtext to one line as it gains the round and hint counters.
+	if strings.Contains(hinted[0].Description, "letters") {
+		t.Errorf("the hinted card still counts letters as well as showing them:\n%s",
+			hinted[0].Description)
+	}
+}
+
+// assertCardShape checks a card is description-only and no taller than it should be.
+func assertCardShape(t *testing.T, e *discordgo.MessageEmbed, maxLines int, state string) {
+	t.Helper()
+
+	// Description-only. A title, a field or a footer would each add a line of chrome, and the
+	// state colour is carrying what the title used to.
+	if e.Title != "" {
+		t.Errorf("%s card has a title (%q); the colour says which state it is", state, e.Title)
+	}
+	if len(e.Fields) != 0 {
+		t.Errorf("%s card uses %d fields; a field adds a bold header nobody reads", state, len(e.Fields))
+	}
+	if e.Footer != nil {
+		t.Errorf("%s card has a footer; the countdown has to live in the description, so the "+
+			"metadata joins it there rather than being split across two slots", state)
+	}
+
+	if got := len(strings.Split(e.Description, "\n")); got > maxLines {
+		t.Errorf("%s card is %d lines, want at most %d:\n%s", state, got, maxLines, e.Description)
+	}
+
+	// Exactly one subtext line, at the bottom. Two would defeat the point, and one in the middle
+	// would put small grey text above full-size text.
+	lines := strings.Split(e.Description, "\n")
+	subs := 0
+	for i, l := range lines {
+		if !strings.HasPrefix(l, "-# ") {
+			continue
+		}
+		subs++
+		if i != len(lines)-1 {
+			t.Errorf("%s card has subtext above body text (line %d):\n%s", state, i+1, e.Description)
+		}
+	}
+	if subs != 1 {
+		t.Errorf("%s card has %d subtext lines, want exactly 1:\n%s", state, subs, e.Description)
+	}
 }

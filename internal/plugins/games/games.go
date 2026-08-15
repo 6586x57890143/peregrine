@@ -465,7 +465,7 @@ func (s *Service) startGauntlet(channelID string, n int) {
 	case errors.Is(err, wordgame.ErrGauntletInProgress):
 		remaining, total := s.manager.Gauntlet(channelID)
 		s.guard.Send(channelID, fmt.Sprintf(
-			"A gauntlet is already running here: %d of %d still to go.", remaining, total))
+			"a gauntlet is already running here: %d of %d to go", remaining, total))
 		return
 	case err != nil:
 		log.Printf("[WORDGAME] Failed to queue a gauntlet in %s: %v", channelID, err)
@@ -476,7 +476,7 @@ func (s *Service) startGauntlet(channelID string, n int) {
 		// Said, rather than silently clamped. An operator who asked for fifty and got ten
 		// should learn that from the bot rather than by counting.
 		s.guard.Send(channelID, fmt.Sprintf(
-			"Starting a gauntlet of %d. (%d is the most I will queue at once.)", queued, queued))
+			"gauntlet of %d starting (%d is the most I queue at once)", queued, queued))
 	}
 	log.Printf("[WORDGAME] Gauntlet of %d queued in channel %s.", queued, channelID)
 	s.start(channelID)
@@ -523,15 +523,15 @@ func (s *Service) startOnRequest(channelID string, who Requester, arg string) {
 	case errors.Is(err, wordgame.ErrGameInProgress):
 		// Reported to the channel, because the operator asked for something and deserves to
 		// know why it did not happen.
-		s.guard.Send(channelID, "A word game is already in progress in this channel!")
+		s.guard.Send(channelID, "a game is already running here")
 		return
 	case errors.Is(err, wordgame.ErrUnusableWord):
 		// Also reported, and it names the rules rather than saying no. The operator typed a
 		// word and the interesting information is which rule it broke.
 		minLen, maxLen := s.manager.WordBounds()
 		s.guard.Send(channelID, fmt.Sprintf(
-			"I cannot scramble that. A puzzle word has to be %d to %d letters, letters only, "+
-				"and use at least two different ones.", minLen, maxLen))
+			"cannot scramble that. a puzzle word is %d to %d letters, letters only, and "+
+				"needs at least two different ones", minLen, maxLen))
 		return
 	case err != nil:
 		log.Printf("[WORDGAME] Failed to start a game on request: %v", err)
@@ -658,7 +658,7 @@ func (s *Service) postLeaderboard(channelID, viewerID string, names func(userID 
 		return err
 	}); err != nil {
 		log.Printf("[LEADERBOARD] Error loading user stats: %v", err)
-		s.guard.Send(channelID, "Could not generate the leaderboard.")
+		s.guard.Send(channelID, "could not build the leaderboard")
 		return
 	}
 
