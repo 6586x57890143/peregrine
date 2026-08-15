@@ -326,43 +326,50 @@ start, and deferring to the decision the server already made beats maintaining a
 opinion about it. The failure mode a second copy would have is the empty case, which fails
 **open**, and no behavioural test can cover the command nobody has written yet.
 
-**A puzzle card is two lines, three when hinted, and that is pinned by a test.** M27's pass: no
-title, no fields, no footer, everything in the description with one `-#` subtext line at the
-bottom. The state colour carries what the title used to. The countdown is what forces this rather
-than taste: Discord renders `<t:N:R>` in descriptions and field values only, **never in a footer
-or a title**, so the one part of the card that most wants to be small cannot use the small slot,
-and subtext is the only way to get footer-sized text into a description. The letter count
-disappears once a rung lands, because the mask says it more directly and dropping it is what
-keeps the subtext to one line as it gains the round and hint counters. The mask is **not** wrapped
-in backticks: `hidden` is an escaped underscore, and inside an inline code span a backslash is
+**A puzzle is a plain chat message, not an embed, and it is two lines, three when hinted.** M25
+made it an embed and M27 made that embed compact; it was still too disruptive, and reverting was
+right. An embed is a CARD, with a coloured bar and a box and a chunk of visual weight that says
+"this is a notice" every time it appears. A word game is not a notice, it is a thing somebody said
+in the channel, and a bot posting a card every few minutes is a bot that keeps interrupting.
+
+**The formatting survived the container**, which is why the revert cost almost nothing. Everything
+the embed description carried is markdown a normal message renders identically, and two parts work
+strictly better outside one: headers and `-#` subtext are ordinary message markdown, and the
+relative timestamp no longer has a footer or a title to be excluded from. The letter count still
+disappears once a rung lands, because the mask says it more directly and that is what keeps the
+subtext to one line as it gains the round and hint counters. The mask is still **not** wrapped in
+backticks: `hidden` is an escaped underscore, and inside an inline code span a backslash is
 literal, so backticks would render `p \_ \_ e`.
+
+**What was lost is the state colour, and it was near-redundant.** Four colours said live, hinted,
+solved and timed out with no words at all. But a mask only exists on a hinted puzzle, "hint 1/3"
+only appears once a rung has landed, and a message opening "nobody got" is not ambiguous about how
+it went. The one thing colour did that text does not is work at a glance while scrolling, and the
+H2 does that instead, which is why **the header is more load-bearing now than it was inside the
+embed, not less**: without a box to make the message findable in a scroll, the scramble being a
+header is the only thing that catches a skimming eye.
 
 **The chrome is deadpan lowercase, and that is the opposite of what "match the register"
 implies.** This furniture repeats on every single puzzle, and a fixed joke stops being funny by
-the fourth time. Peregrine's chaos belongs in the generated text, which varies; the card around it
-should be flat and get out of the way.
+the fourth time. Peregrine's chaos belongs in the generated text, which varies; the message around
+it should be flat and get out of the way.
 
-**The leaderboard's two inline fields and eleventh slot survived the pass deliberately.** Both are
-measured decisions rather than styling: the columns sit side by side on a desktop and stack on a
-phone, which is what replaced a fixed-width code-block table that scrolled off screen for most
-readers, and the divider plus the viewer's own row under it is the whole reason ranking is
-competition ranking computed from scores alone. Restyling either away would undo a measurement for
-a preference.
+**The leaderboard stays an embed**, and its two inline fields and eleventh slot survived every
+pass deliberately. A weekly board IS a notice, unlike a puzzle, so a card is the right shape for
+it. The columns sit side by side on a desktop and stack on a phone, which is what replaced a
+fixed-width code-block table that scrolled off screen for most readers, and the divider plus the
+viewer's own row under it is the whole reason ranking is competition ranking computed from scores
+alone. Restyling either away would undo a measurement for a preference.
 
-**Assert on the embed, not on the copy.** A dozen tests pinned behaviour through prose, so a
-restyle looked like a dozen regressions: `Contains(post, "Unscramble")` is really asking whether a
-puzzle went up. The structural checks read the state colour now, which is the field that says
-which of four things a card is. Copy assertions survive only where the copy IS the behaviour: the
-round numbering, the stake being visible before the first hint, and the refusal that names the
-length bounds.
-
-**Puzzles are embeds, and Components V2 is deliberately not adopted yet.** `Guard.SendEmbed`
-already runs `CheckEmit` over every text field, so the richer card cost no new gate surface. V2
-exists in discordgo v0.29 and the one thing it uniquely buys is a button beside the text, but
-its flag **disables `content` and `embeds`**, so `embedText` would stop covering these messages
-and a recursive component walker would become load-bearing safety code, over an interface whose
-unknown types a walker silently skips. Paying that for layout polish while the payoff needs an
-interaction handler nobody has built is the wrong order.
+**Assert on the payload, not on the copy and not on decoration.** A dozen tests once pinned
+behaviour through prose, so a restyle looked like a dozen regressions: `Contains(post,
+"Unscramble")` is really asking whether a puzzle went up. M27 moved them onto the embed's colour
+and M28 took the embed away, so they now read what the message exists to convey: the header line,
+the mask that only a hinted puzzle has, and the rung counter that only appears once one has
+landed. That is a better anchor than either of the first two, because a colour was decoration the
+renderer happened to set and prose is wording. Copy assertions survive only where the copy IS the
+behaviour: round numbering, the stake being visible before the first hint, and the refusal that
+names the length bounds.
 
 **A planted word is held to the dictionary's own rules, through the same function.**
 `LoadDictionary` excludes words with fewer than two distinct letters *specifically* because

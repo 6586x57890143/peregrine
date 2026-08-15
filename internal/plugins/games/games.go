@@ -294,7 +294,7 @@ func (s *Service) Guess(channelID, messageID, content, authorID, displayName str
 	// untrusted-input-shaped.
 	solveTime := time.Since(won.StartedAt)
 	points := s.points(won)
-	if announcement, ok := s.guard.SendEmbed(channelID, solvedEmbed(displayName, won.Word, solveTime, points)); ok {
+	if announcement, ok := s.guard.Send(channelID, solvedMessage(displayName, won.Word, solveTime, points)); ok {
 		s.manager.DeleteLater(channelID, announcement.ID)
 	}
 
@@ -317,7 +317,7 @@ func (s *Service) Guess(channelID, messageID, content, authorID, displayName str
 	// one that broke, which is the shape finding 32 names: the bot's silence is a feature, the
 	// player's inability to tell what it meant is not.
 	if won.Rounds > 0 && won.Round == won.Rounds {
-		s.guard.SendEmbed(channelID, gauntletDoneEmbed(won.Rounds))
+		s.guard.Send(channelID, gauntletDoneMessage(won.Rounds))
 	}
 	return true
 }
@@ -410,31 +410,31 @@ func (s *Service) start(channelID string) {
 	log.Printf("[WORDGAME] Started a game in channel %s.", channelID)
 }
 
-// announce posts a puzzle's card and records the message it landed as, replacing whatever card
+// announce posts a puzzle and records the message it landed as, replacing whatever announcement
 // the game had before.
 //
 // # Post the new one, THEN delete the old one
 //
 // The order is the whole safety of the repost. Deleting first opens a window in which a live
-// puzzle has no visible card at all, and if the send is then refused or rate-limited the window
+// puzzle has no visible announcement at all, and if the send is then refused or rate-limited it
 // never closes: the game runs to its timeout with nobody able to see what they were supposed to
-// be solving. Posting first costs at most a moment of two cards, which is untidy and playable.
+// be solving. Posting first costs at most a moment of two, which is untidy and playable.
 // Same shape as backup writing a temp name before renaming it.
 //
 // The superseded ID comes back from Announced rather than being remembered here, because a win
 // or an expiry can land between the send and the record, and the Manager holds the only
-// authoritative answer to which card a game is currently wearing.
+// authoritative answer to which announcement a game is currently wearing.
 //
 // # It does NOT abandon the game on a refusal, and the caller must decide
 //
 // This function serves two moments that want opposite things from a refused send. A puzzle whose
-// FIRST card was refused is invisible and has to be abandoned, or it blocks the channel until it
-// times out against something nobody ever saw. A puzzle whose HINT was refused still has its
-// original card up and is perfectly playable, so abandoning it would delete a live game because
-// a decoration failed to render. Folding the abandon in here got that second case wrong, and a
-// test asking what a refused hint costs the winner is what found it.
+// FIRST announcement was refused is invisible and has to be abandoned, or it blocks the channel
+// until it times out against something nobody ever saw. A puzzle whose HINT was refused still has
+// its original announcement up and is perfectly playable, so abandoning it would delete a live
+// game because a decoration failed to render. Folding the abandon in here got that second case
+// wrong, and a test asking what a refused hint costs the winner is what found it.
 func (s *Service) announce(g *wordgame.Game) bool {
-	msg, ok := s.guard.SendEmbed(g.ChannelID, puzzleEmbed(g, s.points(g)))
+	msg, ok := s.guard.Send(g.ChannelID, puzzleMessage(g, s.points(g)))
 	if !ok {
 		return false
 	}
@@ -584,15 +584,15 @@ func (s *Service) sweep() {
 	//
 	// That decision was made for a stated reason: an edit puts the hint "where people are
 	// already looking". It holds exactly as long as the announcement is still on screen, and in
-	// the channels this bot lives in it is not. An edit to a card that scrolled away twenty
+	// the channels this bot lives in it is not. An edit to a message that scrolled away twenty
 	// messages ago is invisible, so the feature meant to rescue a stalling puzzle did nothing
 	// at the only moment it was needed. Reposting surfaces it. The cost is a deleted message
-	// per rung, which is why the old card is removed rather than left as a duplicate.
+	// per rung, which is why the old announcement is removed rather than left as a duplicate.
 	//
 	// Reversing a documented decision, so: if this is ever changed back, the thing to answer is
 	// how a hint reaches somebody who has scrolled past the puzzle.
 	for _, g := range s.manager.DueHints() {
-		// The game arrives already carrying the rung on offer, so the card renders with the
+		// The game arrives already carrying the rung on offer, so the message renders with the
 		// hint on it. Committing that rung is a separate call, made only once it has landed.
 		level := g.HintLevel
 		if !s.announce(g) {
@@ -605,7 +605,7 @@ func (s *Service) sweep() {
 	}
 
 	for _, g := range s.manager.Expired() {
-		if announcement, ok := s.guard.SendEmbed(g.ChannelID, timeoutEmbed(g.Word)); ok {
+		if announcement, ok := s.guard.Send(g.ChannelID, timeoutMessage(g.Word)); ok {
 			s.manager.DeleteLater(g.ChannelID, announcement.ID)
 		}
 		s.guard.Delete(g.ChannelID, g.MessageID)
