@@ -34,6 +34,8 @@ func clearEnv(t *testing.T) {
 		"PEREGRINE_ENABLE_WORD_GAMES", "PEREGRINE_WORDGAME_FREQUENCY_MODE",
 		"PEREGRINE_WORDGAME_INTERVAL", "PEREGRINE_WORDGAME_DICTIONARY",
 		"PEREGRINE_WORDGAME_TIMEOUT", "PEREGRINE_WORDGAME_HINT_AFTER",
+		"PEREGRINE_WORDGAME_HINT_LEVELS", "PEREGRINE_WORDGAME_POINTS_BASE",
+		"PEREGRINE_WORDGAME_GAUNTLET_MAX", "PEREGRINE_WORDGAME_GAUNTLET_GAP",
 		"PEREGRINE_ENABLE_TRANSCRIPTION", "PEREGRINE_TRANSCRIPTION_QUEUE",
 		"PEREGRINE_BACKUP_DIR", "PEREGRINE_BACKUP_TICK", "PEREGRINE_BACKUP_KEEP",
 		"PEREGRINE_ASSOC_BACKFILL", "PEREGRINE_ASSOC_BACKFILL_BEFORE",
@@ -674,5 +676,63 @@ func TestRepairJobsAndBoundaryLoad(t *testing.T) {
 	}
 	if cfg.RepairBefore.IsZero() {
 		t.Error("RepairBefore is zero after being set to a valid timestamp")
+	}
+}
+
+// TestAPointsBaseTheLadderCanReachIsRefused.
+//
+// The third cross-field check, and the same relationship mistake as the two above: neither value
+// is wrong on its own. A score floors at one, so once the base is spent every further rung is
+// free, and the wait-or-guess trade the ladder exists to create quietly stops existing. That is
+// worse than a knob wired to nothing, because the feature still LOOKS like it is working.
+func TestAPointsBaseTheLadderCanReachIsRefused(t *testing.T) {
+	for _, tc := range []struct{ name, base, levels string }{
+		{"equal", "3", "3"},
+		{"below", "2", "4"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("PEREGRINE_WORDGAME_POINTS_BASE", tc.base)
+			t.Setenv("PEREGRINE_WORDGAME_HINT_LEVELS", tc.levels)
+
+			_, err := Load()
+			if err == nil {
+				t.Fatal("a points base the hint ladder can reach must be a startup error")
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "PEREGRINE_WORDGAME_POINTS_BASE") ||
+				!strings.Contains(msg, "PEREGRINE_WORDGAME_HINT_LEVELS") {
+				t.Errorf("error must name both variables; got:\n%s", msg)
+			}
+		})
+	}
+
+	// With hints off there is no ladder to out-run, so the relationship does not apply and
+	// refusing it would be a startup error about a feature that is not running.
+	clearEnv(t)
+	t.Setenv("PEREGRINE_WORDGAME_HINT_AFTER", "0s")
+	t.Setenv("PEREGRINE_WORDGAME_POINTS_BASE", "1")
+	t.Setenv("PEREGRINE_WORDGAME_HINT_LEVELS", "6")
+	if _, err := Load(); err != nil {
+		t.Errorf("the check fired with hints turned off: %v", err)
+	}
+}
+
+// TestTheShippedDefaultsAgree, because the two cross-field rules above are only useful if the
+// values an operator gets by doing nothing pass them. A default set that fails its own
+// validation is a bot that will not start out of the box.
+func TestTheShippedDefaultsAgree(t *testing.T) {
+	clearEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("the shipped defaults do not load: %v", err)
+	}
+	if cfg.WordGamePointsBase <= cfg.WordGameHintLevels {
+		t.Errorf("default base %d is not above default rungs %d",
+			cfg.WordGamePointsBase, cfg.WordGameHintLevels)
+	}
+	if cfg.WordGameHintAfter >= cfg.WordGameTimeout {
+		t.Errorf("default hint %v is not below default timeout %v",
+			cfg.WordGameHintAfter, cfg.WordGameTimeout)
 	}
 }

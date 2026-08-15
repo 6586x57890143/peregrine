@@ -47,6 +47,7 @@ import (
 	"github.com/6586x57890143/peregrine/internal/generate"
 	"github.com/6586x57890143/peregrine/internal/learn"
 	"github.com/6586x57890143/peregrine/internal/names"
+	"github.com/6586x57890143/peregrine/internal/plugins/games"
 	"github.com/6586x57890143/peregrine/internal/plugins/images"
 	"github.com/6586x57890143/peregrine/internal/plugins/tuning"
 	"github.com/6586x57890143/peregrine/internal/safety"
@@ -83,7 +84,7 @@ type Images interface {
 // Games handles guesses and the bang commands.
 type Games interface {
 	Guess(channelID, messageID, content, authorID, displayName string) bool
-	Command(cmd, arg, channelID, authorID string, names func(userID string) string) bool
+	Command(cmd, arg, channelID string, who games.Requester, names func(userID string) string) bool
 }
 
 // Voice queues a voice attachment for transcription and reports whether it took it.
@@ -485,9 +486,35 @@ func (s *Service) stepCommands(r *reaction) bool {
 	// Counted by command, never by argument. A planted word is user text, and a usage tally
 	// carrying it would put arbitrary content into the tuning archive by a side door.
 	s.recorder.Count("command:" + cmd)
-	return s.games.Command(cmd, arg, r.m.ChannelID, r.m.Author.ID, func(userID string) string {
+	return s.games.Command(cmd, arg, r.m.ChannelID, s.requester(r), func(userID string) string {
 		return s.displayName(r.m.GuildID, userID)
 	})
+}
+
+// requester is who sent a command and what Discord says they may do in that channel.
+//
+// Read from the STATE CACHE, which costs no request: discordgo computes the permission set from
+// the guild, the member's roles and the channel's overwrites, all of which the gateway has
+// already delivered because M3 added IntentsGuilds. The obvious alternative, fetching the member
+// and folding the roles by hand, is a REST call per command and a second implementation of
+// Discord's own permission arithmetic.
+//
+// A miss FAILS CLOSED, leaving Permissions zero. That matches internal/channels' rule that "we
+// could not tell" has to mean "do not", and it costs nothing real: the bootstrap admin ID is
+// checked separately and does not depend on this, so a cold cache degrades to exactly the
+// authorization this command had before M25 rather than to none.
+func (s *Service) requester(r *reaction) games.Requester {
+	who := games.Requester{UserID: r.m.Author.ID}
+	if r.m.GuildID == "" {
+		// A DM has no administrators. Nothing to resolve, and nothing this bot runs there.
+		return who
+	}
+	perms, err := s.session.State.UserChannelPermissions(r.m.Author.ID, r.m.ChannelID)
+	if err != nil {
+		return who
+	}
+	who.Permissions = perms
+	return who
 }
 
 // commandFor recognizes a command and its one optional argument, or returns "".
@@ -514,10 +541,17 @@ func commandFor(content string) (cmd, arg string) {
 			return fields[0], ""
 		}
 	case 2:
-		// Letters only, checked HERE as well as in the Manager. This one is about what counts
-		// as an invocation: "!wordgame :)" should stay chat rather than becoming a command that
-		// answers with a refusal, and the Manager's check is about what can be a puzzle.
-		if fields[0] == "!wordgame" && isWord(fields[1]) {
+		// Letters, or digits, and nothing mixed. Checked HERE as well as in the games service,
+		// and the two checks are about different questions: this one decides what counts as an
+		// invocation at all, so "!wordgame :)" stays chat rather than becoming a command that
+		// answers with a refusal, while the service decides what can be a puzzle or a run
+		// length.
+		//
+		// Digits are a gauntlet ("!wordgame 5") and letters are a planted word. They cannot
+		// collide, because a token that is all digits is not a word and a word is not a number,
+		// which is what lets the argument stay a single untyped token instead of growing a
+		// subcommand.
+		if fields[0] == "!wordgame" && (isWord(fields[1]) || isNumber(fields[1])) {
 			return fields[0], fields[1]
 		}
 	}
@@ -531,6 +565,23 @@ func isWord(s string) bool {
 	}
 	for _, r := range s {
 		if !unicode.IsLetter(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// isNumber reports whether a token is ASCII digits and nothing else.
+//
+// unicode.IsDigit would also accept Devanagari and full-width digits, which strconv.Atoi then
+// refuses, so the two would disagree about what an invocation is: the command would be
+// recognized, consumed, and then quietly do nothing. Narrower here is what keeps them agreeing.
+func isNumber(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
 			return false
 		}
 	}

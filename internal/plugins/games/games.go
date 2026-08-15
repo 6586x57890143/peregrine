@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"strconv"
 	"sync"
 	"time"
 
@@ -90,8 +91,16 @@ type Options struct {
 	// this too.
 	AllowChannels []string
 
-	// AdminUserID may run !wordgame. Empty refuses everyone.
+	// AdminUserID may run !wordgame. Empty refuses everyone who is not a guild administrator.
 	AdminUserID string
+
+	// PointsBase is what a puzzle solved with no hints showing is worth, and every delivered
+	// rung of the hint ladder takes one off that.
+	//
+	// Config refuses a base at or below the rung count, naming both, because a ladder that can
+	// reach zero means its bottom rungs are free and the wait-or-guess decision the ladder
+	// exists to create does not exist. Same shape as the HINT_AFTER/TIMEOUT check next to it.
+	PointsBase int
 }
 
 // Service is the feature.
@@ -149,6 +158,18 @@ func (s *Service) Init(deps core.Deps) error {
 		s.board = wordgame.NewLeaderboard(time.Now())
 		return nil
 	}
+	// A board written before points existed ranks everybody at zero, which would show an empty
+	// leaderboard to a server that has been playing all week. Converting on load is the one
+	// moment the number is knowable and the board is not yet being read.
+	//
+	// Here rather than in internal/wordgame because PointsBase is configuration and that
+	// package reads none, which is the same reason ScanTopics leaves its filters to health.
+	if converted := s.board.BackfillPoints(s.opts.PointsBase); converted > 0 {
+		log.Printf("[LEADERBOARD] Converted %d entries from wins to points at %d each. This "+
+			"happens once, on the first load after the hint ladder shipped.",
+			converted, s.opts.PointsBase)
+	}
+
 	log.Println("[INFO] Leaderboard loaded.")
 	return nil
 }
@@ -244,13 +265,18 @@ func (s *Service) Guess(channelID, messageID, content, authorID, displayName str
 	// can contain a role mention. Even a message the bot composes itself is
 	// untrusted-input-shaped.
 	solveTime := time.Since(won.StartedAt)
-	if announcement, ok := s.guard.Send(channelID, winnerMessage(displayName, won.Word, solveTime)); ok {
+	points := s.points(won)
+	if announcement, ok := s.guard.SendEmbed(channelID, solvedEmbed(displayName, won.Word, solveTime, points)); ok {
 		s.manager.DeleteLater(channelID, announcement.ID)
 	}
 
 	// The solve time reaches the board now, which is what makes a weekly record possible. It
 	// was computed for the announcement and then thrown away.
-	s.board.AddWin(authorID, displayName, solveTime)
+	//
+	// A gauntlet win is an ORDINARY win and is worth exactly what the same puzzle would have
+	// been worth on its own. A second scoring economy for runs would mean two ways to reach one
+	// leaderboard and a reason to argue about which was the real one.
+	s.board.AddWin(authorID, displayName, solveTime, points)
 	if err := s.save(); err != nil {
 		log.Printf("[WORDGAME] failed to persist a win: %v", err)
 	}
@@ -258,6 +284,13 @@ func (s *Service) Guess(channelID, messageID, content, authorID, displayName str
 	// Tidy up: the puzzle announcement and the winning guess.
 	s.guard.Delete(channelID, won.MessageID)
 	s.guard.Delete(channelID, messageID)
+
+	// The last round of a run says so. A gauntlet that simply stops is indistinguishable from
+	// one that broke, which is the shape finding 32 names: the bot's silence is a feature, the
+	// player's inability to tell what it meant is not.
+	if won.Rounds > 0 && won.Round == won.Rounds {
+		s.guard.SendEmbed(channelID, gauntletDoneEmbed(won.Rounds))
+	}
 	return true
 }
 
@@ -265,13 +298,13 @@ func (s *Service) Guess(channelID, messageID, content, authorID, displayName str
 //
 // The caller decides what recognition means for the message; here it only means the command
 // ran, or was refused for a reason the operator can see.
-func (s *Service) Command(cmd, arg, channelID, authorID string, names func(userID string) string) bool {
+func (s *Service) Command(cmd, arg, channelID string, who Requester, names func(userID string) string) bool {
 	switch cmd {
 	case "!leaderboard":
 		// The author's ID reaches the board, which is what makes the eleventh slot possible:
 		// showing somebody their own rank requires knowing which of the rows is theirs, and
 		// the only thing that identifies them is their ID.
-		s.postLeaderboard(channelID, authorID, names)
+		s.postLeaderboard(channelID, who.UserID, names)
 		return true
 	case "!wordgame":
 		// Only a command when word games are available at all. With the feature off it is
@@ -280,23 +313,50 @@ func (s *Service) Command(cmd, arg, channelID, authorID string, names func(userI
 		if !s.opts.Enabled || !s.manager.Available() {
 			return false
 		}
-		s.startOnRequest(channelID, authorID, arg)
+		s.startOnRequest(channelID, who, arg)
 		return true
 	}
 	return false
 }
 
+// Requester is who is asking, and what Discord says they may do where they are asking it.
+//
+// A struct rather than two arguments because it crosses three packages (chat resolves it, games
+// judges it, and M26's interaction handler will fill it from a different source), and a bare
+// pair of a string and an int64 is exactly the shape a caller eventually passes in the wrong
+// order.
+//
+// Permissions is Discord's COMPUTED permission set for this user in this channel, already
+// folded over roles and overwrites. Zero means "we could not tell", which is why it fails
+// closed below rather than being treated as a plain user.
+type Requester struct {
+	UserID      string
+	Permissions int64
+}
+
 // Authorized reports whether a user may run an operator command.
 //
-// It fails CLOSED: an unset PEREGRINE_BOOTSTRAP_ADMIN_USER_ID refuses everyone, never allows
-// everyone. Getting that direction wrong on an empty string is how a missing variable turns
-// an operator-only command into a public one, and it is the only authorization check in the
-// codebase (SPEC.md section 8, finding 19).
-func (s *Service) Authorized(userID string) bool {
-	if s.opts.AdminUserID == "" {
-		return false
+// It fails CLOSED: an unset PEREGRINE_BOOTSTRAP_ADMIN_USER_ID and no Administrator bit refuses
+// everyone, never allows everyone. Getting that direction wrong on an empty string is how a
+// missing variable turns an operator-only command into a public one, and it is the only
+// authorization check in the codebase (SPEC.md section 8, finding 19).
+//
+// # Two ways in, still one check
+//
+// The bootstrap admin ID was the only answer until M25, and it is a single person: a bot whose
+// word games can only be started by whoever holds one Discord ID is a bot whose word games stop
+// when that person is asleep. Anyone Discord already trusts with Administrator in the guild is
+// somebody the server has made that decision about, and deferring to it is strictly better than
+// this bot maintaining a second, worse opinion about who runs the server.
+//
+// It stays ONE function. The failure mode a second copy has is the empty case, which fails OPEN,
+// and no behavioural test can cover the command nobody has written yet: that is the whole
+// argument the AST test pinning this exists to enforce.
+func (s *Service) Authorized(r Requester) bool {
+	if r.UserID != "" && r.UserID == s.opts.AdminUserID {
+		return true
 	}
-	return userID == s.opts.AdminUserID
+	return r.Permissions&discordgo.PermissionAdministrator != 0
 }
 
 // start begins a puzzle and announces it.
@@ -312,13 +372,86 @@ func (s *Service) start(channelID string) {
 		// neither is worth more than this.
 		return
 	}
-	msg, ok := s.guard.Send(channelID, scrambleMessage(g.Scrambled))
-	if !ok {
+	if !s.announce(g) {
+		// Abandoned HERE rather than inside announce, because only the start path wants that:
+		// an unannounced puzzle is invisible and would block the channel until it timed out
+		// against something nobody ever saw, whereas a refused hint leaves a playable game.
 		s.manager.Abandon(channelID)
 		return
 	}
-	s.manager.Announced(channelID, msg.ID)
 	log.Printf("[WORDGAME] Started a game in channel %s.", channelID)
+}
+
+// announce posts a puzzle's card and records the message it landed as, replacing whatever card
+// the game had before.
+//
+// # Post the new one, THEN delete the old one
+//
+// The order is the whole safety of the repost. Deleting first opens a window in which a live
+// puzzle has no visible card at all, and if the send is then refused or rate-limited the window
+// never closes: the game runs to its timeout with nobody able to see what they were supposed to
+// be solving. Posting first costs at most a moment of two cards, which is untidy and playable.
+// Same shape as backup writing a temp name before renaming it.
+//
+// The superseded ID comes back from Announced rather than being remembered here, because a win
+// or an expiry can land between the send and the record, and the Manager holds the only
+// authoritative answer to which card a game is currently wearing.
+//
+// # It does NOT abandon the game on a refusal, and the caller must decide
+//
+// This function serves two moments that want opposite things from a refused send. A puzzle whose
+// FIRST card was refused is invisible and has to be abandoned, or it blocks the channel until it
+// times out against something nobody ever saw. A puzzle whose HINT was refused still has its
+// original card up and is perfectly playable, so abandoning it would delete a live game because
+// a decoration failed to render. Folding the abandon in here got that second case wrong, and a
+// test asking what a refused hint costs the winner is what found it.
+func (s *Service) announce(g *wordgame.Game) bool {
+	msg, ok := s.guard.SendEmbed(g.ChannelID, puzzleEmbed(g, s.points(g)))
+	if !ok {
+		return false
+	}
+	if old := s.manager.Announced(g.ChannelID, msg.ID); old != "" {
+		s.guard.Delete(g.ChannelID, old)
+	}
+	return true
+}
+
+// points is what solving this puzzle right now is worth: the base, less one for every rung of
+// the ladder that has actually been delivered, and never less than one.
+//
+// A DELIVERED rung, not a due one. The distinction is the player's money and is why DueHints
+// stopped advancing the level itself: a hint the guard refused to post never reached the
+// channel, and charging for help nobody could see is the kind of unfairness that is invisible
+// from the log and obvious to whoever lost the point.
+func (s *Service) points(g *wordgame.Game) int {
+	return max(s.opts.PointsBase-g.HintLevel, 1)
+}
+
+// startGauntlet queues a run and starts its first puzzle.
+//
+// The first one starts here and every later one from the sweep, which is what makes the run
+// advance on the previous puzzle CONCLUDING rather than on a clock.
+func (s *Service) startGauntlet(channelID string, n int) {
+	queued, err := s.manager.Queue(channelID, n)
+	switch {
+	case errors.Is(err, wordgame.ErrGauntletInProgress):
+		remaining, total := s.manager.Gauntlet(channelID)
+		s.guard.Send(channelID, fmt.Sprintf(
+			"A gauntlet is already running here: %d of %d still to go.", remaining, total))
+		return
+	case err != nil:
+		log.Printf("[WORDGAME] Failed to queue a gauntlet in %s: %v", channelID, err)
+		return
+	}
+
+	if queued < n {
+		// Said, rather than silently clamped. An operator who asked for fifty and got ten
+		// should learn that from the bot rather than by counting.
+		s.guard.Send(channelID, fmt.Sprintf(
+			"Starting a gauntlet of %d. (%d is the most I will queue at once.)", queued, queued))
+	}
+	log.Printf("[WORDGAME] Gauntlet of %d queued in channel %s.", queued, channelID)
+	s.start(channelID)
 }
 
 // startOnRequest is !wordgame: the operator asking for a puzzle here, now, optionally on a
@@ -336,20 +469,28 @@ func (s *Service) start(channelID string) {
 // It stays silent IN THE CHANNEL, which is a different decision from staying silent in the
 // log. Answering a non-admin advertises that the command exists and that they are not allowed
 // to use it, which is an invitation. The message is still consumed either way.
-func (s *Service) startOnRequest(channelID, authorID, word string) {
-	if !s.Authorized(authorID) {
+func (s *Service) startOnRequest(channelID string, who Requester, arg string) {
+	if !s.Authorized(who) {
 		if s.opts.AdminUserID == "" {
 			log.Printf("[WORDGAME] !wordgame in %s was refused because "+
-				"PEREGRINE_BOOTSTRAP_ADMIN_USER_ID is unset, so the check fails closed and "+
-				"refuses everyone. Set it to your own Discord user ID.", channelID)
+				"PEREGRINE_BOOTSTRAP_ADMIN_USER_ID is unset and the caller is not a guild "+
+				"administrator, so the check fails closed and refuses everyone. Set it to "+
+				"your own Discord user ID, or give yourself Administrator.", channelID)
 			return
 		}
-		log.Printf("[WORDGAME] !wordgame in %s from %s was refused: not the configured admin.",
-			channelID, authorID)
+		log.Printf("[WORDGAME] !wordgame in %s from %s was refused: not the configured admin "+
+			"and not a guild administrator.", channelID, who.UserID)
 		return
 	}
 
-	g, err := s.manager.StartWord(channelID, word)
+	// A number is a gauntlet, a word is a planted puzzle. commandFor has already established
+	// that the argument is one or the other, so this only has to tell them apart.
+	if n, ok := gauntletArg(arg); ok {
+		s.startGauntlet(channelID, n)
+		return
+	}
+
+	g, err := s.manager.StartWord(channelID, arg)
 	switch {
 	case errors.Is(err, wordgame.ErrGameInProgress):
 		// Reported to the channel, because the operator asked for something and deserves to
@@ -369,8 +510,7 @@ func (s *Service) startOnRequest(channelID, authorID, word string) {
 		return
 	}
 
-	msg, ok := s.guard.Send(channelID, scrambleMessage(g.Scrambled))
-	if !ok {
+	if !s.announce(g) {
 		s.manager.Abandon(channelID)
 		// Said out loud, because the guard refusing this is the other way an operator command
 		// silently does nothing: an ignored channel or a paused bot, neither of which is
@@ -380,7 +520,6 @@ func (s *Service) startOnRequest(channelID, authorID, word string) {
 			channelID)
 		return
 	}
-	s.manager.Announced(channelID, msg.ID)
 	if g.Planted {
 		log.Printf("[WORDGAME] Started a game on request in channel %s on a chosen word.", channelID)
 		return
@@ -412,23 +551,46 @@ func (s *Service) startInterval() {
 func (s *Service) sweep() {
 	// Hints first, so a puzzle that is both due a hint and about to expire does not get one
 	// after the answer has been announced.
+	//
+	// # A REPOST, where M21b deliberately chose an edit
+	//
+	// That decision was made for a stated reason: an edit puts the hint "where people are
+	// already looking". It holds exactly as long as the announcement is still on screen, and in
+	// the channels this bot lives in it is not. An edit to a card that scrolled away twenty
+	// messages ago is invisible, so the feature meant to rescue a stalling puzzle did nothing
+	// at the only moment it was needed. Reposting surfaces it. The cost is a deleted message
+	// per rung, which is why the old card is removed rather than left as a duplicate.
+	//
+	// Reversing a documented decision, so: if this is ever changed back, the thing to answer is
+	// how a hint reaches somebody who has scrolled past the puzzle.
 	for _, g := range s.manager.DueHints() {
-		first, letters := g.Hint()
-		// An EDIT rather than a new message, so the hint arrives where people are already
-		// looking instead of scrolling the puzzle away. Through the guard like everything
-		// else: an edit can introduce a mention the original did not have.
-		if !s.guard.Edit(g.ChannelID, g.MessageID, hintMessage(g.Scrambled, first, letters)) {
-			log.Printf("[WORDGAME] Could not add a hint in channel %s.", g.ChannelID)
+		// The game arrives already carrying the rung on offer, so the card renders with the
+		// hint on it. Committing that rung is a separate call, made only once it has landed.
+		level := g.HintLevel
+		if !s.announce(g) {
+			// Not acknowledged, so the rung stays undelivered and the player is not charged
+			// for it. It will come due again on the next tick.
+			log.Printf("[WORDGAME] Could not repost a hint in channel %s.", g.ChannelID)
+			continue
 		}
+		s.manager.HintDelivered(g.ChannelID, level)
 	}
 
 	for _, g := range s.manager.Expired() {
-		if announcement, ok := s.guard.Send(g.ChannelID, timeUpMessage(g.Word)); ok {
+		if announcement, ok := s.guard.SendEmbed(g.ChannelID, timeoutEmbed(g.Word)); ok {
 			s.manager.DeleteLater(g.ChannelID, announcement.ID)
 		}
 		s.guard.Delete(g.ChannelID, g.MessageID)
 		log.Printf("[WORDGAME] Game timed out in channel %s.", g.ChannelID)
 	}
+
+	// Gauntlet successors after the expiries, so a puzzle that just timed out can owe its
+	// replacement on the same tick rather than waiting a full one, and before the deletions so
+	// the two are not both reaching for the announcement of the game that just ended.
+	for _, channelID := range s.manager.DueStarts() {
+		s.start(channelID)
+	}
+
 	for _, p := range s.manager.DueDeletions() {
 		s.guard.Delete(p.ChannelID, p.MessageID)
 	}
@@ -561,26 +723,19 @@ func (s *Service) save() error {
 	})
 }
 
-func scrambleMessage(scrambled string) string {
-	return fmt.Sprintf("✨ **Word Scramble!** ✨\n\nUnscramble this word: **%s**", scrambled)
-}
-
-// hintMessage is the announcement with the first letter revealed.
+// gauntletArg reads "!wordgame 5" and reports the count.
 //
-// It REPLACES the announcement rather than adding a line under it, because this is an edit:
-// the puzzle and its hint are one message, so a player scrolling back sees the current state
-// of the game rather than two messages they have to read in order.
-func hintMessage(scrambled, first string, letters int) string {
-	return fmt.Sprintf("✨ **Word Scramble!** ✨\n\nUnscramble this word: **%s**\n\n"+
-		"💡 Hint: %d letters, starts with **%s**.", scrambled, letters, first)
-}
-
-func timeUpMessage(original string) string {
-	return fmt.Sprintf("Time is up! The word was **%s**.", original)
-}
-
-// winnerMessage announces a solved scramble. The nickname is interpolated into it, which is
-// why it goes through the guard like any other send.
-func winnerMessage(winner, word string, solveTime time.Duration) string {
-	return fmt.Sprintf("🎉 **%s** guessed the word **%s** in %.2f seconds!", winner, word, solveTime.Seconds())
+// Digits only and nothing else, so it cannot collide with a planted word: commandFor already
+// guarantees the argument is one token, and a token is either all letters or all digits by the
+// time it arrives here. A leading zero or an absurd number is simply not a count, and the
+// Manager clamps what it accepts, so the parse is allowed to be this small.
+func gauntletArg(arg string) (int, bool) {
+	if arg == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(arg)
+	if err != nil || n < 1 {
+		return 0, false
+	}
+	return n, true
 }

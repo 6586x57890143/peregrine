@@ -250,13 +250,85 @@ too. It stays silent **in the channel**, which is a different decision: answerin
 advertises that the command exists and that they are not allowed to use it. That is finding 32's
 shape in a command rather than in the reply path.
 
-**A hint is not a fourth timer.** `HintAt` is a field on the `Game` and `DueHints` is swept by
-the sweep that already expires puzzles, so it costs no goroutine and inherits `RunLoop`'s panic
-isolation and context binding for free. It **edits** the announcement rather than posting again,
-so the hint arrives where people are already looking, and a game whose announcement the guard
-refused is skipped rather than returned, because there is nothing to edit.
+**A hint is not a fourth timer.** `NextHintAt` is a field on the `Game` and `DueHints` is swept
+by the sweep that already expires puzzles, so it costs no goroutine and inherits `RunLoop`'s
+panic isolation and context binding for free. A game whose announcement the guard refused is
+skipped rather than returned, because there is nothing to replace.
 `PEREGRINE_WORDGAME_HINT_AFTER` at or above `PEREGRINE_WORDGAME_TIMEOUT` is a startup error
 naming both: a hint due after the puzzle has ended is a knob wired to nothing.
+
+**M25 made the hint a LADDER, and reversed M21b's edit into a repost.** Both halves are in
+`internal/wordgame/hint.go` and the reasoning is worth knowing before either is undone:
+
+- **The rungs are a price, not a gift.** A solve is worth `PointsBase` less the rungs actually
+  delivered, floored at one, so waiting for more letters is a trade against guessing now. That
+  is the only decision this game has ever offered a player; before it, every round paid the same
+  and the only skill was typing speed. `PEREGRINE_WORDGAME_POINTS_BASE` at or below
+  `PEREGRINE_WORDGAME_HINT_LEVELS` is a startup error naming both, because a floored score makes
+  the last rungs free and the trade quietly stops existing. That is worse than a knob wired to
+  nothing: the feature still looks like it works.
+- **The reveal ORDER is fixed once, at start.** That is what makes rung k a superset of rung
+  k-1. Drawing positions per rung would let a letter shown at rung 2 disappear at rung 3, and a
+  hint that takes something back is worse than no hint. The opening letter always leads.
+- **The configured rung count is a ceiling, not a promise.** `ladder()` drops a rung that would
+  reveal nothing the one below it did not, and keeps at least two letters hidden however far it
+  goes, so a short word gets a SHORTER ladder rather than rungs a player pays for and learns
+  nothing from. `Game.Rungs()` is the real number and the schedule divides by it.
+- **`DueHints` does not mutate, and `HintDelivered` is the acknowledgement.** The guard can
+  refuse a repost, and advancing the level anyway charges the eventual winner for help nobody
+  saw. It also returns **copies** carrying the PENDING level: the live games are still in the
+  map where `Guess` and `Announced` write to them, and the caller has to render the card as it
+  *will* look or the repost goes out as a hint card with no hint on it. Both were found by
+  tests rather than by reading.
+- **A repost, and the new card goes up BEFORE the old one comes down.** M21b chose an edit
+  because a hint "arrives where people are already looking", which holds only while the
+  announcement is still on screen; in a busy channel an edit to a card twenty messages up is
+  invisible, so the feature meant to rescue a stalling puzzle did nothing at the one moment it
+  mattered. Deleting first would open a window where a live puzzle has no card at all, and a
+  refused or rate-limited send never closes it. Same shape as backup's temp-then-rename.
+  `Announced` returns the superseded ID so nothing leaks when a win races the repost.
+
+**`announce` must not abandon the game, and the caller decides.** It serves two moments that
+want opposite things from a refusal: a puzzle whose FIRST card was refused is invisible and has
+to be abandoned or it blocks the channel until it times out, whereas a puzzle whose HINT was
+refused still has its original card up and is perfectly playable. Folding the abandon into the
+shared function deleted live games, and the test that found it was asking what a refused hint
+costs the winner.
+
+**A gauntlet advances on the previous puzzle CONCLUDING, not on a clock.** `!wordgame <n>`
+queues a run; the first puzzle starts immediately and every later one comes from `DueStarts`,
+collected by the sweep, so a slow round pushes the rest back instead of stacking puzzles. Both
+endings count, because recording only the solve would stall a run on the ending nobody is around
+for. The queue maps are bounded by `MaxChannels` (this repo has shipped an unbounded per-channel
+map twice) and live in memory only: a gauntlet is a five-minute event, so a restart dropping it
+is correct, where a week of wins is not re-derivable and is persisted. A run cancels on
+`Abandon`, because the guard refuses for reasons that do not clear on their own and the
+alternative is marching the whole gauntlet through the same refusal one puzzle at a time. A
+gauntlet win is an **ordinary** win worth ordinary points: the run is pacing, not a second
+scoring economy.
+
+**The board ranks by points and `BackfillPoints` converts a week already in progress.** It lives
+in `games.Init` rather than in `internal/wordgame` because `PointsBase` is configuration and that
+package reads none, which is the same rule `ScanTopics` states about its filters living in
+`health`. Old wins convert at the full no-hint value, which is generous on purpose: the
+alternative ranks an active server off a field that is zero for everybody, overpaying preserves
+the ORDER players actually notice, and the next weekly reset makes it moot.
+
+**`Authorized` widened to guild Administrator and is still one function.** It takes a
+`Requester` carrying Discord's computed permissions, resolved from the **state cache** on the
+bang path (no REST call, available since M3 added `IntentsGuilds`) and failing closed on a miss.
+A bot whose games only start when one specific user is awake is a bot whose games mostly do not
+start, and deferring to the decision the server already made beats maintaining a worse second
+opinion about it. The failure mode a second copy would have is the empty case, which fails
+**open**, and no behavioural test can cover the command nobody has written yet.
+
+**Puzzles are embeds, and Components V2 is deliberately not adopted yet.** `Guard.SendEmbed`
+already runs `CheckEmit` over every text field, so the richer card cost no new gate surface. V2
+exists in discordgo v0.29 and the one thing it uniquely buys is a button beside the text, but
+its flag **disables `content` and `embeds`**, so `embedText` would stop covering these messages
+and a recursive component walker would become load-bearing safety code, over an interface whose
+unknown types a walker silently skips. Paying that for layout polish while the payoff needs an
+interaction handler nobody has built is the wrong order.
 
 **A planted word is held to the dictionary's own rules, through the same function.**
 `LoadDictionary` excludes words with fewer than two distinct letters *specifically* because
