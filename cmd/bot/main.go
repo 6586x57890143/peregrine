@@ -88,6 +88,14 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 	purgeAuthor := flag.String("purge-author", "",
 		"Remove one Discord user ID's contribution to author-diversity counts, then exit. "+
 			"The surgical alternative to discarding a corpus one bad actor has poisoned.")
+	// Also deliberately unused, for the reason -clean-db's value is. This one opens the
+	// corpus READ-ONLY, which is the whole difference between it and its neighbours:
+	// storage.Open creates missing buckets, stamps a schema version and can run the v2
+	// migration that empties the image cache, and a mode that mutates the corpus it was
+	// asked to measure has changed the thing it is describing.
+	_ = flag.Bool("corpus-report", false,
+		"Measure the corpus and print its distributions, then exit. Opens read-only and "+
+			"writes nothing, so it runs against a snapshot from -compact or the backup service.")
 	tuningReport := flag.String("tuning-report", "",
 		"Summarize a tuning export directory (or one .jsonl file) and exit. Reads no corpus "+
 			"and contacts nothing, so it runs against an archive pulled off the host.")
@@ -148,7 +156,7 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 	// not require one: an operator cleaning a poisoned corpus should not need a
 	// live credential to do it. bbolt holds an exclusive flock, so these fail
 	// within five seconds against a live bot rather than hanging.
-	if passed["clean-db"] || passed["compact"] || passed["purge-author"] {
+	if passed["clean-db"] || passed["compact"] || passed["purge-author"] || passed["corpus-report"] {
 		return runMaintenance(cfg, log, passed, *compactTo, *purgeAuthor)
 	}
 
@@ -300,7 +308,7 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 // want and an ambiguous thing to write, so the operator states the sequence.
 func runMaintenance(cfg *config.Config, log *slog.Logger, passed map[string]bool, compactTo, purgeAuthor string) error {
 	modes := 0
-	for _, name := range []string{"clean-db", "compact", "purge-author"} {
+	for _, name := range []string{"clean-db", "compact", "purge-author", "corpus-report"} {
 		if passed[name] {
 			modes++
 		}
@@ -316,6 +324,32 @@ func runMaintenance(cfg *config.Config, log *slog.Logger, passed map[string]bool
 	if passed["compact"] && compactTo == "" {
 		return errors.New("-compact needs a destination path. It writes a new file rather than " +
 			"replacing the corpus in place, so that a compaction that goes wrong costs nothing")
+	}
+
+	// The report opens read-only and therefore takes a SHARED flock, so unlike its
+	// neighbours it cannot run against a corpus a live bot is holding. That is the honest
+	// outcome rather than a limitation to work around: the intended input is a snapshot,
+	// and internal/plugins/backup already produces consistent ones. It is opened here
+	// rather than in a branch below because storage.Open and storage.OpenReadOnly are
+	// different calls, and the whole point of the mode is which one it makes.
+	if passed["corpus-report"] {
+		store, err := storage.OpenReadOnly(cfg.DBPath)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err := store.Close(); err != nil {
+				log.Error("closing corpus", "err", err)
+			}
+		}()
+
+		log.Info("running maintenance mode", "mode", "corpus-report", "corpus", cfg.DBPath,
+			"min_distinct_authors", cfg.MinDistinctAuthors)
+		st, err := store.CorpusStats(cfg.MinDistinctAuthors, learn.EndToken)
+		if err != nil {
+			return err
+		}
+		return maintenance.CorpusReport(st, cfg.MinDistinctAuthors, os.Stdout)
 	}
 
 	store, err := storage.Open(cfg.DBPath)
