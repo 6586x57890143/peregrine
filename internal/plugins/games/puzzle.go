@@ -57,7 +57,10 @@ const sep = " · "
 // different moments and two builders would be two places for the round number or the stake to go
 // stale.
 func puzzleMessage(g *wordgame.Game, points int) string {
-	lines := []string{"## " + g.Scrambled}
+	// The call to action, back by request and lowercase like everything else. It costs a line
+	// on every puzzle, which is why it is the ONLY line above the scramble: the layout under it
+	// is unchanged, so the header still carries the word and the subtext still carries the rest.
+	lines := []string{"✨ **unscramble** ✨", "## " + g.Scrambled}
 	meta := []string{}
 
 	if g.Rounds > 0 {
@@ -100,15 +103,60 @@ func timeoutMessage(word string) string {
 	return fmt.Sprintf("nobody got **%s**", word)
 }
 
-// gauntletDoneMessage closes out a run.
+// gauntletDoneMessage closes out a run and recaps what everybody took from it.
 //
 // A run that just stops is indistinguishable from a run that broke, which is finding 32's shape:
 // the bot going quiet is fine, a player being unable to tell whether that was the design is not.
-// It carries no standings of its own, because a gauntlet win is an ordinary win and the weekly
-// board is where wins are counted.
-func gauntletDoneMessage(rounds int) string {
-	return fmt.Sprintf("that's all %s\n%s",
-		plural(rounds, "round"), subtext("`!leaderboard` for the damage"))
+//
+// # The recap is a report, not a second scoring economy
+//
+// Every number here is ordinary points that have already gone to the weekly board. Nothing is
+// scored twice and nothing is scored differently inside a run. What this adds is the thing a run
+// has that a lone puzzle does not: a result. That is also why it sits next to the pointer at the
+// leaderboard rather than replacing it, since the recap is the match and the board is the season.
+//
+// Capped at recapPlaces, because a long run in a busy channel can have more winners than anybody
+// wants to read on one line, and the people who took nothing are not the story.
+func gauntletDoneMessage(rounds int, standings []wordgame.Standing) string {
+	if len(standings) == 0 {
+		// Said rather than omitted, for the same reason the leaderboard says "no points this
+		// week": a missing line is indistinguishable from a bug.
+		return fmt.Sprintf("that's all %s, and nobody scored\n%s",
+			plural(rounds, "round"), subtext("`!leaderboard` for the damage"))
+	}
+
+	parts := make([]string, 0, recapPlaces)
+	for i, st := range standings {
+		if i == recapPlaces {
+			break
+		}
+		parts = append(parts, fmt.Sprintf("%s **%s** %d",
+			place(i), wordgame.TruncateRunes(recapName(st), 16), st.Points))
+	}
+	return fmt.Sprintf("that's all %s\n%s\n%s",
+		plural(rounds, "round"), strings.Join(parts, sep),
+		subtext("`!leaderboard` for the damage"))
+}
+
+// recapPlaces is how many winners a run recap names.
+const recapPlaces = 3
+
+// place decorates a recap position with the same medals the leaderboard uses, because a player
+// who has seen one board should not have to learn a second vocabulary for the other.
+func place(i int) string {
+	if i < len(medals) {
+		return medals[i]
+	}
+	return "*"
+}
+
+// recapName falls back to the ID rather than rendering an empty bold pair, matching the
+// leaderboard's own fallback: showing the ID beats showing nothing.
+func recapName(st wordgame.Standing) string {
+	if st.Name == "" {
+		return st.UserID
+	}
+	return st.Name
 }
 
 // subtext renders one small grey line from its non-empty parts.

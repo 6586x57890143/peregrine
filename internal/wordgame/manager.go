@@ -192,6 +192,15 @@ type Manager struct {
 	rounds  map[string]int // how many were asked for, so a puzzle can say "Round 2 of 5"
 	readyAt map[string]time.Time
 
+	// tally is what each player took from the run in progress, so it can be recapped when the
+	// run ends. Display only: these ARE ordinary points and they have already gone to the
+	// weekly board, so this is a report rather than a second scoring economy.
+	//
+	// Naturally bounded twice over. The outer map is per channel and evicted with the rest of
+	// the gauntlet state; the inner one cannot hold more entries than the run has rounds,
+	// which GauntletMax caps.
+	tally map[string]map[string]Standing
+
 	dict    *Dictionary
 	src     Source
 	counter Counter
@@ -240,6 +249,7 @@ func NewManager(dict *Dictionary, src Source, counter Counter, opts Options) *Ma
 		started: map[string]time.Time{},
 		queued:  map[string]int{},
 		rounds:  map[string]int{},
+		tally:   map[string]map[string]Standing{},
 		readyAt: map[string]time.Time{},
 		dict:    dict,
 		src:     src,
@@ -398,6 +408,7 @@ func (m *Manager) Abandon(channelID string) {
 	delete(m.queued, channelID)
 	delete(m.rounds, channelID)
 	delete(m.readyAt, channelID)
+	delete(m.tally, channelID)
 }
 
 // Guess reports whether a message solves the live game in its channel.
@@ -573,7 +584,86 @@ func (m *Manager) evictOldestGauntlet(protect string) {
 		delete(m.queued, oldestID)
 		delete(m.rounds, oldestID)
 		delete(m.readyAt, oldestID)
+		delete(m.tally, oldestID)
 	}
+}
+
+// Standing is one player's take from a gauntlet.
+type Standing struct {
+	UserID string
+
+	// Name is the display name as it was when the win landed, stored rather than resolved
+	// later for the reason AddWin stores one: the recap is rendered from a code path that has
+	// no name resolver and no business acquiring one, and resolving at render time would put
+	// REST calls on the end of a run.
+	Name string
+
+	Points int
+	Wins   int
+}
+
+// RecordRunWin adds a win to the tally for the run in a channel.
+//
+// The caller decides whether a win belongs to a run, by asking the Game it just resolved rather
+// than by asking this package whether one is in flight. That is not indirection: StartWord
+// deletes the queue the moment the LAST round starts, so a gauntlet is already "not running" by
+// the time its final puzzle is solved, and gating here would silently drop the win that closes
+// every single run. The Game carries its own Round and Rounds, which is the durable answer.
+func (m *Manager) RecordRunWin(channelID, userID, name string, points int) {
+	if userID == "" {
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.tally[channelID] == nil {
+		m.tally[channelID] = map[string]Standing{}
+		if len(m.tally) > m.opts.MaxChannels {
+			m.evictOldestGauntlet(channelID)
+		}
+	}
+	e := m.tally[channelID][userID]
+	e.UserID = userID
+	e.Name = name // refreshed, because people rename themselves mid-run
+	e.Points += points
+	e.Wins++
+	m.tally[channelID][userID] = e
+}
+
+// TakeRunTally returns a run's standings and forgets them.
+//
+// Take rather than read, because whoever reads it owns it: a tally left behind after the run it
+// describes has ended is a per-channel map growing with every gauntlet the bot ever runs, which
+// is the leak this repo has shipped twice. Abandon clears it for the runs that never get here.
+//
+// Sorted by points, then by wins, then by user ID. The last is arbitrary and stable, which is
+// the requirement the leaderboard's own tie rule states: an unstable order makes two renderings
+// of one result disagree.
+func (m *Manager) TakeRunTally(channelID string) []Standing {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entries := m.tally[channelID]
+	if len(entries) == 0 {
+		return nil
+	}
+	delete(m.tally, channelID)
+
+	out := make([]Standing, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Points != out[j].Points {
+			return out[i].Points > out[j].Points
+		}
+		if out[i].Wins != out[j].Wins {
+			return out[i].Wins > out[j].Wins
+		}
+		return out[i].UserID < out[j].UserID
+	})
+	return out
 }
 
 // evictOldestCooldown drops the oldest cooldown entry, never the one being written.
