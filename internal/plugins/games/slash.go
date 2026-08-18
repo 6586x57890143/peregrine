@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 
@@ -44,9 +47,35 @@ import (
 // two are visibly the same thing rather than two features.
 const commandName = "wordgame"
 
+// configCommandName is the settings command. A SECOND command rather than a subcommand tree or
+// more options on the first, because the two are different jobs with different audiences: one
+// starts a puzzle everybody sees, the other changes where puzzles happen and answers only the
+// operator. Overloading /wordgame would also have meant every start of a game carrying four
+// options that have nothing to do with starting one.
+//
+// There is deliberately no bang equivalent. commandFor accepts exactly two tokens whose first is
+// the command, which is what keeps "you should try !wordgame sometime" ordinary chat, and
+// "mode interval" is three; and a settings answer wants to be ephemeral for the reason M21b
+// states about refusals.
+const configCommandName = "wordgame-config"
+
 const (
 	optWord  = "word"
 	optCount = "count"
+
+	optChannel  = "channel"
+	optMode     = "mode"
+	optInterval = "interval"
+	optReset    = "reset"
+)
+
+// The channel option's three verbs. Verbs rather than a channel argument, because the answer is
+// almost always "here": an operator types the command in the channel they want puzzles in, and a
+// channel picker would let them bind a voice channel or a category the bot cannot post to.
+const (
+	channelBind     = "bind"
+	channelUnbind   = "unbind"
+	channelAnywhere = "anywhere"
 )
 
 // definitions is what gets registered. One command with two optional options, mirroring the bang
@@ -74,6 +103,49 @@ func definitions() []*discordgo.ApplicationCommand {
 				// bound is a courtesy and that one is the rule.
 				MinValue: ptr(1.0),
 				MaxValue: 50,
+			},
+		},
+	}, {
+		Name:        configCommandName,
+		Description: "Show or change where and how word games run",
+		Options: []*discordgo.ApplicationCommandOption{
+			{
+				Type:        discordgo.ApplicationCommandOptionString,
+				Name:        optChannel,
+				Description: "Bind games to this channel, unbind it, or allow anywhere",
+				Required:    false,
+				Choices: []*discordgo.ApplicationCommandOptionChoice{
+					{Name: "bind this channel", Value: channelBind},
+					{Name: "unbind this channel", Value: channelUnbind},
+					{Name: "allow anywhere", Value: channelAnywhere},
+				},
+			},
+			{
+				Type:        discordgo.ApplicationCommandOptionString,
+				Name:        optMode,
+				Description: "Start puzzles when a channel is busy, or on a timer",
+				Required:    false,
+				Choices: []*discordgo.ApplicationCommandOptionChoice{
+					{Name: "activity", Value: string(ModeActivity)},
+					{Name: "interval", Value: string(ModeInterval)},
+				},
+			},
+			{
+				Type:        discordgo.ApplicationCommandOptionInteger,
+				Name:        optInterval,
+				Description: "Minutes between puzzles in interval mode",
+				Required:    false,
+				// Discord's bound is a courtesy so the client refuses an absurd number before it
+				// costs a round trip; clampInterval is the rule, for the same reason the gauntlet
+				// count is bounded in both places.
+				MinValue: ptr(float64(minInterval / time.Minute)),
+				MaxValue: float64(maxInterval / time.Minute),
+			},
+			{
+				Type:        discordgo.ApplicationCommandOptionBoolean,
+				Name:        optReset,
+				Description: "Write the environment's values back over the stored ones",
+				Required:    false,
 			},
 		},
 	}}
@@ -114,7 +186,14 @@ func (s *Service) onInteraction(_ *discordgo.Session, ic *discordgo.InteractionC
 		// event or a shape this build does not know. Ignored rather than answered.
 		return
 	}
-	if ic.ApplicationCommandData().Name != commandName {
+	name := ic.ApplicationCommandData().Name
+	var handle func(*discordgo.Interaction)
+	switch name {
+	case commandName:
+		handle = s.handleInteraction
+	case configCommandName:
+		handle = s.handleConfig
+	default:
 		return
 	}
 
@@ -122,11 +201,11 @@ func (s *Service) onInteraction(_ *discordgo.Session, ic *discordgo.InteractionC
 	if s.dispatcher == nil {
 		// No dispatcher means Init never ran, which cannot happen in production. Handled
 		// inline rather than dropped, so a test does not need one.
-		s.handleInteraction(i)
+		handle(i)
 		return
 	}
-	if !s.dispatcher.Submit(func(context.Context) { s.handleInteraction(i) }) {
-		log.Printf("[WORDGAME] Dropped a /%s: the work queue is full.", commandName)
+	if !s.dispatcher.Submit(func(context.Context) { handle(i) }) {
+		log.Printf("[WORDGAME] Dropped a /%s: the work queue is full.", name)
 	}
 }
 
@@ -157,6 +236,11 @@ func (s *Service) handleInteraction(i *discordgo.Interaction) {
 		// Ephemerally, which is the whole point: the person who asked learns why, and nobody
 		// else learns that the command exists.
 		s.guard.Respond(i, "you need Administrator here to start a word game", true)
+		return
+	}
+
+	if !s.allowed(i.ChannelID) {
+		s.guard.Respond(i, "word games are restricted to another channel", true)
 		return
 	}
 
@@ -286,4 +370,137 @@ func interactionArgs(i *discordgo.Interaction) (word string, count int) {
 		}
 	}
 	return word, count
+}
+
+// handleConfig is /wordgame-config: show the settings, or change them.
+//
+// # It is NOT gated on allowed()
+//
+// Every other path here refuses a channel that is not on the allowlist, and this one must not:
+// the command an operator runs to bind the channel they are standing in cannot require that
+// channel to already be bound. That is the same trap as an authorization check that fails open on
+// an empty string, in the other direction, and it would make the feature unrecoverable from
+// Discord once somebody bound the wrong channel.
+//
+// Every exit answers, ephemerally, for the reason handleInteraction states: an interaction with no
+// response shows the caller Discord's own red failure after three seconds, and a settings command
+// that appears to do nothing is worse than one that says no.
+func (s *Service) handleConfig(i *discordgo.Interaction) {
+	who := interactionRequester(i)
+	if !s.Authorized(who) {
+		if s.opts.AdminUserID == "" {
+			log.Printf("[WORDGAME] /%s in %s was refused because "+
+				"PEREGRINE_BOOTSTRAP_ADMIN_USER_ID is unset and the caller is not a guild "+
+				"administrator, so the check fails closed and refuses everyone.",
+				configCommandName, i.ChannelID)
+		} else {
+			log.Printf("[WORDGAME] /%s in %s from %s was refused: not the configured admin and "+
+				"not a guild administrator.", configCommandName, i.ChannelID, who.UserID)
+		}
+		s.guard.Respond(i, "you need Administrator here to change word-game settings", true)
+		return
+	}
+
+	channel, mode, minutes, reset := configArgs(i)
+	if channel == "" && mode == "" && minutes == 0 && !reset {
+		// No options is a read. The command with nothing filled in is how an operator asks what
+		// the bot is currently doing, which is the question the log line at startup answers once
+		// and then scrolls away.
+		s.guard.Respond(i, "word games: "+s.snapshot().String(), true)
+		return
+	}
+
+	var notes []string
+	set := s.update(func(set *settings) {
+		if reset {
+			// Applied FIRST, so an operator can reset and set something in one command rather
+			// than watching their change be overwritten by the reset in the same call.
+			*set = settings{
+				Channels: s.opts.AllowChannels,
+				Mode:     s.opts.Mode,
+				Interval: s.opts.Interval,
+			}
+			notes = append(notes, "reset to the values this process started with")
+		}
+		switch channel {
+		case channelBind:
+			if !slices.Contains(set.Channels, i.ChannelID) {
+				set.Channels = append(set.Channels, i.ChannelID)
+			}
+			notes = append(notes, "bound to this channel")
+		case channelUnbind:
+			set.Channels = slices.DeleteFunc(set.Channels, func(id string) bool {
+				return id == i.ChannelID
+			})
+			// Said out loud, because an empty allowlist means ANYWHERE and unbinding the last
+			// channel therefore does the opposite of what "unbind" sounds like. An operator who
+			// tightened the list one channel at a time should not discover that by watching a
+			// puzzle appear somewhere else.
+			if len(set.Channels) == 0 {
+				notes = append(notes, "unbound this channel, and that was the last one, so "+
+					"games can now run anywhere")
+			} else {
+				notes = append(notes, "unbound this channel")
+			}
+		case channelAnywhere:
+			set.Channels = nil
+			notes = append(notes, "games can run anywhere")
+		}
+		// Checked against the two known modes rather than trusted, even though Discord only
+		// offers those two choices: an interaction payload is user input at a trust boundary, and
+		// an unrecognized mode is neither activity nor interval, so puzzles would simply stop
+		// starting with nothing to say why.
+		switch Mode(mode) {
+		case ModeActivity, ModeInterval:
+			set.Mode = Mode(mode)
+			notes = append(notes, "mode is "+mode)
+		case "":
+		default:
+			notes = append(notes, "ignored an unknown mode "+strconv.Quote(mode))
+		}
+		if minutes > 0 {
+			set.Interval = clampInterval(time.Duration(minutes) * time.Minute)
+			notes = append(notes, "interval is "+set.Interval.String())
+		}
+	})
+
+	log.Printf("[WORDGAME] %s changed the settings via /%s: %s",
+		who.UserID, configCommandName, set)
+	// The change AND the resulting state, because a diff alone leaves an operator guessing at
+	// what the other two dials are, and interval mode with an interval nobody has checked is the
+	// combination that surprises people.
+	s.guard.Respond(i, strings.Join(notes, ", ")+".\nword games: "+set.String(), true)
+}
+
+// clampInterval keeps a requested period inside the bounds Discord's own option only asks
+// politely about. An interaction payload is user input at a trust boundary like any other.
+func clampInterval(d time.Duration) time.Duration {
+	return min(max(d, minInterval), maxInterval)
+}
+
+// configArgs reads the four optional options.
+//
+// All four are optional and any combination is legal, because they are independent dials rather
+// than alternatives: "bind here and switch to interval every 20 minutes" is one intention and
+// should be one command.
+func configArgs(i *discordgo.Interaction) (channel, mode string, minutes int, reset bool) {
+	if i == nil {
+		return "", "", 0, false
+	}
+	for _, opt := range i.ApplicationCommandData().Options {
+		if opt == nil {
+			continue
+		}
+		switch opt.Name {
+		case optChannel:
+			channel = opt.StringValue()
+		case optMode:
+			mode = opt.StringValue()
+		case optInterval:
+			minutes = int(opt.IntValue())
+		case optReset:
+			reset = opt.BoolValue()
+		}
+	}
+	return channel, mode, minutes, reset
 }
