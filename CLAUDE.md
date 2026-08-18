@@ -243,6 +243,37 @@ The dictionary load used to be `log.Fatalf`, so a missing 64 KB word list killed
 
 **`/wordgame` is the blessed path and `!wordgame` still works.** A soft move: nobody's muscle memory breaks. The slash command is what M21b's dilemma needed, because its answers can be **ephemeral**. Answering a non-admin in the channel advertises that the command exists and that they are not allowed to use it, so the bang command refuses in silence, and the case that actually bit was the operator's own: with `PEREGRINE_BOOTSTRAP_ADMIN_USER_ID` unset the check fails closed and refuses the person who deployed the bot, with the reason only in the log. A private reply says no to the person who asked and to nobody else.
 
+**Where games run, how they start and how often are STORED, not environmental, as of M30.**
+`internal/plugins/games/settings.go` keeps them in a `BlobConfig` blob, the way aggro persists its
+target, and `/wordgame-config` is the only thing that writes it. `PEREGRINE_WORDGAME_CHANNELS`,
+`PEREGRINE_WORDGAME_FREQUENCY_MODE` and `PEREGRINE_WORDGAME_INTERVAL` seed a corpus that has never
+had settings stored and are ignored after the first change, which is the knob-wired-to-nothing
+trap pointing the other way: an operator editing `.env` during an incident would watch nothing
+happen. So `Init` **logs which source won**, and `reset:true` writes the environment's values back
+over the stored ones. Four things about it are load-bearing:
+
+- **The config command is not gated on the allowlist it edits.** Every other path refuses a channel
+  that is not on the list, and this one must not: the command that binds the channel you are
+  standing in cannot require that channel to already be bound. Getting that wrong would leave the
+  feature unrecoverable from Discord the moment somebody bound the wrong channel, which is a
+  fail-open authorization check's shape in reverse.
+- **Unbinding the last channel means anywhere**, because an empty list means anywhere, which is the
+  opposite of what the word sounds like. The reply says so rather than letting an operator find out
+  by watching a puzzle appear somewhere else.
+- **The interval poster rides the sweep and no longer owns a `core.Loop`.** A Loop's period is fixed
+  when it starts, so a configurable interval and a dedicated ticker are incompatible without
+  rebuilding the loop on every edit. The cost is one sweep tick of resolution, five seconds by
+  default against a five-minute minimum, and `maybeInterval` holds the lock across the elapsed
+  check and the timestamp write so two sweeps cannot both decide the period is over. `lastInterval`
+  is deliberately not persisted: a restart owing a puzzle for time the bot was not running is not a
+  setting.
+- **A second command, and no bang equivalent.** `commandFor` accepts exactly two tokens whose first
+  is the command, which is what keeps "you should try !wordgame sometime" ordinary chat, and
+  `mode interval` is three. A settings answer also wants to be ephemeral, for the reason M21b
+  states about refusals. The mode is checked against the two known values rather than trusted,
+  because an interaction payload is input and an unrecognized mode would stop puzzles starting with
+  nothing in the settings to say why.
+
 **Every exit from the interaction handler answers, which is finding 32 inverted.** The bot staying quiet in a channel is a design decision; an interaction that is never responded to is Discord showing the caller a red failure after three seconds. The acknowledgement is ephemeral and the **puzzle is a normal channel post**, which is the split that makes this worth doing: what everybody should see goes to the channel, what only the operator needs goes to the operator. Permissions arrive already computed in the payload, so this path makes no REST call and consults no cache, and feeds the same one `Authorized` the bang path resolves from the state cache. The handler registers in `Init` (discordgo dispatches inside `Open`, which happens between `Init` and `Start`) and dispatches through `core.Dispatcher`; command registration happens in `Start`, because it is a REST call and the first moment the application ID is knowable.
 
 **A refusal that says nothing is the bug, not the silence itself.** `!wordgame` used to `return` on

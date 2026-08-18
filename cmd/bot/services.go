@@ -157,6 +157,13 @@ func registerServices(
 		CacheSize:    cfg.ImageCacheSize,
 		MaxPerAuthor: cfg.ImageMaxPerAuthor,
 	})
+	// Word games take their own channel allowlist, falling back to the autonomous-post one:
+	// that list is what restricted interval mode before PEREGRINE_WORDGAME_CHANNELS existed,
+	// so an operator who set only the old one keeps the behaviour they had.
+	wordGameChannels := cfg.WordGameChannels
+	if len(wordGameChannels) == 0 {
+		wordGameChannels = cfg.AutonomousPostChannels
+	}
 	gamesSvc := games.New(store, guard, manager, tracker, resolver, games.Options{
 		Enabled:             cfg.EnableWordGames,
 		Mode:                games.Mode(cfg.WordGameMode),
@@ -164,7 +171,7 @@ func registerServices(
 		LeaderboardTick:     cfg.LeaderboardTick,
 		SweepTick:           cfg.WordGameSweepTick,
 		ActiveChannelWindow: cfg.ActiveChannelWindow,
-		AllowChannels:       cfg.AutonomousPostChannels,
+		AllowChannels:       wordGameChannels,
 		AdminUserID:         cfg.AdminUserID,
 		PointsBase:          cfg.WordGamePointsBase,
 	})

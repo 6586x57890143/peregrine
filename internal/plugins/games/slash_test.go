@@ -269,25 +269,41 @@ func TestOnlyOurOwnCommandIsHandled(t *testing.T) {
 // silently ignores its argument, which is the worst outcome available here: it looks like it
 // worked. Nothing else checks that these two agree.
 func TestTheRegisteredCommandMatchesWhatTheHandlerReads(t *testing.T) {
-	defs := definitions()
-	if len(defs) != 1 {
-		t.Fatalf("definitions() returned %d commands, want 1", len(defs))
-	}
-	if defs[0].Name != commandName {
-		t.Errorf("registered as %q but the handler answers %q", defs[0].Name, commandName)
+	// Every command onInteraction dispatches, against every option its handler reads. Keyed by
+	// name rather than by index so adding a command is a row here and not a rewrite.
+	want := map[string][]string{
+		commandName:       {optWord, optCount},
+		configCommandName: {optChannel, optMode, optInterval, optReset},
 	}
 
-	names := map[string]bool{}
-	for _, o := range defs[0].Options {
-		names[o.Name] = true
+	defs := definitions()
+	if len(defs) != len(want) {
+		t.Fatalf("definitions() returned %d commands, want %d", len(defs), len(want))
 	}
-	for _, want := range []string{optWord, optCount} {
-		if !names[want] {
-			t.Errorf("the handler reads option %q, which is not registered, so it can never "+
-				"arrive and the command silently ignores it", want)
+	for _, def := range defs {
+		options, ok := want[def.Name]
+		if !ok {
+			t.Errorf("registered %q, which onInteraction does not dispatch, so it appears in "+
+				"every client and answers nothing", def.Name)
+			continue
 		}
+		names := map[string]bool{}
+		for _, o := range def.Options {
+			names[o.Name] = true
+		}
+		for _, opt := range options {
+			if !names[opt] {
+				t.Errorf("/%s reads option %q, which is not registered, so it can never "+
+					"arrive and the command silently ignores it", def.Name, opt)
+			}
+		}
+		if def.Description == "" {
+			t.Errorf("/%s has no description; Discord refuses a command without one", def.Name)
+		}
+		delete(want, def.Name)
 	}
-	if defs[0].Description == "" {
-		t.Error("no description; Discord refuses a command without one")
+	for name := range want {
+		t.Errorf("onInteraction dispatches /%s, which is not registered, so nobody can run it",
+			name)
 	}
 }

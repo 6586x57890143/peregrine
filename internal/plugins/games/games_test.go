@@ -375,6 +375,30 @@ func TestWordgameOnRequestNeedsAuthorization(t *testing.T) {
 	onePuzzle(t, guard)
 }
 
+// TestGamesRunOnlyInAllowedChannels. PEREGRINE_WORDGAME_CHANNELS is an allowlist for the
+// feature rather than a denylist for the whole bot, so a server that wants puzzles in exactly
+// one channel does not have to list every other channel on PEREGRINE_IGNORE_CHANNELS. The
+// refusal is spoken because the caller is already an admin: there is nothing to hide from
+// them, and a command that silently does nothing is the shape finding 32 is about.
+func TestGamesRunOnlyInAllowedChannels(t *testing.T) {
+	opts := enabled()
+	opts.AllowChannels = []string{"c1"}
+	s, guard, _, _ := fixture(t, opts)
+
+	if consumed := s.Command("!wordgame", "", "c2", admin(snowflake(1)), noNames); !consumed {
+		t.Error("!wordgame in a disallowed channel was not consumed; it is still a command")
+	}
+	if got := guard.puzzles(); len(got) != 0 {
+		t.Errorf("a puzzle started in a channel that is not on the allowlist: %v", got)
+	}
+	if len(guard.posts()) != 1 {
+		t.Errorf("the refusal said nothing: %v", guard.posts())
+	}
+
+	s.Command("!wordgame", "", "c1", admin(snowflake(1)), noNames)
+	onePuzzle(t, guard)
+}
+
 // ---------------------------------------------------------------- the game
 
 // TestAnnouncingIsTwoStepsSoARefusalDoesNotBlockTheChannel.
