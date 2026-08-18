@@ -91,9 +91,13 @@ type Options struct {
 	// channel worth posting in.
 	ActiveChannelWindow time.Duration
 
-	// AllowChannels restricts interval mode, and it is the autonomous-post allowlist:
-	// an operator who has said "only speak unprompted in these channels" has said it about
-	// this too.
+	// AllowChannels restricts where puzzles may run: the activity trigger, interval mode
+	// and both operator commands. Empty means anywhere, because an operator who has not
+	// said where games belong has not said no.
+	//
+	// It defaults to the autonomous-post allowlist in cmd/bot, since an operator who has
+	// said "only speak unprompted in these channels" has said it about this too, and that
+	// list is all interval mode had before PEREGRINE_WORDGAME_CHANNELS existed.
 	AllowChannels []string
 
 	// AdminUserID may run !wordgame. Empty refuses everyone who is not a guild administrator.
@@ -122,6 +126,17 @@ type Service struct {
 	loops       sync.WaitGroup
 	cancelLoops context.CancelFunc
 	logger      *slog.Logger
+
+	// The runtime dials, in settings.go: where puzzles may run, activity or interval, and how
+	// often. Options seeds them and /wordgame-config owns them from then on, which is why they
+	// are behind a mutex: the sweep reads them on a ticker and an interaction writes them.
+	mu  sync.RWMutex
+	set settings
+
+	// lastInterval is when interval mode last posted. It is here rather than in settings
+	// because it is not a setting: persisting it would mean a restart owing a puzzle for time
+	// the bot was not running.
+	lastInterval time.Time
 
 	// The slash command's two dependencies, both filled in by Init from core.Deps. Nil in
 	// tests that do not exercise it, which every path here tolerates: a service that needed a
@@ -158,6 +173,8 @@ func (s *Service) Init(deps core.Deps) error {
 	if s.session != nil {
 		s.session.AddHandler(s.onInteraction)
 	}
+
+	s.loadSettings()
 
 	if err := s.store.View(func(r *storage.Reader) error {
 		v, err := r.GetBlob(storage.BlobLeaderboard, "current")
@@ -212,18 +229,17 @@ func (s *Service) Start(ctx context.Context) error {
 	}}
 
 	if s.opts.Enabled {
+		s.mu.Lock()
+		s.lastInterval = time.Now()
+		s.mu.Unlock()
 		loops = append(loops, core.Loop{
 			Name:  "wordgame-sweep",
 			Every: s.opts.SweepTick,
-			Fn:    func(context.Context) { s.sweep() },
+			Fn: func(context.Context) {
+				s.sweep()
+				s.maybeInterval()
+			},
 		})
-		if s.opts.Mode == ModeInterval {
-			loops = append(loops, core.Loop{
-				Name:  "wordgame-interval",
-				Every: s.opts.Interval,
-				Fn:    func(context.Context) { s.startInterval() },
-			})
-		}
 	}
 
 	for _, l := range loops {
@@ -282,7 +298,7 @@ func (s *Service) Guess(channelID, messageID, content, authorID, displayName str
 	if !solved {
 		// No win. Start a game if the channel has earned one. The Manager asks the shared
 		// activity tracker how busy the channel has been rather than counting for itself.
-		if s.manager.MaybeStart(channelID) {
+		if s.allowed(channelID) && s.manager.MaybeStart(channelID) {
 			s.start(channelID)
 		}
 		return false
@@ -527,6 +543,14 @@ func (s *Service) startOnRequest(channelID string, who Requester, arg string) {
 		return
 	}
 
+	if !s.allowed(channelID) {
+		// Answered, unlike the authorization refusal above: this caller IS an admin, so
+		// there is nothing to hide from them and a command that silently does nothing is
+		// the failure mode that refusal comment is about.
+		s.guard.Send(channelID, "word games are restricted to another channel")
+		return
+	}
+
 	// A number is a gauntlet, a word is a planted puzzle. commandFor has already established
 	// that the argument is one or the other, so this only has to tell them apart.
 	if n, ok := gauntletArg(arg); ok {
@@ -571,6 +595,27 @@ func (s *Service) startOnRequest(channelID string, who Requester, arg string) {
 	log.Printf("[WORDGAME] Started a game on request in channel %s.", channelID)
 }
 
+// maybeInterval posts a puzzle when interval mode is on and its period has elapsed.
+//
+// It rides the SWEEP rather than owning a core.Loop of its own, which is the whole reason
+// /wordgame-config can change the mode and the interval at all: a Loop's period is fixed when it
+// starts, so a configurable interval and a dedicated ticker are incompatible without tearing the
+// loop down and rebuilding it on every edit. The cost is that the interval is accurate only to
+// one sweep tick, five seconds by default, against a minimum interval of five minutes.
+//
+// The elapsed check is under the lock with the timestamp write, so two sweeps cannot both decide
+// the same period is over.
+func (s *Service) maybeInterval() {
+	s.mu.Lock()
+	if s.set.Mode != ModeInterval || time.Since(s.lastInterval) < s.set.Interval {
+		s.mu.Unlock()
+		return
+	}
+	s.lastInterval = time.Now()
+	s.mu.Unlock()
+	s.startInterval()
+}
+
 // startInterval posts a puzzle on a timer, in interval mode.
 //
 // It picks the busiest channel the bot can see, for the same reason the activity trigger
@@ -579,7 +624,8 @@ func (s *Service) startInterval() {
 	if !s.manager.Available() {
 		return
 	}
-	channelID := channels.Busiest(s.counter, s.resolver, s.opts.ActiveChannelWindow, s.opts.AllowChannels)
+	channelID := channels.Busiest(s.counter, s.resolver, s.opts.ActiveChannelWindow,
+		s.snapshot().Channels)
 	if channelID == "" {
 		log.Println("[WORDGAME] No active channel found for an interval game.")
 		return
