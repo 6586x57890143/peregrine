@@ -196,8 +196,15 @@ type Config struct {
 	// They are not tuning knobs for their own sake: the timeout and the announcement TTL
 	// govern how much of the channel the game occupies, and the activity trigger governs
 	// whether the bot interrupts a conversation or joins one.
-	EnableWordGames           bool          // PEREGRINE_ENABLE_WORD_GAMES
-	WordGameMode              string        // PEREGRINE_WORDGAME_FREQUENCY_MODE
+	EnableWordGames bool   // PEREGRINE_ENABLE_WORD_GAMES
+	WordGameMode    string // PEREGRINE_WORDGAME_FREQUENCY_MODE
+
+	// WordGameChannels restricts where puzzles may run at all: automatic starts, the
+	// interval poster and the operator commands. Empty means anywhere, and cmd/bot falls
+	// back to PEREGRINE_AUTONOMOUS_POST_CHANNELS when it is unset, because that list is
+	// what governed interval mode before this variable existed.
+	WordGameChannels []string // PEREGRINE_WORDGAME_CHANNELS
+
 	WordGameInterval          time.Duration // PEREGRINE_WORDGAME_INTERVAL
 	WordGameDictionary        string        // PEREGRINE_WORDGAME_DICTIONARY
 	WordGameTimeout           time.Duration // PEREGRINE_WORDGAME_TIMEOUT
@@ -480,8 +487,9 @@ func Load() (*Config, error) {
 		// the feature is engagement: a game nobody can play is not a conservative
 		// default, it is a feature that does not exist. The failure mode of having it on
 		// is that the bot occasionally posts a puzzle, which is what it is for.
-		EnableWordGames: l.boolVal("PEREGRINE_ENABLE_WORD_GAMES", true),
-		WordGameMode:    l.enum("PEREGRINE_WORDGAME_FREQUENCY_MODE", WordGameModeActivity, WordGameModeInterval, WordGameModeActivity),
+		EnableWordGames:  l.boolVal("PEREGRINE_ENABLE_WORD_GAMES", true),
+		WordGameMode:     l.enum("PEREGRINE_WORDGAME_FREQUENCY_MODE", WordGameModeActivity, WordGameModeInterval, WordGameModeActivity),
+		WordGameChannels: l.csv("PEREGRINE_WORDGAME_CHANNELS"),
 
 		// 30 minutes, not the 2 minutes that stood here. Two was plainly a leftover from
 		// testing: a puzzle every two minutes in a busy channel is the bot talking over
