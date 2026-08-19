@@ -813,6 +813,53 @@ an unstable order made the ranking shuffle between two identical invocations. Or
 would be prettier and would put the names back on the critical path, which is the cost this
 change exists to remove.
 
+**The name resolver is `names.Display` and it belongs to `games` as of M32.** It used to be
+`chat.displayName`, handed downwards as a closure, so the reactor carried a member cache for
+one call it made on somebody else's behalf. Two paths ask the question now, and a GLOBAL board
+resolves people who are not in the caller's guild at all, which is what makes the `User`
+fallback ordinary rather than rare. Three sources, cheapest first: the gateway state cache
+(free), then `names.NewCachedSession` (bounded, TTL'd, shared with ingest and mentions), then a
+plain `User` lookup. **The raw ID is the last fallback rather than an error**, because a board
+that drops whoever left the server loses entries silently.
+
+**`/leaderboard` takes a scope, the board is PAGED, and the page rides in the `custom_id`.**
+`lb:<scope>:<page>`, so there is no pending map to leak and a restart still answers a press on
+an old message. **The guild is deliberately not in it**, against the milestone plan's own
+sketch: a component interaction already carries the guild it was pressed in, and a second copy
+that can disagree is a way to render one server's board into another, which is the leak M31
+exists to make unwritable. A press re-renders for **whoever pressed**, because the eleventh
+slot is the one row that is about the person looking.
+
+**`Rank`'s eleventh slot means "not on THIS page".** Paging away from your own row must not
+hide where you stand and paging onto it must not print you twice. Ranks are computed over the
+whole field before the slice, or page two would renumber everybody from one, and an
+out-of-range page is CLAMPED rather than refused, because a press arrives from a button on a
+message that may be older than the board.
+
+**Global sums, and only IDs and integers cross the boundary.** No word anybody typed moves
+between servers, which is why this does not undo M31. A guild whose corpus cannot be reached is
+skipped for a global board and fatal for a local one: one unreachable server must not empty
+everybody else's board, and a viewer asking about their own has to be told.
+
+**`/leaderboard` is registered whether or not word games are on**, and `definitions` filters
+the two commands that ARE the feature. `!leaderboard` has never been gated on the flag, because
+its chat half reads the stats bucket, which is populated on every message; a slash form that
+disagreed would be one command answering a question its twin refuses. The other direction is
+the knob-wired-to-nothing shape: a `/wordgame` visible in every client for a feature that is
+off is a command whose only possible answer is a refusal.
+
+**`Guard.UpdateEmbed` is a send, and "the reader already had this open" exempts nothing.** It
+runs the same `CheckEmit` walk, pause switch, ignore list and explicit `AllowedMentions` as
+`SendEmbed`, because what goes INTO the message is a freshly built board full of nicknames. The
+response type is `InteractionResponseUpdateMessage` and that is the behaviour rather than a
+detail: an ordinary response posts a SECOND board under the first. Button LABELS are not
+content-gated, for the reason `RegisterCommands` is not: they are this repository's own text.
+
+**`discordgo.MessageComponentData` type-ASSERTS.** An interaction whose type and its data
+disagree panics the goroutine reading it, and those are two independent fields off the wire.
+`games.componentID` is the comma-ok version; a test built the mismatched payload by hand and
+found it immediately.
+
 **`Guard.SendEmbed` runs `CheckEmit` over EVERY text field**, walking the struct rather than
 naming the two fields anybody remembers. Nicknames are user-controlled, so a blocklisted word
 in a field value is exactly as much of an incident as one in the description, and which of them

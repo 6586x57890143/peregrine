@@ -120,7 +120,7 @@ func TestSettingsSurviveARestart(t *testing.T) {
 
 	// A second Service over the SAME corpora, which is what a restart is from this package's
 	// point of view.
-	restarted := New(s.corpora, guard, manager, tracker, s.resolver, opts)
+	restarted := New(s.corpora, guard, manager, tracker, s.resolver, nil, opts)
 
 	got := restarted.snapshot(testGuild)
 	if got.Mode != ModeInterval || got.Interval != 20*time.Minute {
