@@ -86,7 +86,9 @@ type Options struct {
 
 // Service is the feature.
 type Service struct {
-	store    *storage.Store
+	// corpora is the SET, because the status this service reports is the whole bot's: one
+	// number per guild would be a log line nobody reads, and the presence line has one slot.
+	corpora  *storage.Set
 	queue    Queue
 	gate     Gate
 	latency  Latency
@@ -114,7 +116,7 @@ type Service struct {
 // Deps are the collaborators. A struct because the constructor reached seven positional
 // arguments, three of them optional interfaces, which is where argument-order bugs live.
 type Deps struct {
-	Store   *storage.Store
+	Corpora *storage.Set
 	Queue   Queue
 	Gate    Gate
 	Latency Latency
@@ -131,7 +133,7 @@ type Deps struct {
 // New builds the service.
 func New(d Deps, opts Options, presence PresenceOptions) *Service {
 	return &Service{
-		store: d.Store, queue: d.Queue, gate: d.Gate, latency: d.Latency,
+		corpora: d.Corpora, queue: d.Queue, gate: d.Gate, latency: d.Latency,
 		reporter: d.Reporter, presence: d.Presence, topics: d.Topics,
 		opts: opts, presenceOpts: presence,
 	}
@@ -202,13 +204,27 @@ func (s *Service) Shutdown(ctx context.Context) error {
 func (s *Service) reportStatus() {
 	start := time.Now()
 
+	// SUMMED over every guild, M31. The page walk is per corpus and so is its cost, which is
+	// the honest price of the split: the alternative is a status line per guild, and there is
+	// one presence line and one operator reading one log.
+	//
+	// A corpus that cannot be read is skipped rather than failing the report, for the reason
+	// every optional behaviour here is: one guild's problem must not blind the operator to the
+	// other twenty.
 	var st storage.Status
-	if err := s.store.View(func(r *storage.Reader) error {
-		st = r.Status()
-		return nil
-	}); err != nil {
-		s.logger.Error("reading corpus status", "err", err)
-		return
+	guilds := s.corpora.Guilds()
+	for _, guildID := range guilds {
+		store, err := s.corpora.For(guildID)
+		if err != nil {
+			s.logger.Error("reading corpus status", "guild", guildID, "err", err)
+			continue
+		}
+		if err := store.View(func(r *storage.Reader) error {
+			st = addStatus(st, r.Status())
+			return nil
+		}); err != nil {
+			s.logger.Error("reading corpus status", "guild", guildID, "err", err)
+		}
 	}
 
 	dropped, learnRejected, emitRejected := s.counters()
@@ -229,6 +245,7 @@ func (s *Service) reportStatus() {
 	// One record with everything, rather than a line per subsystem. An operator comparing two
 	// reports wants them adjacent.
 	s.logger.Info("status",
+		"guilds", len(guilds),
 		"ngrams", st.Ngrams,
 		"author_entries", st.AuthorEntries,
 		"topics", st.Topics,
@@ -321,4 +338,22 @@ func (l sessionLatency) HeartbeatLatency() time.Duration {
 		return 0
 	}
 	return l.s.HeartbeatLatency()
+}
+
+// addStatus sums two corpus statuses.
+//
+// Written out field by field rather than reflected over, because a new Status field that
+// nobody adds here should be a compile-time nudge rather than a silent zero in the report.
+func addStatus(a, b storage.Status) storage.Status {
+	return storage.Status{
+		Ngrams:        a.Ngrams + b.Ngrams,
+		AuthorEntries: a.AuthorEntries + b.AuthorEntries,
+		Topics:        a.Topics + b.Topics,
+		TopicWords:    a.TopicWords + b.TopicWords,
+		NameTopics:    a.NameTopics + b.NameTopics,
+		Names:         a.Names + b.Names,
+		HistoryWindow: a.HistoryWindow + b.HistoryWindow,
+		ImageCache:    a.ImageCache + b.ImageCache,
+		Learned:       a.Learned + b.Learned,
+	}
 }

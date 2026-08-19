@@ -28,7 +28,7 @@ func tracker(t *testing.T, traffic map[string]int) *activity.Tracker {
 	tr := activity.New(activity.Options{})
 	for id, n := range traffic {
 		for range n {
-			tr.Note(id, "someone")
+			tr.Note("g1", id, "someone")
 		}
 	}
 	return tr
@@ -40,7 +40,7 @@ func TestBusiestPicksTheChannelWithTheMostTraffic(t *testing.T) {
 	tr := tracker(t, map[string]int{"quiet": 2, "loud": 9})
 	res := fakeResolver{"quiet": text("quiet", "quiet"), "loud": text("loud", "memes")}
 
-	if got := channels.Busiest(tr, res, time.Hour, nil); got != "loud" {
+	if got := channels.Busiest(tr, res, time.Hour, nil, ""); got != "loud" {
 		t.Errorf("Busiest = %q, want loud", got)
 	}
 }
@@ -52,7 +52,7 @@ func TestBusiestFiltersWhileChoosing(t *testing.T) {
 	tr := tracker(t, map[string]int{"allowed": 3, "busiest": 30})
 	res := fakeResolver{"allowed": text("allowed", "allowed"), "busiest": text("busiest", "busiest")}
 
-	if got := channels.Busiest(tr, res, time.Hour, []string{"allowed"}); got != "allowed" {
+	if got := channels.Busiest(tr, res, time.Hour, []string{"allowed"}, ""); got != "allowed" {
 		t.Errorf("Busiest with an allowlist = %q, want the busiest ALLOWED channel", got)
 	}
 }
@@ -69,7 +69,7 @@ func TestBusiestSkipsWhatItCannotIdentify(t *testing.T) {
 		"known": text("known", "memes"),
 	}
 
-	if got := channels.Busiest(tr, res, time.Hour, nil); got != "known" {
+	if got := channels.Busiest(tr, res, time.Hour, nil, ""); got != "known" {
 		t.Errorf("Busiest = %q, want the only identifiable, text, safe-for-work channel", got)
 	}
 }
@@ -82,7 +82,7 @@ func TestBusiestIsQuietOnAColdStart(t *testing.T) {
 	tr := activity.New(activity.Options{})
 	res := fakeResolver{"c1": text("c1", "general")}
 
-	if got := channels.Busiest(tr, res, time.Hour, nil); got != "" {
+	if got := channels.Busiest(tr, res, time.Hour, nil, ""); got != "" {
 		t.Errorf("Busiest on a cold start = %q, want empty", got)
 	}
 }
@@ -94,7 +94,7 @@ func TestTheGeneralBonusIsApplied(t *testing.T) {
 	tr := tracker(t, map[string]int{"general": 10, "memes": 13})
 	res := fakeResolver{"general": text("general", "general"), "memes": text("memes", "memes")}
 
-	if got := channels.Busiest(tr, res, time.Hour, nil); got != "general" {
+	if got := channels.Busiest(tr, res, time.Hour, nil, ""); got != "general" {
 		t.Errorf("Busiest = %q, want general: the bonus is 1.5x and 10*1.5 beats 13", got)
 	}
 }
@@ -108,15 +108,15 @@ func TestBusiestIgnoresTrafficOutsideTheWindow(t *testing.T) {
 	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
 	tr := activity.New(activity.Options{Now: func() time.Time { return now }})
 	for range 50 {
-		tr.Note("stale", "someone")
+		tr.Note("g1", "stale", "someone")
 	}
 	res := fakeResolver{"stale": text("stale", "memes")}
 
-	if got := channels.Busiest(tr, res, time.Hour, nil); got != "stale" {
+	if got := channels.Busiest(tr, res, time.Hour, nil, ""); got != "stale" {
 		t.Fatalf("Busiest = %q before the window moved, want stale", got)
 	}
 	now = now.Add(2 * time.Hour)
-	if got := channels.Busiest(tr, res, time.Hour, nil); got != "" {
+	if got := channels.Busiest(tr, res, time.Hour, nil, ""); got != "" {
 		t.Errorf("Busiest = %q after the traffic aged out of the window, want empty", got)
 	}
 }
@@ -129,7 +129,7 @@ func TestAnEmptyAllowlistMeansNoRestriction(t *testing.T) {
 	res := fakeResolver{"c1": text("c1", "memes")}
 
 	for _, allow := range [][]string{nil, {}, {""}} {
-		if got := channels.Busiest(tr, res, time.Hour, allow); got != "c1" {
+		if got := channels.Busiest(tr, res, time.Hour, allow, ""); got != "c1" {
 			t.Errorf("Busiest with allow=%v = %q, want c1", allow, got)
 		}
 	}

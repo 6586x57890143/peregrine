@@ -38,9 +38,17 @@ import (
 	"github.com/6586x57890143/peregrine/internal/core"
 )
 
-// Snapshotter writes a consistent copy of the corpus to a path. *storage.Store satisfies it.
+// Snapshotter is the set of per-guild corpora to snapshot.
+//
+// An interface over the set rather than over one corpus, because M31 made a snapshot a
+// per-guild operation and the retention rules below have to know which family a file belongs
+// to. *storage.Set satisfies it.
 type Snapshotter interface {
-	Backup(path string) error
+	// Guilds is every guild with a corpus.
+	Guilds() []string
+
+	// Backup writes one guild's corpus to a path, consistently.
+	Backup(guildID, path string) error
 }
 
 // Options are the dials.
@@ -66,6 +74,13 @@ type Options struct {
 
 // prefix and suffix bracket the names this service creates. Retention matches on both, so a
 // prune can only ever remove a file this service named.
+//
+// The GUILD ID sits between the prefix and the timestamp as of M31: "markov-<guild>-<ts>.db".
+// Two things made that necessary rather than tidy. Keep is a per-guild promise, and a prune
+// that saw every guild's snapshots as one family would keep Keep files in total, which on five
+// guilds is one generation each. And the timestamp has one-second resolution, so five corpora
+// snapshotted on the same tick would collide on the rename and leave one file where five were
+// wanted.
 const (
 	prefix    = "markov-"
 	suffix    = ".db"
@@ -73,19 +88,28 @@ const (
 	timestamp = "20060102-150405"
 )
 
+// snapshotName is the one place a snapshot's name is built, so prune and Once cannot disagree
+// about what this service owns.
+func snapshotName(guildID string, at time.Time) string {
+	return prefix + guildID + "-" + at.UTC().Format(timestamp) + suffix
+}
+
+// familyPrefix is what every snapshot of one guild starts with.
+func familyPrefix(guildID string) string { return prefix + guildID + "-" }
+
 // Service is the feature.
 type Service struct {
-	store  Snapshotter
-	opts   Options
-	logger *slog.Logger
+	corpora Snapshotter
+	opts    Options
+	logger  *slog.Logger
 
 	loops       sync.WaitGroup
 	cancelLoops context.CancelFunc
 }
 
 // New builds the service.
-func New(store Snapshotter, opts Options) *Service {
-	return &Service{store: store, opts: opts}
+func New(corpora Snapshotter, opts Options) *Service {
+	return &Service{corpora: corpora, opts: opts}
 }
 
 func (s *Service) Name() string { return "backup" }
@@ -167,14 +191,27 @@ func (s *Service) Once() bool {
 		return false
 	}
 
+	// One tick, one snapshot per guild. A guild whose snapshot fails does NOT stop the others:
+	// the reason to have backups at all is the day something is already wrong.
+	ok := false
+	for _, guildID := range s.corpora.Guilds() {
+		if s.once(guildID) {
+			ok = true
+		}
+	}
+	return ok
+}
+
+// once snapshots one guild's corpus and, if that worked, prunes that guild's older ones.
+func (s *Service) once(guildID string) bool {
 	start := time.Now()
-	final := filepath.Join(s.opts.Dir, prefix+time.Now().UTC().Format(timestamp)+suffix)
+	final := filepath.Join(s.opts.Dir, snapshotName(guildID, time.Now()))
 	temp := final + tempMark
 
 	// Written under a temp name and renamed, because a half-written file with a real name is
 	// indistinguishable from a snapshot, and the one moment anybody looks in this directory is
 	// the moment they need a file that is definitely whole.
-	if err := s.store.Backup(temp); err != nil {
+	if err := s.corpora.Backup(guildID, temp); err != nil {
 		s.logger.Error("corpus snapshot failed; NOT pruning older ones", "err", err)
 		// The partial file goes, so a failed attempt does not leave debris that the next
 		// operator has to identify. Its own failure is logged and ignored: there is nothing
@@ -199,9 +236,11 @@ func (s *Service) Once() bool {
 			"took", time.Since(start))
 	}
 
-	// Pruning happens ONLY after a snapshot that worked. See the package comment: pruning on a
-	// schedule while backups fail deletes every good copy one tick at a time.
-	s.prune()
+	// Pruning happens ONLY after a snapshot that worked, and only within THIS guild's family.
+	// See the package comment: pruning on a schedule while backups fail deletes every good copy
+	// one tick at a time, and pruning across families would let a busy guild evict a quiet
+	// one's only copy.
+	s.prune(guildID)
 	return true
 }
 
@@ -210,7 +249,7 @@ func (s *Service) Once() bool {
 // Names are sorted rather than modification times compared, which is deliberate: the timestamp
 // in the name is UTC and fixed-width, so lexical order is chronological order, and a name cannot
 // be changed by a filesystem operation the way an mtime can.
-func (s *Service) prune() {
+func (s *Service) prune(guildID string) {
 	if s.opts.Keep <= 0 {
 		return
 	}
@@ -230,7 +269,7 @@ func (s *Service) prune() {
 		// Both ends checked, and partials excluded. A retention pass that matched loosely would
 		// be a delete loop pointed at whatever else is in this directory, which on a mounted
 		// volume could be the corpus itself.
-		if strings.HasPrefix(name, prefix) && strings.HasSuffix(name, suffix) {
+		if strings.HasPrefix(name, familyPrefix(guildID)) && strings.HasSuffix(name, suffix) {
 			mine = append(mine, name)
 		}
 	}

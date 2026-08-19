@@ -54,16 +54,21 @@ type Deps struct {
 	Config  *config.Config
 	Logger  *slog.Logger
 
-	// Store is the corpus. It used to be the raw *bbolt.DB, and this is the field
-	// whose type change makes the nested-transaction deadlock in the generation path
-	// UNWRITABLE rather than merely fixed (SPEC.md section 8, finding 1).
+	// Corpora is one corpus per guild. It used to be a single *storage.Store, and before
+	// that the raw *bbolt.DB; each narrowing made a class of bug unwritable rather than
+	// merely fixed.
 	//
-	// A service can only get at the data through Store.View or Store.Update, which
-	// hand it a *storage.Reader or *storage.Writer bound to one transaction, and
-	// neither has a method that starts another. So the old shape, a read transaction
-	// calling helpers that each opened their own read transaction, cannot be
-	// expressed from here at all. No service can reach a *bbolt.DB.
-	Store *storage.Store
+	// A service can only get at the data through Store.View or Store.Update, which hand it a
+	// *storage.Reader or *storage.Writer bound to one transaction, and neither has a method
+	// that starts another. So the old shape, a read transaction calling helpers that each
+	// opened their own read transaction, cannot be expressed from here at all (SPEC.md
+	// section 8, finding 1). M31 adds the second narrowing: a store now belongs to one guild,
+	// so a query cannot reach another guild's text even by accident.
+	//
+	// It is the interface rather than the *Set, so a service cannot enumerate or close
+	// corpora it was not asked about. The loops that legitimately fan out over every guild
+	// take the *Set explicitly instead.
+	Corpora storage.Corpora
 
 	// Dispatcher is the only way a gateway handler should do work. See its own
 	// documentation for why a handler must not spawn its own goroutine.

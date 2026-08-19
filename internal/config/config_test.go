@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -18,7 +20,8 @@ func clearEnv(t *testing.T) {
 	t.Helper()
 	keys := []string{
 		"DISCORD_BOT_TOKEN", "PEREGRINE_BOOTSTRAP_ADMIN_USER_ID", "LOG_LEVEL",
-		"PEREGRINE_DB_PATH", "PEREGRINE_MAX_HISTORY", "PEREGRINE_MAX_NGRAM",
+		"PEREGRINE_DB_PATH", "PEREGRINE_MAX_GUILD_CORPORA", "PEREGRINE_MAX_HISTORY",
+		"PEREGRINE_MAX_NGRAM",
 		"PEREGRINE_BLOCKLIST_PATH", "PEREGRINE_PAUSE_ALL_WRITES",
 		"PEREGRINE_PROMPT_RELEVANCE_BOOST", "PEREGRINE_SELF_MENTION_PATTERN",
 		"PEREGRINE_INGEST_TICK", "PEREGRINE_INGEST_LOOKBACK", "PEREGRINE_INGEST_BATCH_DELAY",
@@ -66,7 +69,7 @@ func TestLoadDefaults(t *testing.T) {
 		got  any
 		want any
 	}{
-		{"DBPath", cfg.DBPath, "markov.db"},
+		{"DBPath", cfg.DBPath, "corpora"},
 		{"MaxHistory", cfg.MaxHistory, 10000},
 		{"MaxNGram", cfg.MaxNGram, 5},
 		// 0.6, not the old 15.0. The units changed in M7a: this is a logit added to a
@@ -734,5 +737,41 @@ func TestTheShippedDefaultsAgree(t *testing.T) {
 	if cfg.WordGameHintAfter >= cfg.WordGameTimeout {
 		t.Errorf("default hint %v is not below default timeout %v",
 			cfg.WordGameHintAfter, cfg.WordGameTimeout)
+	}
+}
+
+// TestADbPathThatNamesAFileIsRefused, M31.
+//
+// PEREGRINE_DB_PATH changed meaning from one corpus file to a directory of per-guild corpora and
+// deliberately kept its name: this repo's rule is rescale-and-refuse over rename, because a
+// rename lets a stale /data/markov.db silently stop being read. The refusal is what makes that
+// rule work, and it names the new shape rather than only saying no.
+func TestADbPathThatNamesAFileIsRefused(t *testing.T) {
+	clearEnv(t)
+
+	file := filepath.Join(t.TempDir(), "markov.db")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PEREGRINE_DB_PATH", file)
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("a PEREGRINE_DB_PATH naming a file was accepted, so an operator upgrading would " +
+			"get a directory called markov.db and a bot that learned nothing they recognized")
+	}
+	if !strings.Contains(err.Error(), "DIRECTORY") {
+		t.Errorf("the refusal does not name the shape it wants: %v", err)
+	}
+}
+
+// TestADbPathThatDoesNotExistYetIsFine, because the corpus set creates it. Only an existing
+// non-directory is the stale-value case.
+func TestADbPathThatDoesNotExistYetIsFine(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("PEREGRINE_DB_PATH", filepath.Join(t.TempDir(), "corpora"))
+
+	if _, err := Load(); err != nil {
+		t.Errorf("a fresh corpus directory was refused: %v", err)
 	}
 }

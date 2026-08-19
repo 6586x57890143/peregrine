@@ -105,7 +105,7 @@ cp .env.example .env
 docker compose up --build
 ```
 
-`PEREGRINE_DB_PATH` must point inside the mounted volume, which `.env.example` already sets to `/data/markov.db`. The container runs with a read-only root filesystem, so a relative path resolves against the distroless working directory and the database fails to open. This is the most common way to get a bot that starts, looks healthy, and has silently learned nothing.
+`PEREGRINE_DB_PATH` is a **directory** of per-guild corpora as of M31 (`<guild id>.db` inside it), and must point inside the mounted volume, which `.env.example` already sets to `/data/corpora`. A value that names an existing file is refused at startup rather than quietly becoming a directory of that name. The container runs with a read-only root filesystem, so a relative path resolves against the distroless working directory and the database fails to open. This is the most common way to get a bot that starts, looks healthy, and has silently learned nothing.
 
 ## Configuration
 
@@ -119,7 +119,7 @@ Maintenance modes do not need `DISCORD_BOT_TOKEN`: cleaning a poisoned corpus sh
 
 ```sh
 go run ./cmd/bot -clean-db                    # remove spammy and blocklisted n-grams
-go run ./cmd/bot -compact /data/markov.new    # reclaim free pages into a fresh file
+go run ./cmd/bot -compact /data/new.db -guild 123456789   # reclaim free pages, one guild
 go run ./cmd/bot -purge-author 1234567890     # undo one user's contribution to diversity
 go run ./cmd/bot -tuning-report ./tuning      # summarize a pulled-down tuning export
 ```

@@ -69,3 +69,35 @@ func Seed(t *testing.T, s *storage.Store, entries ...Learn) {
 		t.Fatalf("seed corpus: %v", err)
 	}
 }
+
+// Set is a directory of per-guild corpora in t.TempDir(), closed when the test ends.
+//
+// The per-guild counterpart of Store, and it exists for the same reason: a test that wants a
+// corpus should say so in one line. Services that fan out over guilds (games, aggro, health,
+// repair, backup) take the concrete *storage.Set, so they cannot be handed a single Store; a
+// test that only cares about one guild's behaviour can still wrap one with storage.Single.
+func Set(t *testing.T) *storage.Set {
+	t.Helper()
+
+	set, err := storage.OpenSet(filepath.Join(t.TempDir(), "corpora"), 16, 1)
+	if err != nil {
+		t.Fatalf("OpenSet: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := set.Close(); err != nil {
+			t.Errorf("closing corpora: %v", err)
+		}
+	})
+	return set
+}
+
+// Guild is one guild's corpus out of a Set, failing the test if it cannot be opened.
+func Guild(t *testing.T, set *storage.Set, guildID string) *storage.Store {
+	t.Helper()
+
+	store, err := set.For(guildID)
+	if err != nil {
+		t.Fatalf("corpus for guild %s: %v", guildID, err)
+	}
+	return store
+}

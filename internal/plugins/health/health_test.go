@@ -44,7 +44,7 @@ func fixture(t *testing.T, latency Latency) (*Service, *fakeQueue, *fakeGate, *b
 	var buf bytes.Buffer
 	queue := &fakeQueue{}
 	gate := &fakeGate{}
-	s := New(Deps{Store: dbtest.Store(t), Queue: queue, Gate: gate, Latency: latency}, Options{
+	s := New(Deps{Corpora: dbtest.Set(t), Queue: queue, Gate: gate, Latency: latency}, Options{
 		StatusTick:  time.Minute,
 		LatencyTick: time.Minute,
 		Threshold:   500 * time.Millisecond,
@@ -223,13 +223,16 @@ func TestShutdownReportsOnceMore(t *testing.T) {
 // a report racing shutdown would hit.
 func TestAnUnreadableCorpusIsReportedRatherThanPanicking(t *testing.T) {
 	var buf bytes.Buffer
-	store := dbtest.Store(t)
-	s := New(Deps{Store: store, Queue: &fakeQueue{}, Gate: &fakeGate{}, Latency: fakeLatency(0)}, Options{
+	corpora := dbtest.Set(t)
+	store := dbtest.Guild(t, corpora, "111")
+	s := New(Deps{Corpora: corpora, Queue: &fakeQueue{}, Gate: &fakeGate{}, Latency: fakeLatency(0)}, Options{
 		StatusTick: time.Minute, LatencyTick: time.Minute, Threshold: time.Second,
 	}, PresenceOptions{})
 	if err := s.Init(core.Deps{Logger: slog.New(slog.NewTextHandler(&buf, nil))}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
+	// Closed under the report, which is what a status tick racing shutdown would hit. The
+	// corpus stays in the set's map, so the read finds a handle that is already closed.
 	if err := store.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -243,14 +246,15 @@ func TestAnUnreadableCorpusIsReportedRatherThanPanicking(t *testing.T) {
 // TestTheCorpusCountsComeFromTheStore, so the report is about the real thing rather than zeroes.
 func TestTheCorpusCountsComeFromTheStore(t *testing.T) {
 	var buf bytes.Buffer
-	store := dbtest.Store(t)
+	corpora := dbtest.Set(t)
+	store := dbtest.Guild(t, corpora, "111")
 	if err := store.Update(func(w *storage.Writer) error {
 		return w.LearnNgram("the bird", "flew", "author-1")
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
-	s := New(Deps{Store: store, Queue: &fakeQueue{}, Gate: &fakeGate{}, Latency: fakeLatency(0)}, Options{
+	s := New(Deps{Corpora: corpora, Queue: &fakeQueue{}, Gate: &fakeGate{}, Latency: fakeLatency(0)}, Options{
 		StatusTick: time.Minute, LatencyTick: time.Minute, Threshold: time.Second,
 	}, PresenceOptions{})
 	if err := s.Init(core.Deps{Logger: slog.New(slog.NewTextHandler(&buf, nil))}); err != nil {

@@ -102,8 +102,11 @@ type Trace = markov.Trace
 
 // Generator produces sentences from a corpus.
 type Generator struct {
-	store *storage.Store
-	opts  Options
+	// corpora resolves the guild whose corpus a request reads. One per guild as of M31, so
+	// a reply cannot be assembled from another server's text: the isolation is the type's
+	// rather than a rule every call site has to remember.
+	corpora storage.Corpora
+	opts    Options
 
 	// src is the randomness every draw on this path takes, or nil for DefaultSource.
 	//
@@ -116,16 +119,16 @@ type Generator struct {
 	src markov.Source
 }
 
-// New returns a Generator. It holds the Store rather than a Reader, because it opens its
+// New returns a Generator. It holds the corpora rather than a Reader, because it opens its
 // own transaction per sentence and a Reader cannot be held across one.
-func New(store *storage.Store, opts Options) *Generator {
-	return &Generator{store: store, opts: opts}
+func New(corpora storage.Corpora, opts Options) *Generator {
+	return &Generator{corpora: corpora, opts: opts}
 }
 
 // NewWithSource is New with the randomness supplied, for tests that need reproducible
 // output. Production uses New, which leaves src nil and therefore uses DefaultSource.
-func NewWithSource(store *storage.Store, opts Options, src markov.Source) *Generator {
-	return &Generator{store: store, opts: opts, src: src}
+func NewWithSource(corpora storage.Corpora, opts Options, src markov.Source) *Generator {
+	return &Generator{corpora: corpora, opts: opts, src: src}
 }
 
 // source is the one answer to where a draw on this path comes from.
@@ -168,6 +171,15 @@ const (
 	// similar things almost no continuation is eligible and the walk dies immediately. It is
 	// the single most likely reason a freshly deployed bot is mute, and it is not a fault.
 	TooShort
+
+	// NoCorpus means the request named no guild, or its guild has no corpus available.
+	//
+	// In the enum rather than logged generically, for the reason the other two are: a
+	// decision to stay silent carries a reason, and this one points somewhere completely
+	// different from the others. CorpusEmpty points at ingestion and TooShort at the
+	// author-diversity gate; this points at the CALLER, which asked for a reply with no
+	// guild to answer in. That is a DM, or a code path that lost the guild on the way.
+	NoCorpus
 )
 
 // String names the outcome for a log field.
@@ -179,6 +191,8 @@ func (o Outcome) String() string {
 		return "corpus-empty"
 	case TooShort:
 		return "too-short"
+	case NoCorpus:
+		return "no-corpus"
 	}
 	return "unknown"
 }
@@ -189,6 +203,10 @@ func (o Outcome) String() string {
 // call was already four wide. Six positional arguments, three of them optional and two of them
 // strings, is where argument-order bugs live.
 type Request struct {
+	// GuildID selects the corpus. Required: a request with no guild has no corpus to read,
+	// which is the DM case, and there is deliberately no shared fallback for it.
+	GuildID string
+
 	// Prompt is what the bot is answering: the message addressed to it, with mention markup
 	// already substituted for names.
 	Prompt string
@@ -265,7 +283,12 @@ func (g *Generator) Sentence(req Request) (string, Outcome, error) {
 	// used to reach back for its own. Reader.CorpusEmpty replaces a Bucket.Stats() call
 	// that walked every page in the largest bucket in the database on every reply purely to
 	// answer "is there anything in here" (finding 11).
-	err := g.store.View(func(r *storage.Reader) error {
+	store, err := g.corpora.For(req.GuildID)
+	if err != nil {
+		return "", NoCorpus, err
+	}
+
+	err = store.View(func(r *storage.Reader) error {
 		if r.CorpusEmpty() {
 			// Recorded rather than inferred from the empty sentence below, because a
 			// dead-ended walk on a populated corpus produces the same empty slice and the
