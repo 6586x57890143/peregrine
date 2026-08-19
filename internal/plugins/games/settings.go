@@ -4,10 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"slices"
 	"strings"
 	"time"
 
+	"github.com/6586x57890143/peregrine/internal/channels"
 	"github.com/6586x57890143/peregrine/internal/storage"
 )
 
@@ -177,7 +177,12 @@ func (s *Service) snapshot(guildID string) settings {
 // PEREGRINE_IGNORE_CHANNELS is the guard's denylist and says where the bot must not speak at
 // all; this is the allowlist for one feature, so a server that wants puzzles in exactly one
 // channel does not have to list every other channel it has.
+//
+// Read PER GUILD through channels.Allows, which is the M31b fix. Settings are per guild, but a
+// guild that has never run /wordgame-config is seeded from PEREGRINE_WORDGAME_CHANNELS, and that
+// is one flat list of channel IDs written when the bot was in one server: a straight membership
+// test refused every channel in every OTHER server, so binding games to a channel in one guild
+// turned them off everywhere else. A list is a statement about the guilds it names.
 func (s *Service) allowed(guildID, channelID string) bool {
-	set := s.snapshot(guildID)
-	return len(set.Channels) == 0 || slices.Contains(set.Channels, channelID)
+	return channels.Allows(s.resolver, s.snapshot(guildID).Channels, guildID, channelID)
 }

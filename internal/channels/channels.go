@@ -115,23 +115,20 @@ type Counter interface {
 // that as of M31: the settings that decide whether to post at all are per guild, so the channel
 // the decision produces has to be in the guild whose settings were consulted.
 func Busiest(c Counter, r Resolver, window time.Duration, allow []string, guildID string) string {
-	allowed := make(map[string]struct{}, len(allow))
-	for _, id := range allow {
-		if id != "" {
-			allowed[id] = struct{}{}
-		}
-	}
-
 	best := ""
 	bestScore := 0.0
 	for _, ranked := range c.Busiest(window) {
-		if len(allowed) > 0 {
-			if _, ok := allowed[ranked.ID]; !ok {
-				continue
-			}
-		}
 		info, ok := r.Channel(ranked.ID)
 		if !ok || !info.Text || info.NotSafeForWork() {
+			continue
+		}
+		// The allowlist is read per guild rather than as a flat set, so a list naming one
+		// server's channels does not silence the bot in every other server. See Allows.
+		//
+		// The channel is resolved BEFORE the allowlist test now, where the old order tested
+		// membership first: the per-guild reading needs to know which guild this candidate is
+		// in, and resolving is a state-cache lookup rather than a request.
+		if !Allows(r, allow, info.GuildID, ranked.ID) {
 			continue
 		}
 		if guildID != "" && info.GuildID != guildID {
@@ -152,4 +149,68 @@ func Busiest(c Counter, r Resolver, window time.Duration, allow []string, guildI
 		}
 	}
 	return best
+}
+
+// Allows applies a channel allowlist the way a multi-guild bot has to read one, M31b.
+//
+// # A channel allowlist is per guild, even when it is written in one variable
+//
+// The lists that decide where the bot may speak unprompted are flat sets of channel IDs from
+// the environment, written when the bot was in one server. In a second server none of those IDs
+// match, so a straight membership test refuses EVERY channel there: setting a list to bind word
+// games to one channel in one guild silently turned them off in every other guild.
+//
+// So a list is read as a statement about the guilds it MENTIONS. If the operator named channels
+// in this guild, only those channels qualify here. If they named none, they said nothing about
+// this guild and the feature is unrestricted here, which is the same reading an empty list has
+// always had: an operator who has not said where something belongs has not said no.
+//
+// A channel missing from the state cache resolves to no guild and therefore restricts nothing,
+// which is the direction that keeps a cold cache from silently unbinding a live setting: the
+// cache is populated before any of these callers run, since all of them are driven by traffic
+// or by a ticker that starts after READY.
+func Allows(r Resolver, allow []string, guildID, channelID string) bool {
+	if len(allow) == 0 {
+		return true
+	}
+
+	var namesThisGuild, namesAnyGuild, any bool
+	for _, id := range allow {
+		if id == "" {
+			// A blank entry is what a trailing comma in the environment produces. Skipped
+			// rather than matched, or a stray comma would bind the feature to nothing at all.
+			continue
+		}
+		any = true
+		if id == channelID {
+			return true
+		}
+		info, ok := r.Channel(id)
+		if !ok || info.GuildID == "" {
+			continue
+		}
+		namesAnyGuild = true
+		if info.GuildID == guildID {
+			namesThisGuild = true
+		}
+	}
+
+	switch {
+	case !any:
+		// Every entry was blank, which is the same as no list.
+		return true
+	case namesThisGuild:
+		// The operator named channels here and this is not one of them.
+		return false
+	case !namesAnyGuild:
+		// Nothing in the list resolves to a guild at all, so there is no per-guild reading to
+		// make and this falls back to plain membership, which is what it did before M31b. That
+		// is the safe direction rather than the tidy one: an unresolvable list is a cold state
+		// cache or a stale ID, and treating either as "no opinion" would quietly UNBIND a live
+		// setting.
+		return false
+	default:
+		// The list names other guilds and not this one, so it says nothing about here.
+		return true
+	}
 }

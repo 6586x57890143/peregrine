@@ -246,3 +246,48 @@ func setInterval(t *testing.T, s *Service, at time.Time) {
 	st.lastInterval = at
 	s.mu.Unlock()
 }
+
+// TestABindInOneGuildLeavesOthersAlone, M31b, and it is the bug a live multi-guild bot hit.
+//
+// Settings are per guild, but a guild that has never run /wordgame-config is seeded from
+// PEREGRINE_WORDGAME_CHANNELS, which is ONE flat list of channel IDs written when the bot was in
+// one server. A straight membership test refuses every channel in every other server, so binding
+// word games to a channel in one guild silently turned them off in all the others.
+//
+// The rule that replaces it: a list is a statement about the guilds it NAMES. It restricts those
+// and says nothing about the rest, which is the reading an empty list has always had.
+func TestABindInOneGuildLeavesOthersAlone(t *testing.T) {
+	opts := enabled()
+	opts.AllowChannels = []string{"c1"} // a channel in testGuild, and only there
+	s, _, _, _ := fixture(t, opts)
+
+	if !s.allowed(testGuild, "c1") {
+		t.Error("the bound channel is not allowed in its own guild")
+	}
+	if s.allowed(testGuild, "c2") {
+		t.Error("an unbound channel in the SAME guild is allowed, so the bind restricts nothing")
+	}
+	if !s.allowed(otherGuild, "other") {
+		t.Error("a channel in another guild was refused because of a bind in this one, which is " +
+			"the bug: one server's bind disabled word games everywhere else")
+	}
+}
+
+// TestAGuildsOwnBindStillRestrictsThatGuild, which is the other half: the per-guild reading must
+// not become "every list is advisory". A guild that binds a channel of its own is restricted to
+// it, and that is exactly what the operator asked for.
+func TestAGuildsOwnBindStillRestrictsThatGuild(t *testing.T) {
+	s, _, _, _ := fixture(t, enabled())
+
+	s.handleConfig(configInteraction("c1", strOpt(optChannel, channelBind)))
+
+	if !s.allowed(testGuild, "c1") {
+		t.Error("the bound channel is not allowed")
+	}
+	if s.allowed(testGuild, "c2") {
+		t.Error("binding one channel did not restrict the others in the same guild")
+	}
+	if !s.allowed(otherGuild, "other") {
+		t.Error("binding a channel in this guild restricted another guild")
+	}
+}

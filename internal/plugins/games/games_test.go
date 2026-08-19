@@ -232,6 +232,10 @@ func (g *fakeGuard) deleted() []string {
 // because the corpus set refuses anything else: a guild ID is a path component.
 const testGuild = "111"
 
+// otherGuild is a second server the bot is in. Word-game settings are per guild, and the
+// channel allowlist has to be READ per guild as well: see TestABindInOneGuildLeavesOthersAlone.
+const otherGuild = "222"
+
 type fakeChannels map[string]channels.Info
 
 func (f fakeChannels) Channel(id string) (channels.Info, bool) {
@@ -271,7 +275,13 @@ func fixtureWithTimeout(t *testing.T, opts Options, timeout time.Duration) (*Ser
 		GauntletMax: 10,
 	})
 	guard := &fakeGuard{}
-	chans := fakeChannels{"c1": {ID: "c1", Name: "memes", Text: true, GuildID: testGuild}}
+	chans := fakeChannels{
+		"c1": {ID: "c1", Name: "memes", Text: true, GuildID: testGuild},
+		"c2": {ID: "c2", Name: "chat", Text: true, GuildID: testGuild},
+		// A channel in a DIFFERENT server, so the per-guild reading of the channel allowlist
+		// has something to be wrong about.
+		"other": {ID: "other", Name: "memes", Text: true, GuildID: otherGuild},
+	}
 
 	s := New(dbtest.Set(t), guard, manager, tracker, chans, opts)
 	if err := s.Init(core.Deps{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}); err != nil {

@@ -8,7 +8,7 @@ Written 2026-08-19, at the end of M31. Read this with `CLAUDE.md` and `SPEC.md` 
 |---|---|
 | `main` | Has M29. |
 | `m30-wordgame-settings` | **PR #50, open.** `/wordgame-config`: the word-game channel list, mode and interval move from the environment into a `BlobConfig` blob. CI is red for a reason unrelated to the code: GitHub Actions is blocked on account billing ("recent account payments have failed"), so all four jobs fail in 2-3 seconds without starting. Locally the same checks are green. |
-| `m31-per-guild-corpora` | **This work. Branched off M30, not off `main`, because it edits M30's `settings.go`.** Uncommitted at the time of writing unless the commit below has landed. |
+| `m31-per-guild-corpora` | **This work, two commits: M31 and the M31b allowlist fix. Branched off M30, not off `main`, because it edits M30's `settings.go`.** |
 
 Merge order is M30 then M31. If M30 is rejected, M31 does not apply cleanly.
 
@@ -49,6 +49,20 @@ guard's ignore list and pause switch, `activity`'s per-CHANNEL traffic ring (a c
 one guild anyway), conversation memory (per channel), the word-game `Manager` (per channel), the
 presence line (there is one, so it quotes one guild picked at random), and the health status log
 (summed, with a `guilds` count).
+
+## M31b: a channel allowlist is read per guild
+
+Found on a live multi-guild bot after M31 and fixed in the same branch. Settings being per guild
+was not enough: a guild that has never run `/wordgame-config` is SEEDED from
+`PEREGRINE_WORDGAME_CHANNELS`, one flat list of channel IDs, so every channel in every other
+server matched nothing and word games were dead there.
+
+`channels.Allows` is the one place that reads a list now, used by `games.allowed` and by
+`channels.Busiest` (so interval-mode games and the autonomous poster share it). The rule: **a list
+is a statement about the guilds it names.** It restricts those, and says nothing about the rest.
+Two fallbacks are deliberate and both are pinned by tests: a list resolving to no guild at all
+falls back to plain membership, because that means a cold state cache or stale IDs rather than "no
+opinion", and blank entries (a trailing comma in `.env`) are skipped.
 
 ## Operational changes an operator must know
 
@@ -93,7 +107,13 @@ Both were pre-existing and are worth knowing because neither was found by readin
 3. **`docker-compose.prod.yml` mentions `/data` generally and needs no edit, but the deploy still
    has to be told the volume now holds a directory of corpora** rather than one file, and the old
    `markov.db` inside the volume can be deleted once the operator is satisfied.
-4. **`-tuning-report` has no guild dimension.** `plugins/tuning/map.go` writes one record per tick
+4. **The remaining global dials are scalars, not lists.** Aggro's chance and duration, the
+   autopost interval and skip chance, the roast chance and the word-game trigger chances are all
+   process-wide, and nothing has asked for them per guild yet. If one does, the pattern is
+   `/wordgame-config`: a blob in that guild's corpus, seeded from the environment, with a command
+   that owns it afterwards. `PEREGRINE_IGNORE_CHANNELS` needs no change, because a channel ID is
+   unique across Discord, so a denylist of them is already per channel.
+5. **`-tuning-report` has no guild dimension.** `plugins/tuning/map.go` writes one record per tick
    with no corpus identity in it, so an archive from a multi-guild bot averages servers together.
    Adding a `GuildID` field to the wire type is a deliberate decision about the format, which is
    why it was not done quietly here.
