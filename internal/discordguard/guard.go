@@ -219,7 +219,8 @@ func (g *Guard) SendReply(channelID, content string, ref *discordgo.MessageRefer
 // the kind of reading this package's allowedMentions comment refuses to depend on: the same
 // argument was available for discordgo's "a zero value allows no mentions", which is true of
 // the field being present and not of its value. Setting it costs one struct.
-func (g *Guard) SendEmbed(channelID string, embed *discordgo.MessageEmbed) (*discordgo.Message, bool) {
+func (g *Guard) SendEmbed(channelID string, embed *discordgo.MessageEmbed,
+	components ...discordgo.MessageComponent) (*discordgo.Message, bool) {
 	if embed == nil {
 		return nil, false
 	}
@@ -229,6 +230,7 @@ func (g *Guard) SendEmbed(channelID string, embed *discordgo.MessageEmbed) (*dis
 
 	msg, err := g.session.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
 		Embeds:          []*discordgo.MessageEmbed{embed},
+		Components:      components,
 		AllowedMentions: allowedMentions(),
 	})
 	if err != nil {
@@ -453,7 +455,8 @@ func (g *Guard) Respond(i *discordgo.Interaction, content string, ephemeral bool
 }
 
 // RespondEmbed is Respond with an embed, gated over every text field like SendEmbed.
-func (g *Guard) RespondEmbed(i *discordgo.Interaction, embed *discordgo.MessageEmbed, ephemeral bool) bool {
+func (g *Guard) RespondEmbed(i *discordgo.Interaction, embed *discordgo.MessageEmbed,
+	ephemeral bool, components ...discordgo.MessageComponent) bool {
 	if i == nil || embed == nil {
 		return false
 	}
@@ -463,6 +466,7 @@ func (g *Guard) RespondEmbed(i *discordgo.Interaction, embed *discordgo.MessageE
 
 	data := &discordgo.InteractionResponseData{
 		Embeds:          []*discordgo.MessageEmbed{embed},
+		Components:      components,
 		AllowedMentions: allowedMentions(),
 	}
 	if ephemeral {
@@ -474,6 +478,50 @@ func (g *Guard) RespondEmbed(i *discordgo.Interaction, embed *discordgo.MessageE
 		Data: data,
 	}); err != nil {
 		g.log.Error("discord interaction embed response failed", "channel", i.ChannelID, "err", err)
+		return false
+	}
+	return true
+}
+
+// UpdateEmbed REPLACES the message a component press came from, gated like every other send.
+//
+// This is the button half of M32's paginated leaderboard, and it is a send rather than an edit
+// of somebody else's message: the message being replaced is the bot's own, and the text going
+// into it is a fresh board built from Discord nicknames, which are user-controlled. So it runs
+// the same embedText walk, the same pause switch, the same ignore list and the same explicit
+// AllowedMentions as SendEmbed. Nothing about "the reader already had this message open"
+// exempts the new contents from the gate.
+//
+// # The components are not gated, and that is deliberate
+//
+// A button's label is this repository's own text, exactly like an application command's
+// description, which is why RegisterCommands is not content-gated either. A caller that puts a
+// corpus word on a button has invented a new category of output and should say so here; there
+// is no way to do it by accident, because the labels are constants.
+//
+// An UpdateMessage response is the only shape that edits in place without a follow-up: an
+// ordinary response would post a SECOND board under the first, which is the failure this
+// method exists to avoid rather than an aesthetic preference.
+func (g *Guard) UpdateEmbed(i *discordgo.Interaction, embed *discordgo.MessageEmbed,
+	components ...discordgo.MessageComponent) bool {
+	if i == nil || embed == nil {
+		return false
+	}
+	if !g.permit(i.ChannelID, embedText(embed), "update-embed") {
+		return false
+	}
+
+	if err := g.session.InteractionRespond(i, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseUpdateMessage,
+		Data: &discordgo.InteractionResponseData{
+			Embeds:          []*discordgo.MessageEmbed{embed},
+			Components:      components,
+			AllowedMentions: allowedMentions(),
+		},
+	}); err != nil {
+		// Error rather than Info, matching Respond: somebody pressed a button and Discord gives
+		// an interaction three seconds before showing them a failure of its own.
+		g.log.Error("discord component response failed", "channel", i.ChannelID, "err", err)
 		return false
 	}
 	return true

@@ -19,7 +19,7 @@ import (
 func TestAFinishedRunRecapsWhatPeopleTook(t *testing.T) {
 	s, guard, _, _ := fixtureGauntlet(t)
 
-	if consumed := s.Command("!wordgame", "2", testGuild, "c1", admin(snowflake(1)), noNames); !consumed {
+	if consumed := s.Command("!wordgame", "2", testGuild, "c1", admin(snowflake(1))); !consumed {
 		t.Fatal("!wordgame 2 was not consumed")
 	}
 	s.Guess(testGuild, "c1", snowflake(700), theWord, snowflake(42), "ann")

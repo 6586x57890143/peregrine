@@ -274,9 +274,10 @@ func TestTheRegisteredCommandMatchesWhatTheHandlerReads(t *testing.T) {
 	want := map[string][]string{
 		commandName:       {optWord, optCount},
 		configCommandName: {optChannel, optMode, optInterval, optReset},
+		boardCommandName:  {optScope},
 	}
 
-	defs := definitions()
+	defs := definitions(true)
 	if len(defs) != len(want) {
 		t.Fatalf("definitions() returned %d commands, want %d", len(defs), len(want))
 	}
@@ -305,5 +306,14 @@ func TestTheRegisteredCommandMatchesWhatTheHandlerReads(t *testing.T) {
 	for name := range want {
 		t.Errorf("onInteraction dispatches /%s, which is not registered, so nobody can run it",
 			name)
+	}
+
+	// With word games off, the two commands that ARE the feature go away and the leaderboard
+	// stays. !leaderboard has never been gated on the flag, because its chat half reads the
+	// stats bucket, which is populated on every message.
+	off := definitions(false)
+	if len(off) != 1 || off[0].Name != boardCommandName {
+		t.Errorf("with word games off the registered set is %v, want just /%s",
+			off, boardCommandName)
 	}
 }
