@@ -42,8 +42,14 @@ type Config struct {
 	LogLevel    string // LOG_LEVEL
 
 	// Storage.
-	DBPath     string // PEREGRINE_DB_PATH
-	MaxHistory int    // PEREGRINE_MAX_HISTORY
+	//
+	// DBPath is a DIRECTORY of per-guild corpora as of M31, not one corpus file. It keeps its
+	// name because the rule here is rescale-and-refuse over rename: a rename would let an
+	// existing PEREGRINE_DB_PATH=/data/markov.db silently stop being read, which is exactly
+	// the failure that rule exists to prevent. A value that names a file is a startup error.
+	DBPath          string // PEREGRINE_DB_PATH
+	MaxGuildCorpora int    // PEREGRINE_MAX_GUILD_CORPORA
+	MaxHistory      int    // PEREGRINE_MAX_HISTORY
 
 	// Safety. BlocklistPath is validated here only as a string; the file itself is
 	// loaded in cmd/bot, where a failure is fatal. It is deliberately allowed to be
@@ -326,7 +332,15 @@ func Load() (*Config, error) {
 		// .env.example says so: the image has a read-only root filesystem, so a
 		// relative path resolves against the distroless working directory and
 		// bbolt.Open fails.
-		DBPath:     l.str("PEREGRINE_DB_PATH", "markov.db"),
+		DBPath: l.dir("PEREGRINE_DB_PATH", "corpora"),
+
+		// The cap on simultaneously open corpora. Each one is a file handle, an mmap and an
+		// exclusive flock, so this is a resource bound rather than a policy: a bot really in
+		// more guilds than this should raise it, and the corpus set refuses rather than
+		// evicting, because closing a corpus to make room drops the lock on a file another
+		// goroutine may be writing.
+		MaxGuildCorpora: l.intVal("PEREGRINE_MAX_GUILD_CORPORA", 50, 1, 500),
+
 		MaxHistory: l.intVal("PEREGRINE_MAX_HISTORY", 10000, 100, 10_000_000),
 
 		BlocklistPath:  l.str("PEREGRINE_BLOCKLIST_PATH", ""),
@@ -695,6 +709,30 @@ func (l *loader) str(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// dir reads a path that must name a directory, and refuses one that names a file.
+//
+// It exists for PEREGRINE_DB_PATH, whose meaning changed in M31 from one corpus file to a
+// directory of per-guild corpora. An operator upgrading has /data/markov.db in their .env, and
+// the two ways that could go are: create a DIRECTORY called markov.db and quietly learn nothing
+// anybody recognizes, or say so. This says so, and names the shape it wants.
+//
+// A path that does not exist yet is fine: the corpus set creates it. Only an existing
+// non-directory is refused, because that is the stale-value case rather than a first run.
+func (l *loader) dir(key, def string) string {
+	v := l.str(key, def)
+	info, err := os.Stat(v)
+	switch {
+	case err != nil:
+		// Includes "does not exist", which is the ordinary first run.
+	case !info.IsDir():
+		l.errs = append(l.errs, fmt.Errorf("%s=%q names a file, but it must now name a "+
+			"DIRECTORY holding one corpus per guild (M31). Point it at a directory such as "+
+			"/data/corpora. The old single corpus is not migrated and is not read: per-guild "+
+			"corpora are rebuilt from Discord history by the ingest backfill", key, v))
+	}
+	return v
 }
 
 // enum rejects an unrecognized value rather than falling back to the default. A

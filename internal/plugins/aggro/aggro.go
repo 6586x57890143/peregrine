@@ -30,7 +30,7 @@ type Guard interface {
 
 // Activity answers who has spoken recently. internal/activity's Tracker satisfies it.
 type Activity interface {
-	RecentAuthors(window time.Duration) []string
+	RecentAuthors(guildID string, window time.Duration) []string
 }
 
 // Options are the dials, all of them from the environment.
@@ -66,15 +66,17 @@ type State struct {
 
 // Service is the feature. It implements core.Service.
 type Service struct {
-	store    *storage.Store
+	// corpora is the SET, because this service legitimately fans out: an aggro is one person
+	// in one server, so there is one target per guild and each guild's corpus holds its own.
+	// A target chosen bot-wide would poke somebody in a server they are not even in.
+	corpora  *storage.Set
 	guard    Guard
 	activity Activity
 	opts     Options
 	botID    func() string
 
-	mu       sync.Mutex
-	targetID string
-	endTime  time.Time
+	mu      sync.Mutex
+	targets map[string]State
 
 	loops       sync.WaitGroup
 	cancelLoops context.CancelFunc
@@ -82,8 +84,11 @@ type Service struct {
 }
 
 // New builds the service.
-func New(store *storage.Store, guard Guard, act Activity, opts Options) *Service {
-	return &Service{store: store, guard: guard, activity: act, opts: opts}
+func New(corpora *storage.Set, guard Guard, act Activity, opts Options) *Service {
+	return &Service{
+		corpora: corpora, guard: guard, activity: act, opts: opts,
+		targets: map[string]State{},
+	}
 }
 
 // SetBotID supplies a function returning the bot's own user ID.
@@ -103,33 +108,44 @@ func (s *Service) Name() string { return "aggro" }
 func (s *Service) Init(deps core.Deps) error {
 	s.logger = deps.Logger
 
-	var state State
-	if err := s.store.View(func(r *storage.Reader) error {
-		v, err := r.GetBlob(storage.BlobConfig, "aggroState")
-		if err != nil || v == nil {
-			return err
+	// One state per guild that already has a corpus. A guild the bot has never learned from
+	// has no aggro to restore, which is the same thing as having no state.
+	for _, guildID := range s.corpora.Guilds() {
+		store, err := s.corpora.For(guildID)
+		if err != nil {
+			log.Printf("[WARN] Failed to reach the corpus for guild %s: %v", guildID, err)
+			continue
 		}
-		return json.Unmarshal(v, &state)
-	}); err != nil {
-		log.Printf("[WARN] Failed to load aggro state: %v", err)
-		return nil
-	}
 
-	switch {
-	case state.TargetID == "":
-	case time.Now().Before(state.EndTime):
-		s.mu.Lock()
-		s.targetID, s.endTime = state.TargetID, state.EndTime
-		s.mu.Unlock()
-		log.Printf("[AGGRO] Loaded active aggro on %s until %s",
-			state.TargetID, state.EndTime.Format(time.RFC3339))
-	default:
-		// Expired while the bot was down. Cleared here, synchronously, rather than in a
-		// goroutine: Init is the one moment where a write is guaranteed not to race the
-		// message handler, because the gateway is not connected yet.
-		log.Printf("[AGGRO] Loaded expired aggro on %s, clearing.", state.TargetID)
-		if err := s.persist(State{}); err != nil {
-			log.Printf("[WARN] Failed to clear expired aggro state: %v", err)
+		var state State
+		if err := store.View(func(r *storage.Reader) error {
+			v, err := r.GetBlob(storage.BlobConfig, "aggroState")
+			if err != nil || v == nil {
+				return err
+			}
+			return json.Unmarshal(v, &state)
+		}); err != nil {
+			log.Printf("[WARN] Failed to load aggro state for guild %s: %v", guildID, err)
+			continue
+		}
+
+		switch {
+		case state.TargetID == "":
+		case time.Now().Before(state.EndTime):
+			s.mu.Lock()
+			s.targets[guildID] = state
+			s.mu.Unlock()
+			log.Printf("[AGGRO] Loaded active aggro in guild %s on %s until %s",
+				guildID, state.TargetID, state.EndTime.Format(time.RFC3339))
+		default:
+			// Expired while the bot was down. Cleared here, synchronously, rather than in a
+			// goroutine: Init is the one moment where a write is guaranteed not to race the
+			// message handler, because the gateway is not connected yet.
+			log.Printf("[AGGRO] Loaded expired aggro in guild %s on %s, clearing.",
+				guildID, state.TargetID)
+			if err := s.persist(guildID, State{}); err != nil {
+				log.Printf("[WARN] Failed to clear expired aggro state: %v", err)
+			}
 		}
 	}
 	return nil
@@ -184,12 +200,13 @@ const (
 // The lock is released before the caller does any I/O, which is the discipline the old
 // version got right and worth keeping: the aggro mutex must never be held across a Discord
 // call.
-func (s *Service) Consider(authorID string) Reaction {
+func (s *Service) Consider(guildID, authorID string) Reaction {
 	s.mu.Lock()
-	isTarget := authorID != "" && authorID == s.targetID
-	expired := time.Now().After(s.endTime)
+	state := s.targets[guildID]
+	isTarget := authorID != "" && authorID == state.TargetID
+	expired := time.Now().After(state.EndTime)
 	if isTarget && expired {
-		s.targetID, s.endTime = "", time.Time{}
+		delete(s.targets, guildID)
 	}
 	s.mu.Unlock()
 
@@ -197,7 +214,7 @@ func (s *Service) Consider(authorID string) Reaction {
 	case isTarget && !expired:
 		return Poke
 	case isTarget && expired:
-		if err := s.persist(State{}); err != nil {
+		if err := s.persist(guildID, State{}); err != nil {
 			log.Printf("[AGGRO] failed to clear persisted aggro state: %v", err)
 		}
 		return Release
@@ -212,8 +229,8 @@ func (s *Service) Consider(authorID string) Reaction {
 // emergency stop is not asking it to keep poking someone. Unreact is deliberately not
 // pause-gated in the guard, because withdrawing a reaction during an incident is the one
 // thing an operator would want to still work.
-func (s *Service) Handle(channelID, messageID, authorID string) {
-	switch s.Consider(authorID) {
+func (s *Service) Handle(guildID, channelID, messageID, authorID string) {
+	switch s.Consider(guildID, authorID) {
 	case Poke:
 		s.guard.React(channelID, messageID, s.opts.Emoji)
 	case Release:
@@ -227,17 +244,29 @@ func (s *Service) Handle(channelID, messageID, authorID string) {
 	}
 }
 
-// Target reports the current target and when it ends, for the status line.
-func (s *Service) Target() (string, time.Time) {
+// Target reports one guild's current target and when it ends, for the status line.
+func (s *Service) Target(guildID string) (string, time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.targetID, s.endTime
+	state := s.targets[guildID]
+	return state.TargetID, state.EndTime
 }
 
-// maybeTrigger starts an aggro if none is running and the dice agree.
+// maybeTrigger starts an aggro in each guild, if none is running there and the dice agree.
+//
+// Per guild rather than once bot-wide, because the candidates are one server's recent
+// speakers: a single process-wide target would be somebody who is, most of the time, not in
+// the server the poke lands in.
 func (s *Service) maybeTrigger() {
+	for _, guildID := range s.corpora.Guilds() {
+		s.maybeTriggerIn(guildID)
+	}
+}
+
+func (s *Service) maybeTriggerIn(guildID string) {
 	s.mu.Lock()
-	busy := s.targetID != "" && !time.Now().After(s.endTime)
+	state := s.targets[guildID]
+	busy := state.TargetID != "" && !time.Now().After(state.EndTime)
 	s.mu.Unlock()
 	if busy {
 		return
@@ -250,7 +279,7 @@ func (s *Service) maybeTrigger() {
 	// holding one package's lock while acquiring another's is how a lock-ordering deadlock
 	// gets built. The version this replaced did it while also making hundreds of REST
 	// calls, so the aggro state was locked for the length of a Discord page walk.
-	target := s.pick()
+	target := s.pick(guildID)
 	if target == "" {
 		return
 	}
@@ -259,24 +288,24 @@ func (s *Service) maybeTrigger() {
 	// Re-checked, because the state could have changed while the lock was released. There
 	// is only one aggro loop so this cannot happen today, and that is exactly why it is
 	// worth two lines: the next caller will not know.
-	if s.targetID != "" && !time.Now().After(s.endTime) {
+	if current := s.targets[guildID]; current.TargetID != "" && !time.Now().After(current.EndTime) {
 		s.mu.Unlock()
 		return
 	}
-	s.targetID = target
-	s.endTime = time.Now().Add(s.opts.Duration)
-	state := State{TargetID: s.targetID, EndTime: s.endTime}
+	state = State{TargetID: target, EndTime: time.Now().Add(s.opts.Duration)}
+	s.targets[guildID] = state
 	s.mu.Unlock()
 
-	log.Printf("[AGGRO] Bird aggro triggered on user %s for %v.", target, s.opts.Duration)
-	if err := s.persist(state); err != nil {
+	log.Printf("[AGGRO] Bird aggro triggered on user %s in guild %s for %v.",
+		target, guildID, s.opts.Duration)
+	if err := s.persist(guildID, state); err != nil {
 		log.Printf("[ERR] Failed to persist aggro state: %v", err)
 	}
 }
 
 // pick chooses a random recently active user who is not the bot.
-func (s *Service) pick() string {
-	candidates := s.activity.RecentAuthors(s.opts.Window)
+func (s *Service) pick(guildID string) string {
+	candidates := s.activity.RecentAuthors(guildID, s.opts.Window)
 
 	// Never the bot itself. It cannot reach here, because the gateway handler drops bot
 	// messages before anything is recorded, and that is exactly why this is worth three
@@ -299,12 +328,16 @@ func (s *Service) pick() string {
 	return filtered[rand.IntN(len(filtered))]
 }
 
-func (s *Service) persist(state State) error {
+func (s *Service) persist(guildID string, state State) error {
 	encoded, err := json.Marshal(state)
 	if err != nil {
 		return fmt.Errorf("encode aggro state: %w", err)
 	}
-	return s.store.Update(func(w *storage.Writer) error {
+	store, err := s.corpora.For(guildID)
+	if err != nil {
+		return err
+	}
+	return store.Update(func(w *storage.Writer) error {
 		return w.PutBlob(storage.BlobConfig, "aggroState", encoded)
 	})
 }

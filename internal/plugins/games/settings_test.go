@@ -17,7 +17,7 @@ func configInteraction(channelID string, opts ...*discordgo.ApplicationCommandIn
 	return &discordgo.Interaction{
 		Type:      discordgo.InteractionApplicationCommand,
 		ChannelID: channelID,
-		GuildID:   "g1",
+		GuildID:   testGuild,
 		Member: &discordgo.Member{
 			User:        &discordgo.User{ID: snowflake(1)},
 			Permissions: discordgo.PermissionAdministrator,
@@ -56,10 +56,10 @@ func TestBindingAChannelRestrictsGames(t *testing.T) {
 
 	s.handleConfig(configInteraction("c1", strOpt(optChannel, channelBind)))
 
-	if !s.allowed("c1") {
+	if !s.allowed(testGuild, "c1") {
 		t.Error("the channel the command was run in is not allowed, so binding did nothing")
 	}
-	if s.allowed("c2") {
+	if s.allowed(testGuild, "c2") {
 		t.Error("another channel is still allowed, so the allowlist is not restricting anything")
 	}
 }
@@ -75,11 +75,11 @@ func TestTheConfigCommandWorksInADisallowedChannel(t *testing.T) {
 
 	s.handleConfig(configInteraction("c2", strOpt(optChannel, channelBind)))
 
-	if !s.allowed("c2") {
+	if !s.allowed(testGuild, "c2") {
 		t.Fatalf("the command was refused in a channel that was not on the allowlist, which is "+
 			"the one place it has to work: %v", guard.responded())
 	}
-	if !s.allowed("c1") {
+	if !s.allowed(testGuild, "c1") {
 		t.Error("binding replaced the allowlist instead of adding to it")
 	}
 }
@@ -118,16 +118,15 @@ func TestSettingsSurviveARestart(t *testing.T) {
 		strOpt(optMode, string(ModeInterval)),
 		intOpt(optInterval, 20)))
 
-	// A second Service over the SAME corpus, which is what a restart is from this package's
+	// A second Service over the SAME corpora, which is what a restart is from this package's
 	// point of view.
-	restarted := New(s.store, guard, manager, tracker, s.resolver, opts)
-	restarted.loadSettings()
+	restarted := New(s.corpora, guard, manager, tracker, s.resolver, opts)
 
-	got := restarted.snapshot()
+	got := restarted.snapshot(testGuild)
 	if got.Mode != ModeInterval || got.Interval != 20*time.Minute {
 		t.Errorf("settings after a restart = %+v, want interval mode every 20m", got)
 	}
-	if !restarted.allowed("c1") || restarted.allowed("c2") {
+	if !restarted.allowed(testGuild, "c1") || restarted.allowed(testGuild, "c2") {
 		t.Errorf("the allowlist did not survive: %+v", got.Channels)
 	}
 }
@@ -141,7 +140,7 @@ func TestAnOutOfRangeIntervalIsClamped(t *testing.T) {
 
 	s.handleConfig(configInteraction("c1", intOpt(optInterval, 1)))
 
-	if got := s.snapshot().Interval; got != minInterval {
+	if got := s.snapshot(testGuild).Interval; got != minInterval {
 		t.Errorf("interval = %s, want it clamped to %s", got, minInterval)
 	}
 }
@@ -152,23 +151,19 @@ func TestAnOutOfRangeIntervalIsClamped(t *testing.T) {
 // would start a puzzle, which at the default tick is one every five seconds.
 func TestIntervalModeWaitsOutItsPeriod(t *testing.T) {
 	s, guard, _, tracker := fixture(t, enabled())
-	tracker.Note("c1", snowflake(2))
+	tracker.Note(testGuild, "c1", snowflake(2))
 
 	s.handleConfig(configInteraction("c1",
 		strOpt(optMode, string(ModeInterval)), intOpt(optInterval, 20)))
 
 	// Nothing yet: the clock starts when the mode does, so the first puzzle is one period away.
-	s.mu.Lock()
-	s.lastInterval = time.Now()
-	s.mu.Unlock()
+	setInterval(t, s, time.Now())
 	s.maybeInterval()
 	if got := guard.puzzles(); len(got) != 0 {
 		t.Fatalf("interval mode posted before its period elapsed: %v", got)
 	}
 
-	s.mu.Lock()
-	s.lastInterval = time.Now().Add(-21 * time.Minute)
-	s.mu.Unlock()
+	setInterval(t, s, time.Now().Add(-21*time.Minute))
 	s.maybeInterval()
 	onePuzzle(t, guard)
 }
@@ -178,11 +173,9 @@ func TestIntervalModeWaitsOutItsPeriod(t *testing.T) {
 // thing standing between an activity-mode server and a puzzle every sweep.
 func TestActivityModeDoesNotPostOnTheInterval(t *testing.T) {
 	s, guard, _, tracker := fixture(t, enabled())
-	tracker.Note("c1", snowflake(2))
+	tracker.Note(testGuild, "c1", snowflake(2))
 
-	s.mu.Lock()
-	s.lastInterval = time.Now().Add(-24 * time.Hour)
-	s.mu.Unlock()
+	setInterval(t, s, time.Now().Add(-24*time.Hour))
 	s.maybeInterval()
 
 	if got := guard.puzzles(); len(got) != 0 {
@@ -220,10 +213,10 @@ func TestResetRestoresTheEnvironmentValues(t *testing.T) {
 	s.handleConfig(configInteraction("c2", strOpt(optChannel, channelBind)))
 	s.handleConfig(configInteraction("c2", boolOpt(optReset, true)))
 
-	if s.allowed("c2") {
+	if s.allowed(testGuild, "c2") {
 		t.Error("reset did not undo the binding")
 	}
-	if !s.allowed("c1") {
+	if !s.allowed(testGuild, "c1") {
 		t.Error("reset did not restore the environment's allowlist")
 	}
 }
@@ -236,7 +229,65 @@ func TestAnUnknownModeIsRefusedRatherThanStored(t *testing.T) {
 
 	s.handleConfig(configInteraction("c1", strOpt(optMode, "whenever")))
 
-	if got := s.snapshot().Mode; got != ModeActivity {
+	if got := s.snapshot(testGuild).Mode; got != ModeActivity {
 		t.Errorf("mode = %q, want the configured %q left alone", got, ModeActivity)
+	}
+}
+
+// setInterval winds one guild's interval clock, which lives on its per-guild state now.
+func setInterval(t *testing.T, s *Service, at time.Time) {
+	t.Helper()
+
+	st, err := s.state(testGuild)
+	if err != nil {
+		t.Fatalf("state: %v", err)
+	}
+	s.mu.Lock()
+	st.lastInterval = at
+	s.mu.Unlock()
+}
+
+// TestABindInOneGuildLeavesOthersAlone, M31b, and it is the bug a live multi-guild bot hit.
+//
+// Settings are per guild, but a guild that has never run /wordgame-config is seeded from
+// PEREGRINE_WORDGAME_CHANNELS, which is ONE flat list of channel IDs written when the bot was in
+// one server. A straight membership test refuses every channel in every other server, so binding
+// word games to a channel in one guild silently turned them off in all the others.
+//
+// The rule that replaces it: a list is a statement about the guilds it NAMES. It restricts those
+// and says nothing about the rest, which is the reading an empty list has always had.
+func TestABindInOneGuildLeavesOthersAlone(t *testing.T) {
+	opts := enabled()
+	opts.AllowChannels = []string{"c1"} // a channel in testGuild, and only there
+	s, _, _, _ := fixture(t, opts)
+
+	if !s.allowed(testGuild, "c1") {
+		t.Error("the bound channel is not allowed in its own guild")
+	}
+	if s.allowed(testGuild, "c2") {
+		t.Error("an unbound channel in the SAME guild is allowed, so the bind restricts nothing")
+	}
+	if !s.allowed(otherGuild, "other") {
+		t.Error("a channel in another guild was refused because of a bind in this one, which is " +
+			"the bug: one server's bind disabled word games everywhere else")
+	}
+}
+
+// TestAGuildsOwnBindStillRestrictsThatGuild, which is the other half: the per-guild reading must
+// not become "every list is advisory". A guild that binds a channel of its own is restricted to
+// it, and that is exactly what the operator asked for.
+func TestAGuildsOwnBindStillRestrictsThatGuild(t *testing.T) {
+	s, _, _, _ := fixture(t, enabled())
+
+	s.handleConfig(configInteraction("c1", strOpt(optChannel, channelBind)))
+
+	if !s.allowed(testGuild, "c1") {
+		t.Error("the bound channel is not allowed")
+	}
+	if s.allowed(testGuild, "c2") {
+		t.Error("binding one channel did not restrict the others in the same guild")
+	}
+	if !s.allowed(otherGuild, "other") {
+		t.Error("binding a channel in this guild restricted another guild")
 	}
 }

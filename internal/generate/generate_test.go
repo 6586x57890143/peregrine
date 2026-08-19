@@ -60,7 +60,7 @@ func fixture(t *testing.T, opts Options) (*storage.Store, *learn.Learner, *Gener
 	s := dbtest.Store(t)
 	gate := safety.NewGate(nil, slog.New(slog.NewTextHandler(io.Discard, nil)), false)
 	l := learn.New(gate, learn.Options{MaxNGram: opts.MaxNGram, MaxHistory: 1000, CooccurrenceWindow: 5})
-	return s, l, New(s, opts)
+	return s, l, New(storage.Single(s), opts)
 }
 
 // teach seeds the corpus the way the bot does, through the learn path, so the keys under test
@@ -422,7 +422,7 @@ func TestMemoryIsBoundedPerChannel(t *testing.T) {
 func TestGenerationIsReproducibleUnderASeededSource(t *testing.T) {
 	run := func() []string {
 		s, l, _ := fixture(t, defaults())
-		g := NewWithSource(s, defaults(), rand.New(rand.NewPCG(0xC0FFEE, 0xBADF00D)))
+		g := NewWithSource(storage.Single(s), defaults(), rand.New(rand.NewPCG(0xC0FFEE, 0xBADF00D)))
 		teach(t, s, l, "alice", 100,
 			"the bird is loose in the server again",
 			"the bird is coping about the ratio",

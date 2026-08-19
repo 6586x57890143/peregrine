@@ -54,7 +54,7 @@ type Options struct {
 // Service is the feature.
 type Service struct {
 	session *discordgo.Session
-	store   *storage.Store
+	corpora storage.Corpora
 	learner *learn.Learner
 	opts    Options
 	logger  *slog.Logger
@@ -76,10 +76,10 @@ type Service struct {
 // New builds the service. It takes the Learner rather than building one, because the corpus
 // writer is one per process and the reactor holds the same instance: two Learners would mean two
 // bot IDs and two mention patterns, and only one of them would ever be told who the bot is.
-func New(session *discordgo.Session, store *storage.Store, learner *learn.Learner, opts Options) *Service {
+func New(session *discordgo.Session, corpora storage.Corpora, learner *learn.Learner, opts Options) *Service {
 	return &Service{
 		session: session,
-		store:   store,
+		corpora: corpora,
 		learner: learner,
 		opts:    opts,
 		// A SHORTER TTL than a repair pass uses, because this is the live path: a nickname
@@ -146,8 +146,8 @@ func (s *Service) Once(ctx context.Context) {
 
 	in := ingest.New(
 		s.session,
-		cursors{store: s.store},
-		learner{session: s.members, store: s.store, learner: s.learner},
+		cursors{corpora: s.corpora},
+		learner{session: s.members, corpora: s.corpora, learner: s.learner},
 		s.logger,
 		ingest.Options{
 			Lookback:           s.opts.Lookback,
@@ -175,18 +175,28 @@ func (s *Service) Once(ctx context.Context) {
 // learner adapts the corpus writer to ingest.Learner.
 type learner struct {
 	session names.Session
-	store   *storage.Store
+	corpora storage.Corpora
 	learner *learn.Learner
 }
 
+// Learn files a historical message in ITS OWN guild's corpus.
+//
+// The guild is the parameter rather than m.GuildID, and that is not a style choice: a message
+// fetched over REST carries an EMPTY GuildID, so reaching for the field here would file every
+// backfilled message in the bot under one key. storage.Set refuses the empty guild outright,
+// which turns that mistake into a loud failure instead of a corpus nobody can explain.
 func (l learner) Learn(m *discordgo.Message, guildID string) error {
-	mentioned := names.OfMessage(l.session, l.store, &discordgo.MessageCreate{Message: m}, guildID)
+	mentioned := names.OfMessage(l.session, l.corpora, &discordgo.MessageCreate{Message: m}, guildID)
 
 	// One answer to "what is this person called", shared with the live handler. This was
 	// hand-built here and hand-built again in chat, and neither copy knew about GlobalName.
 	author := names.Primary(m.Author, m.Member)
 
-	return l.store.Update(func(w *storage.Writer) error {
+	store, err := l.corpora.For(guildID)
+	if err != nil {
+		return err
+	}
+	return store.Update(func(w *storage.Writer) error {
 		return l.learner.Message(w, m.Content, m.ID, author, mentioned)
 	})
 }
@@ -197,19 +207,27 @@ func (l learner) Learn(m *discordgo.Message, guildID string) error {
 // is holding a write transaction open across every REST round trip of a pass, and bbolt has a
 // single writer process-wide, so it would block all live learning for the length of the walk. A
 // read to fetch a cursor and a write to advance it are both a handful of bytes.
-type cursors struct{ store *storage.Store }
+type cursors struct{ corpora storage.Corpora }
 
-func (c cursors) Cursor(channelID string) (string, error) {
+func (c cursors) Cursor(guildID, channelID string) (string, error) {
+	store, err := c.corpora.For(guildID)
+	if err != nil {
+		return "", err
+	}
 	var id string
-	err := c.store.View(func(r *storage.Reader) error {
+	err = store.View(func(r *storage.Reader) error {
 		id = r.Cursor(channelID)
 		return nil
 	})
 	return id, err
 }
 
-func (c cursors) SetCursor(channelID, messageID string) error {
-	return c.store.Update(func(w *storage.Writer) error {
+func (c cursors) SetCursor(guildID, channelID, messageID string) error {
+	store, err := c.corpora.For(guildID)
+	if err != nil {
+		return err
+	}
+	return store.Update(func(w *storage.Writer) error {
 		return w.SetCursor(channelID, messageID)
 	})
 }

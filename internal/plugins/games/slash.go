@@ -239,7 +239,7 @@ func (s *Service) handleInteraction(i *discordgo.Interaction) {
 		return
 	}
 
-	if !s.allowed(i.ChannelID) {
+	if !s.allowed(i.GuildID, i.ChannelID) {
 		s.guard.Respond(i, "word games are restricted to another channel", true)
 		return
 	}
@@ -406,12 +406,12 @@ func (s *Service) handleConfig(i *discordgo.Interaction) {
 		// No options is a read. The command with nothing filled in is how an operator asks what
 		// the bot is currently doing, which is the question the log line at startup answers once
 		// and then scrolls away.
-		s.guard.Respond(i, "word games: "+s.snapshot().String(), true)
+		s.guard.Respond(i, "word games: "+s.snapshot(i.GuildID).String(), true)
 		return
 	}
 
 	var notes []string
-	set := s.update(func(set *settings) {
+	set := s.update(i.GuildID, func(set *settings) {
 		if reset {
 			// Applied FIRST, so an operator can reset and set something in one command rather
 			// than watching their change be overwritten by the reset in the same call.

@@ -293,8 +293,20 @@ func Record(w *storage.Writer, name, discordUserID, username string) (string, er
 // A corpus read failure degrades to the @mentions alone rather than failing the message.
 // Losing the names somebody typed costs the bot some association data; losing the message
 // costs it the message.
-func OfMessage(s Session, store *storage.Store, m *discordgo.MessageCreate, guildID string) []User {
+func OfMessage(s Session, corpora storage.Corpora, m *discordgo.MessageCreate, guildID string) []User {
 	users, seen := Resolve(s, m.Mentions, guildID)
+
+	// The guild's own corpus, M31. The parameter was already here for the REST half, which
+	// is why this needed no new argument: the names a message contains are looked up in the
+	// corpus of the server the message was sent in, and a name known in one server means
+	// nothing in another.
+	store, err := corpora.For(guildID)
+	if err != nil {
+		// The same degradation a corpus read failure gets below: the @mentions alone. A DM
+		// arrives here as a guildless message and gets exactly that, which is right, since
+		// nothing about it will be learned either.
+		return users
+	}
 
 	var fromContent []User
 	if err := store.View(func(r *storage.Reader) error {
