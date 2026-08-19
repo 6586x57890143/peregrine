@@ -27,7 +27,7 @@ import (
 func TestAGauntletRunsItsRoundsThroughTheSweep(t *testing.T) {
 	s, guard, _, _ := fixtureGauntlet(t)
 
-	if consumed := s.Command("!wordgame", "3", testGuild, "c1", admin(snowflake(1)), noNames); !consumed {
+	if consumed := s.Command("!wordgame", "3", testGuild, "c1", admin(snowflake(1))); !consumed {
 		t.Fatal("!wordgame 3 was not consumed")
 	}
 
@@ -68,7 +68,7 @@ func TestAGauntletRunsItsRoundsThroughTheSweep(t *testing.T) {
 func TestTheLastRoundSaysTheRunIsOver(t *testing.T) {
 	s, guard, _, _ := fixtureGauntlet(t)
 
-	if consumed := s.Command("!wordgame", "1", testGuild, "c1", admin(snowflake(1)), noNames); !consumed {
+	if consumed := s.Command("!wordgame", "1", testGuild, "c1", admin(snowflake(1))); !consumed {
 		t.Fatal("!wordgame 1 was not consumed")
 	}
 	s.Guess(testGuild, "c1", snowflake(601), theWord, snowflake(42), "ann")
@@ -98,7 +98,7 @@ func TestTheLastRoundSaysTheRunIsOver(t *testing.T) {
 func TestASoloWordgameIsNotARound(t *testing.T) {
 	s, guard, _, _ := fixtureGauntlet(t)
 
-	if consumed := s.Command("!wordgame", "", testGuild, "c1", admin(snowflake(1)), noNames); !consumed {
+	if consumed := s.Command("!wordgame", "", testGuild, "c1", admin(snowflake(1))); !consumed {
 		t.Fatal("!wordgame was not consumed")
 	}
 	posts := guard.posts()
@@ -282,7 +282,7 @@ func fixtureDict(t *testing.T, opts Options, mopts wordgame.Options) (
 	guard := &fakeGuard{}
 	chans := fakeChannels{"c1": {ID: "c1", Name: "memes", Text: true}}
 
-	s := New(dbtest.Set(t), guard, manager, tracker, chans, opts)
+	s := New(dbtest.Set(t), guard, manager, tracker, chans, nil, opts)
 	if err := s.Init(core.Deps{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}

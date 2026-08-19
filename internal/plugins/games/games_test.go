@@ -35,6 +35,11 @@ type fakeGuard struct {
 	responses     []response
 	registered    []*discordgo.ApplicationCommand
 	registeredApp string
+
+	// components is the button row that went out with each embed, and updates counts the
+	// component responses: a press must REPLACE the board rather than post a second one.
+	components [][]discordgo.MessageComponent
+	updates    int
 }
 
 func (g *fakeGuard) Edit(_, messageID, content string) bool {
@@ -60,13 +65,15 @@ func (g *fakeGuard) edits() map[string]string {
 	return out
 }
 
-func (g *fakeGuard) SendEmbed(_ string, embed *discordgo.MessageEmbed) (*discordgo.Message, bool) {
+func (g *fakeGuard) SendEmbed(_ string, embed *discordgo.MessageEmbed,
+	components ...discordgo.MessageComponent) (*discordgo.Message, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.refuse {
 		return nil, false
 	}
 	g.embeds = append(g.embeds, embed)
+	g.components = append(g.components, components)
 	// Also recorded as text, so posts() answers "what did the bot say" rather than "which
 	// method did it use". The puzzle moved from a plain send to an embed in M25 and every
 	// assertion about the words in it is still the assertion worth making; a fake that
@@ -126,6 +133,45 @@ func (g *fakeGuard) Respond(_ *discordgo.Interaction, content string, ephemeral 
 	}
 	g.responses = append(g.responses, response{content: content, ephemeral: ephemeral})
 	return true
+}
+
+// RespondEmbed and UpdateEmbed are M32's board. Recorded into the same embeds slice as
+// SendEmbed, because every assertion worth making is about the board rather than about which
+// method carried it, and separately as responses so the ephemeral split stays visible.
+func (g *fakeGuard) RespondEmbed(_ *discordgo.Interaction, embed *discordgo.MessageEmbed,
+	ephemeral bool, components ...discordgo.MessageComponent) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.refuse {
+		return false
+	}
+	g.embeds = append(g.embeds, embed)
+	g.components = append(g.components, components)
+	g.responses = append(g.responses, response{content: flatten(embed), ephemeral: ephemeral})
+	return true
+}
+
+func (g *fakeGuard) UpdateEmbed(_ *discordgo.Interaction, embed *discordgo.MessageEmbed,
+	components ...discordgo.MessageComponent) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.refuse {
+		return false
+	}
+	g.embeds = append(g.embeds, embed)
+	g.components = append(g.components, components)
+	g.updates++
+	return true
+}
+
+// lastComponents is the button row under whatever went out most recently.
+func (g *fakeGuard) lastComponents() []discordgo.MessageComponent {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.components) == 0 {
+		return nil
+	}
+	return g.components[len(g.components)-1]
 }
 
 func (g *fakeGuard) RegisterCommands(appID string, commands []*discordgo.ApplicationCommand) bool {
@@ -283,7 +329,7 @@ func fixtureWithTimeout(t *testing.T, opts Options, timeout time.Duration) (*Ser
 		"other": {ID: "other", Name: "memes", Text: true, GuildID: otherGuild},
 	}
 
-	s := New(dbtest.Set(t), guard, manager, tracker, chans, opts)
+	s := New(dbtest.Set(t), guard, manager, tracker, chans, nil, opts)
 	if err := s.Init(core.Deps{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
@@ -375,7 +421,7 @@ func admin(id string) Requester { return Requester{UserID: id} }
 func TestWordgameOnRequestNeedsAuthorization(t *testing.T) {
 	s, guard, _, _ := fixture(t, enabled())
 
-	if consumed := s.Command("!wordgame", "", testGuild, "c1", Requester{UserID: snowflake(999)}, noNames); !consumed {
+	if consumed := s.Command("!wordgame", "", testGuild, "c1", Requester{UserID: snowflake(999)}); !consumed {
 		t.Error("an unauthorized !wordgame was not consumed; it is still a command rather than " +
 			"something to reply to")
 	}
@@ -383,7 +429,7 @@ func TestWordgameOnRequestNeedsAuthorization(t *testing.T) {
 		t.Errorf("an unauthorized !wordgame started a game: %v", posts)
 	}
 
-	if consumed := s.Command("!wordgame", "", testGuild, "c1", admin(snowflake(1)), noNames); !consumed {
+	if consumed := s.Command("!wordgame", "", testGuild, "c1", admin(snowflake(1))); !consumed {
 		t.Error("an authorized !wordgame was not consumed")
 	}
 	onePuzzle(t, guard)
@@ -399,7 +445,7 @@ func TestGamesRunOnlyInAllowedChannels(t *testing.T) {
 	opts.AllowChannels = []string{"c1"}
 	s, guard, _, _ := fixture(t, opts)
 
-	if consumed := s.Command("!wordgame", "", testGuild, "c2", admin(snowflake(1)), noNames); !consumed {
+	if consumed := s.Command("!wordgame", "", testGuild, "c2", admin(snowflake(1))); !consumed {
 		t.Error("!wordgame in a disallowed channel was not consumed; it is still a command")
 	}
 	if got := guard.puzzles(); len(got) != 0 {
@@ -409,7 +455,7 @@ func TestGamesRunOnlyInAllowedChannels(t *testing.T) {
 		t.Errorf("the refusal said nothing: %v", guard.posts())
 	}
 
-	s.Command("!wordgame", "", testGuild, "c1", admin(snowflake(1)), noNames)
+	s.Command("!wordgame", "", testGuild, "c1", admin(snowflake(1)))
 	onePuzzle(t, guard)
 }
 
@@ -566,7 +612,7 @@ func TestTheLeaderboardCommandWorksWithTheGameOff(t *testing.T) {
 	opts.Enabled = false
 	s, guard, _, _ := fixture(t, opts)
 
-	if consumed := s.Command("!leaderboard", "", testGuild, "c1", admin(snowflake(42)), noNames); !consumed {
+	if consumed := s.Command("!leaderboard", "", testGuild, "c1", admin(snowflake(42))); !consumed {
 		t.Error("!leaderboard was not consumed with word games off")
 	}
 	// An embed now, not a code block. The board is deliberately NOT gated on the feature
@@ -580,7 +626,7 @@ func TestTheLeaderboardCommandWorksWithTheGameOff(t *testing.T) {
 // TestAnUnknownCommandIsNotConsumed, so ordinary chat is not swallowed.
 func TestAnUnknownCommandIsNotConsumed(t *testing.T) {
 	s, _, _, _ := fixture(t, enabled())
-	if s.Command("!nonsense", "", testGuild, "c1", admin(snowflake(42)), noNames) {
+	if s.Command("!nonsense", "", testGuild, "c1", admin(snowflake(42))) {
 		t.Error("an unrecognized command was consumed")
 	}
 }
@@ -605,7 +651,44 @@ func TestIntervalModePicksAChannelWithTraffic(t *testing.T) {
 	onePuzzle(t, guard)
 }
 
-func noNames(userID string) string { return userID }
+// countingMembers is a names.Session that answers every lookup and counts it.
+//
+// The resolver used to arrive as a closure from chat, which made "how many names did this
+// render" a one-line fake. It is games' own dependency as of M32, so the count is taken here
+// instead: the assertion is unchanged, because what it is really measuring is Discord requests
+// per rendered board, and a GuildMember call IS the request.
+type countingMembers struct {
+	mu   sync.Mutex
+	seen map[string]int
+}
+
+func (c *countingMembers) GuildMember(_, userID string, _ ...discordgo.RequestOption) (
+	*discordgo.Member, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.seen[userID]++
+	return &discordgo.Member{User: &discordgo.User{ID: userID, Username: "user-" + userID}}, nil
+}
+
+func (c *countingMembers) counts() map[string]int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(map[string]int, len(c.seen))
+	for k, v := range c.seen {
+		out[k] = v
+	}
+	return out
+}
+
+func (c *countingMembers) total() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, v := range c.seen {
+		n += v
+	}
+	return n
+}
 
 // ------------------------------------------------------- the word-game pass, M21b
 
@@ -633,7 +716,7 @@ func TestTheSweepRepostsTheAnnouncementToDeliverAHint(t *testing.T) {
 		HintAfter: time.Millisecond,
 	})
 	guard := &fakeGuard{}
-	s := New(dbtest.Set(t), guard, manager, tracker, fakeChannels{}, enabled())
+	s := New(dbtest.Set(t), guard, manager, tracker, fakeChannels{}, nil, enabled())
 	if err := s.Init(core.Deps{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
@@ -687,7 +770,7 @@ func TestTheSweepRepostsTheAnnouncementToDeliverAHint(t *testing.T) {
 func TestAPlantedWordBecomesThePuzzle(t *testing.T) {
 	s, guard, manager, _ := fixture(t, enabled())
 
-	if consumed := s.Command("!wordgame", "banana", testGuild, "c1", admin(snowflake(1)), noNames); !consumed {
+	if consumed := s.Command("!wordgame", "banana", testGuild, "c1", admin(snowflake(1))); !consumed {
 		t.Fatal("!wordgame with a word was not consumed")
 	}
 	if manager.Active() != 1 {
@@ -708,7 +791,7 @@ func TestAPlantedWordBecomesThePuzzle(t *testing.T) {
 func TestAnUnusableWordIsRefusedOutLoudNamingTheRules(t *testing.T) {
 	s, guard, manager, _ := fixture(t, enabled())
 
-	if consumed := s.Command("!wordgame", "aaaaa", testGuild, "c1", admin(snowflake(1)), noNames); !consumed {
+	if consumed := s.Command("!wordgame", "aaaaa", testGuild, "c1", admin(snowflake(1))); !consumed {
 		t.Fatal("a refused !wordgame was not consumed; it is still a command")
 	}
 	if manager.Active() != 0 {
@@ -729,7 +812,7 @@ func TestAnUnusableWordIsRefusedOutLoudNamingTheRules(t *testing.T) {
 func TestAPlantedWordFromANonAdminStartsNothing(t *testing.T) {
 	s, guard, manager, _ := fixture(t, enabled())
 
-	if consumed := s.Command("!wordgame", "banana", testGuild, "c1", admin(snowflake(999)), noNames); !consumed {
+	if consumed := s.Command("!wordgame", "banana", testGuild, "c1", admin(snowflake(999))); !consumed {
 		t.Error("an unauthorized !wordgame was not consumed")
 	}
 	if manager.Active() != 0 {
@@ -762,14 +845,12 @@ func TestTheLeaderboardResolvesOnlyTheNamesItRenders(t *testing.T) {
 		}
 	}
 
-	var calls int
-	names := func(userID string) string {
-		calls++
-		return "name-" + userID
-	}
+	members := &countingMembers{seen: map[string]int{}}
+	s.members = members
 
 	// The viewer sits well outside the top ten, so their own row is resolved too.
-	s.Command("!leaderboard", "", testGuild, "c1", admin(snowflake(1150)), names)
+	s.Command("!leaderboard", "", testGuild, "c1", admin(snowflake(1150)))
+	calls := members.total()
 
 	// Ten rows plus the viewer on the word-game board. The chat board is empty in this
 	// fixture, so it needs none.
@@ -801,13 +882,11 @@ func TestANameOnBothBoardsIsResolvedOnce(t *testing.T) {
 		t.Fatalf("seeding a chat stat: %v", err)
 	}
 
-	seen := map[string]int{}
-	s.Command("!leaderboard", "", testGuild, "c1", admin(viewer), func(userID string) string {
-		seen[userID]++
-		return "name"
-	})
+	members := &countingMembers{seen: map[string]int{}}
+	s.members = members
+	s.Command("!leaderboard", "", testGuild, "c1", admin(viewer))
 
-	if seen[viewer] != 1 {
+	if seen := members.counts(); seen[viewer] != 1 {
 		t.Errorf("the viewer was resolved %d times across two boards, want 1", seen[viewer])
 	}
 }
@@ -824,7 +903,8 @@ func TestTheBoardShowsTheViewerTheirOwnRank(t *testing.T) {
 	}
 
 	viewer := snowflake(2017) // eighteenth by score
-	s.Command("!leaderboard", "", testGuild, "c1", admin(viewer), func(userID string) string { return "user-" + userID })
+	s.members = &countingMembers{seen: map[string]int{}}
+	s.Command("!leaderboard", "", testGuild, "c1", admin(viewer))
 
 	embeds := guard.posted()
 	if len(embeds) != 1 {
@@ -845,7 +925,7 @@ func TestTheBoardTellsAViewerWithNoScoreThatTheyHaveNone(t *testing.T) {
 	s, guard, _, _ := fixture(t, enabled())
 	s.board(testGuild).AddWin(snowflake(3001), "somebody", time.Second, 1)
 
-	s.Command("!leaderboard", "", testGuild, "c1", admin(snowflake(9999)), func(userID string) string { return "n" })
+	s.Command("!leaderboard", "", testGuild, "c1", admin(snowflake(9999)))
 
 	embeds := guard.posted()
 	if len(embeds) != 1 {
@@ -865,7 +945,7 @@ func TestARefusedBoardIsNotRetriedAsPlainText(t *testing.T) {
 	s, guard, _, _ := fixture(t, enabled())
 	guard.refuse = true
 
-	if consumed := s.Command("!leaderboard", "", testGuild, "c1", admin(snowflake(1)), noNames); !consumed {
+	if consumed := s.Command("!leaderboard", "", testGuild, "c1", admin(snowflake(1))); !consumed {
 		t.Error("!leaderboard was not consumed when the guard refused it")
 	}
 	if got := guard.posts(); len(got) != 0 {

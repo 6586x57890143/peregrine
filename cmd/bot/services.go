@@ -164,7 +164,13 @@ func registerServices(
 	if len(wordGameChannels) == 0 {
 		wordGameChannels = cfg.AutonomousPostChannels
 	}
-	gamesSvc := games.New(corpora, guard, manager, tracker, resolver, games.Options{
+	// The member cache goes to games rather than to chat as of M32. The leaderboard is the
+	// only path that resolves a display name for somebody who is not the author of a message,
+	// and it moved wholesale: the reactor was carrying a cache for one closure it passed
+	// downwards. discordgo's GuildMember is an unconditional REST GET, which is why the wrapper
+	// exists at all, and a GLOBAL board makes it matter more, since it ranks people who are not
+	// in the caller's guild.
+	gamesSvc := games.New(corpora, guard, manager, tracker, resolver, members, games.Options{
 		Enabled:             cfg.EnableWordGames,
 		Mode:                games.Mode(cfg.WordGameMode),
 		Interval:            cfg.WordGameInterval,
@@ -206,10 +212,6 @@ func registerServices(
 		Games:    gamesSvc,
 		Voice:    voiceSvc,
 		Recorder: tuningSvc,
-		// The member cache, shared with the ingest and mention paths. discordgo's GuildMember
-		// is an unconditional REST GET, and the leaderboard's name lookups were the last call
-		// site in the module that did not go through this.
-		Members: members,
 		Options: chat.Options{
 			SelfMention:  cfg.SelfMention,
 			RoastChance:  cfg.RoastChance,

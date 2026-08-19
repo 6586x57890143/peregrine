@@ -59,6 +59,18 @@ const commandName = "wordgame"
 // states about refusals.
 const configCommandName = "wordgame-config"
 
+// boardCommandName is /leaderboard, M32.
+//
+// A THIRD command rather than an option on either of the other two, for the reason
+// wordgame-config is separate from wordgame: these are different jobs with different
+// audiences. It is also the only command here that answers PUBLICLY, because a leaderboard is
+// the one thing this package produces that the whole channel wants to see.
+//
+// !leaderboard is not removed, exactly as !wordgame was not. It posts the same board with the
+// same buttons; what the slash form adds is the scope option, which a bang command whose
+// arguments must stay one token cannot carry.
+const boardCommandName = "leaderboard"
+
 const (
 	optWord  = "word"
 	optCount = "count"
@@ -67,6 +79,8 @@ const (
 	optMode     = "mode"
 	optInterval = "interval"
 	optReset    = "reset"
+
+	optScope = "scope"
 )
 
 // The channel option's three verbs. Verbs rather than a channel argument, because the answer is
@@ -78,12 +92,42 @@ const (
 	channelAnywhere = "anywhere"
 )
 
-// definitions is what gets registered. One command with two optional options, mirroring the bang
-// command's single argument rather than inventing a subcommand tree: "!wordgame banana" and
-// "!wordgame 5" are one command with an argument, and the slash form should not be a different
-// shape of the same feature.
-func definitions() []*discordgo.ApplicationCommand {
-	return []*discordgo.ApplicationCommand{{
+// definitions is what gets registered.
+//
+// /wordgame is one command with two optional options, mirroring the bang command's single
+// argument rather than inventing a subcommand tree: "!wordgame banana" and "!wordgame 5" are one
+// command with an argument, and the slash form should not be a different shape of it.
+//
+// wordGames FILTERS rather than decorating, and it exists because /leaderboard does not belong
+// to the word-game feature. !leaderboard has never been gated on PEREGRINE_ENABLE_WORD_GAMES,
+// since its chat half reads the stats bucket, which is populated on every message; registering
+// the slash form only when games are on would have made the two disagree. The other direction is
+// the knob-wired-to-nothing shape: a /wordgame visible in every client for a feature that is off
+// is a command whose only possible answer is a refusal.
+func definitions(wordGames bool) []*discordgo.ApplicationCommand {
+	defs := []*discordgo.ApplicationCommand{{
+		Name:        boardCommandName,
+		Description: "Show this week's leaderboard",
+		Options: []*discordgo.ApplicationCommandOption{
+			{
+				Type: discordgo.ApplicationCommandOptionString,
+				Name: optScope,
+				// Local is the default, so the option is optional and an empty value means
+				// this server: that is who the person asking is playing with, and a global
+				// board answered by default would rank them against strangers.
+				Description: "This server, or every server the bot is in",
+				Required:    false,
+				Choices: []*discordgo.ApplicationCommandOptionChoice{
+					{Name: "this server", Value: string(scopeLocal)},
+					{Name: "every server", Value: string(scopeGlobal)},
+				},
+			},
+		},
+	}}
+	if !wordGames {
+		return defs
+	}
+	return append(defs, []*discordgo.ApplicationCommand{{
 		Name:        commandName,
 		Description: "Start a word scramble puzzle",
 		Options: []*discordgo.ApplicationCommandOption{
@@ -148,7 +192,7 @@ func definitions() []*discordgo.ApplicationCommand {
 				Required:    false,
 			},
 		},
-	}}
+	}}...)
 }
 
 func ptr[T any](v T) *T { return &v }
@@ -163,7 +207,7 @@ func (s *Service) registerCommands() {
 			"command still works.")
 		return
 	}
-	s.guard.RegisterCommands(s.session.State.User.ID, definitions())
+	s.guard.RegisterCommands(s.session.State.User.ID, definitions(s.opts.Enabled))
 }
 
 // onInteraction is the gateway handler, registered in Init.
@@ -181,19 +225,30 @@ func (s *Service) onInteraction(_ *discordgo.Session, ic *discordgo.InteractionC
 	if ic == nil || ic.Interaction == nil {
 		return
 	}
-	if ic.Type != discordgo.InteractionApplicationCommand {
-		// Components and modals are not registered, so anything else is either another bot's
-		// event or a shape this build does not know. Ignored rather than answered.
-		return
-	}
-	name := ic.ApplicationCommandData().Name
+	var name string
 	var handle func(*discordgo.Interaction)
-	switch name {
-	case commandName:
-		handle = s.handleInteraction
-	case configCommandName:
-		handle = s.handleConfig
+	switch ic.Type {
+	case discordgo.InteractionApplicationCommand:
+		name = ic.ApplicationCommandData().Name
+		switch name {
+		case commandName:
+			handle = s.handleInteraction
+		case configCommandName:
+			handle = s.handleConfig
+		case boardCommandName:
+			handle = s.handleLeaderboard
+		default:
+			return
+		}
+	case discordgo.InteractionMessageComponent:
+		// M32's buttons. This used to return, because nothing registered a component; the
+		// handler itself checks the custom_id prefix, so a press on somebody else's message is
+		// still ignored rather than answered with the wrong thing.
+		name = componentID(ic.Interaction)
+		handle = s.handleBoardButton
 	default:
+		// Modals and autocomplete are not registered, so anything else is either another
+		// application's event or a shape this build does not know.
 		return
 	}
 
@@ -205,7 +260,7 @@ func (s *Service) onInteraction(_ *discordgo.Session, ic *discordgo.InteractionC
 		return
 	}
 	if !s.dispatcher.Submit(func(context.Context) { handle(i) }) {
-		log.Printf("[WORDGAME] Dropped a /%s: the work queue is full.", name)
+		log.Printf("[WORDGAME] Dropped an interaction (%s): the work queue is full.", name)
 	}
 }
 
@@ -385,6 +440,23 @@ func interactionArgs(i *discordgo.Interaction) (word string, count int) {
 // Every exit answers, ephemerally, for the reason handleInteraction states: an interaction with no
 // response shows the caller Discord's own red failure after three seconds, and a settings command
 // that appears to do nothing is worse than one that says no.
+// componentID reads a component press's custom_id, or "" when the payload is not one.
+//
+// A comma-ok rather than discordgo's MessageComponentData, which type-ASSERTS and therefore
+// PANICS when the interaction's type and its data disagree. Those are two independent fields
+// off the wire, so nothing but this check stops a malformed payload from taking down the
+// goroutine that reads it: a test built one by hand and found it immediately.
+func componentID(i *discordgo.Interaction) string {
+	if i == nil {
+		return ""
+	}
+	data, ok := i.Data.(discordgo.MessageComponentInteractionData)
+	if !ok {
+		return ""
+	}
+	return data.CustomID
+}
+
 func (s *Service) handleConfig(i *discordgo.Interaction) {
 	who := interactionRequester(i)
 	if !s.Authorized(who) {

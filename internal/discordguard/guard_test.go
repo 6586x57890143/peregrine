@@ -773,3 +773,78 @@ func TestRegisteringIsNotPauseGated(t *testing.T) {
 			"user text, and a paused bot still needs its commands to be correct")
 	}
 }
+
+// TestAComponentResponseIsGatedLikeEverythingElse, M32.
+//
+// UpdateEmbed is the button half of the paginated leaderboard, and it is the shape most likely
+// to look exempt: the message already exists, the reader already has it open, and the press
+// came from them. None of that changes what is going INTO the message, which is a freshly built
+// board full of Discord nicknames. So it runs the same gate, over every text field, and the
+// same pause switch.
+func TestAComponentResponseIsGatedLikeEverythingElse(t *testing.T) {
+	i := &discordgo.Interaction{ChannelID: "c1"}
+
+	t.Run("a blocklisted word in a FIELD refuses the update", func(t *testing.T) {
+		f := &fakeSession{}
+		g := newGuard(f, blockMatching{bad: "exampleslur"})
+
+		embed := &discordgo.MessageEmbed{
+			Title: "weekly leaderboard",
+			Fields: []*discordgo.MessageEmbedField{
+				{Name: "scramble", Value: "1. exampleslur 40"},
+			},
+		}
+		if g.UpdateEmbed(i, embed) {
+			t.Error("a nickname carrying a blocked word paged straight through the gate")
+		}
+		if len(f.responses) != 0 {
+			t.Errorf("the refused update reached Discord anyway: %v", f.responses)
+		}
+	})
+
+	t.Run("the ignore list applies", func(t *testing.T) {
+		f := &fakeSession{}
+		g := newGuard(f, allowAll{}, "c1")
+
+		if g.UpdateEmbed(i, &discordgo.MessageEmbed{Title: "weekly leaderboard"}) {
+			t.Error("a button press answered in a channel the operator said not to post in")
+		}
+	})
+}
+
+// TestAComponentResponseReplacesTheMessage.
+//
+// The response TYPE is the whole behaviour: an ordinary response would post a second board
+// under the first, which is what this method exists to avoid. Asserting on the type rather than
+// on the embed, because the embed is identical either way.
+func TestAComponentResponseReplacesTheMessage(t *testing.T) {
+	f := &fakeSession{}
+	g := newGuard(f, allowAll{})
+
+	embed := &discordgo.MessageEmbed{Title: "weekly leaderboard"}
+	buttons := []discordgo.MessageComponent{discordgo.ActionsRow{
+		Components: []discordgo.MessageComponent{
+			discordgo.Button{Label: "next", CustomID: "lb:local:2"},
+		},
+	}}
+	// A nil interaction is refused rather than dereferenced, like every other method here.
+	if g.UpdateEmbed(nil, embed, buttons...) {
+		t.Error("a nil interaction was answered")
+	}
+	if !g.UpdateEmbed(&discordgo.Interaction{ChannelID: "c1"}, embed, buttons...) {
+		t.Fatal("UpdateEmbed refused an ordinary board")
+	}
+	if len(f.responses) != 1 {
+		t.Fatalf("responses = %d, want 1", len(f.responses))
+	}
+	if f.responses[0].Type != discordgo.InteractionResponseUpdateMessage {
+		t.Errorf("response type = %v, want UpdateMessage: anything else posts a SECOND board "+
+			"under the first instead of paging the one that is there", f.responses[0].Type)
+	}
+	if len(f.responses[0].Data.Components) != 1 {
+		t.Error("the buttons did not survive the update, so the board can be paged exactly once")
+	}
+	if f.responses[0].Data.AllowedMentions == nil {
+		t.Error("the update carries no AllowedMentions, so Discord parses every mention in it")
+	}
+}

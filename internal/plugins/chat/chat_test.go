@@ -99,7 +99,7 @@ func (g *fakeGames) Guess(string, string, string, string, string, string) bool {
 	return false
 }
 
-func (g *fakeGames) Command(cmd, arg, _, _ string, who games.Requester, _ func(string) string) bool {
+func (g *fakeGames) Command(cmd, arg, _, _ string, who games.Requester) bool {
 	if arg != "" {
 		cmd += " " + arg
 	}
