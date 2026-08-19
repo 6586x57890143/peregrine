@@ -48,7 +48,7 @@ func registerServices(
 	registry *core.Registry,
 	cfg *config.Config,
 	session *discordgo.Session,
-	store *storage.Store,
+	corpora *storage.Set,
 	gate *safety.Gate,
 	dispatcher *core.Dispatcher,
 	log *slog.Logger,
@@ -89,7 +89,7 @@ func registerServices(
 		PromptRelevance:    cfg.PromptRelevanceBoost,
 		RoastChance:        cfg.RoastChance,
 	}
-	speaker := generate.New(store, dials)
+	speaker := generate.New(corpora, dials)
 	emoji := core.SessionEmoji(session)
 
 	// One member cache for every path that resolves a nickname. Bounded and TTL'd, because a
@@ -144,14 +144,14 @@ func registerServices(
 	// The reactor is built before the features it calls, because it hands them nothing: they
 	// are constructed here and passed in. It is REGISTERED after them, which is what the
 	// ordering note above is about.
-	aggroSvc := aggro.New(store, guard, tracker, aggro.Options{
+	aggroSvc := aggro.New(corpora, guard, tracker, aggro.Options{
 		Chance:   cfg.AggroChance,
 		Duration: cfg.AggroDuration,
 		Tick:     cfg.AggroTick,
 		Emoji:    cfg.AggroEmoji,
 		Window:   cfg.AggroActivityWindow,
 	})
-	imagesSvc := images.New(store, guard, resolver, images.Options{
+	imagesSvc := images.New(corpora, guard, resolver, images.Options{
 		Chance:       cfg.ImageRepostChance,
 		Direct:       cfg.ImageRepostDirect,
 		CacheSize:    cfg.ImageCacheSize,
@@ -164,7 +164,7 @@ func registerServices(
 	if len(wordGameChannels) == 0 {
 		wordGameChannels = cfg.AutonomousPostChannels
 	}
-	gamesSvc := games.New(store, guard, manager, tracker, resolver, games.Options{
+	gamesSvc := games.New(corpora, guard, manager, tracker, resolver, games.Options{
 		Enabled:             cfg.EnableWordGames,
 		Mode:                games.Mode(cfg.WordGameMode),
 		Interval:            cfg.WordGameInterval,
@@ -193,7 +193,7 @@ func registerServices(
 
 	reactor := chat.New(chat.Deps{
 		Session:  session,
-		Store:    store,
+		Corpora:  corpora,
 		Gate:     gate,
 		Guard:    guard,
 		Learner:  learner,
@@ -225,7 +225,7 @@ func registerServices(
 
 	// Ingestion, the corpus snapshots and the health report. These three were the last things
 	// in internal/legacy, which M13 deleted.
-	ingestSvc := ingest.New(session, store, learner, ingest.Options{
+	ingestSvc := ingest.New(session, corpora, learner, ingest.Options{
 		Tick:               cfg.IngestTick,
 		Lookback:           cfg.IngestLookback,
 		GuildConcurrency:   cfg.IngestGuildConcurrency,
@@ -235,7 +235,7 @@ func registerServices(
 	// History repair. Registered unconditionally and gated inside Start, so an operator
 	// turning it on is a restart rather than a different binary, and so the service can
 	// report what it decided.
-	repairSvc := repair.New(session, store, learner, repair.Options{
+	repairSvc := repair.New(session, corpora, learner, repair.Options{
 		Enabled:  cfg.RepairJobs,
 		Override: cfg.RepairBefore,
 		// Gentler than the live pass on purpose: a repair has no deadline and the bot does,
@@ -245,13 +245,13 @@ func registerServices(
 		BatchDelay:         time.Second,
 		Retry:              time.Hour,
 	})
-	backupSvc := backup.New(store, backup.Options{
+	backupSvc := backup.New(corpora, backup.Options{
 		Dir:   cfg.BackupDir,
 		Every: cfg.BackupTick,
 		Keep:  cfg.BackupKeep,
 	})
 	healthSvc := health.New(health.Deps{
-		Store:    store,
+		Corpora:  corpora,
 		Queue:    dispatcher,
 		Gate:     gate,
 		Latency:  health.SessionLatency(session),
@@ -260,7 +260,7 @@ func registerServices(
 		// The corpus word source, wired only when the operator wants that variant. Passing it
 		// unconditionally would be harmless and would also mean the chance dial had two ways
 		// to be off, which is one more than a knob should have.
-		Topics: health.CorpusTopics(store),
+		Topics: health.CorpusTopics(corpora),
 	}, health.Options{
 		StatusTick:  cfg.StatusTick,
 		LatencyTick: latencyTick,

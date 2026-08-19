@@ -228,6 +228,14 @@ func (g *fakeGuard) deleted() []string {
 	return append([]string(nil), g.deletes...)
 }
 
+// testGuild is the server every fixture message and interaction comes from. A real snowflake,
+// because the corpus set refuses anything else: a guild ID is a path component.
+const testGuild = "111"
+
+// otherGuild is a second server the bot is in. Word-game settings are per guild, and the
+// channel allowlist has to be READ per guild as well: see TestABindInOneGuildLeavesOthersAlone.
+const otherGuild = "222"
+
 type fakeChannels map[string]channels.Info
 
 func (f fakeChannels) Channel(id string) (channels.Info, bool) {
@@ -267,9 +275,15 @@ func fixtureWithTimeout(t *testing.T, opts Options, timeout time.Duration) (*Ser
 		GauntletMax: 10,
 	})
 	guard := &fakeGuard{}
-	chans := fakeChannels{"c1": {ID: "c1", Name: "memes", Text: true}}
+	chans := fakeChannels{
+		"c1": {ID: "c1", Name: "memes", Text: true, GuildID: testGuild},
+		"c2": {ID: "c2", Name: "chat", Text: true, GuildID: testGuild},
+		// A channel in a DIFFERENT server, so the per-guild reading of the channel allowlist
+		// has something to be wrong about.
+		"other": {ID: "other", Name: "memes", Text: true, GuildID: otherGuild},
+	}
 
-	s := New(dbtest.Store(t), guard, manager, tracker, chans, opts)
+	s := New(dbtest.Set(t), guard, manager, tracker, chans, opts)
 	if err := s.Init(core.Deps{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
@@ -361,7 +375,7 @@ func admin(id string) Requester { return Requester{UserID: id} }
 func TestWordgameOnRequestNeedsAuthorization(t *testing.T) {
 	s, guard, _, _ := fixture(t, enabled())
 
-	if consumed := s.Command("!wordgame", "", "c1", Requester{UserID: snowflake(999)}, noNames); !consumed {
+	if consumed := s.Command("!wordgame", "", testGuild, "c1", Requester{UserID: snowflake(999)}, noNames); !consumed {
 		t.Error("an unauthorized !wordgame was not consumed; it is still a command rather than " +
 			"something to reply to")
 	}
@@ -369,7 +383,7 @@ func TestWordgameOnRequestNeedsAuthorization(t *testing.T) {
 		t.Errorf("an unauthorized !wordgame started a game: %v", posts)
 	}
 
-	if consumed := s.Command("!wordgame", "", "c1", admin(snowflake(1)), noNames); !consumed {
+	if consumed := s.Command("!wordgame", "", testGuild, "c1", admin(snowflake(1)), noNames); !consumed {
 		t.Error("an authorized !wordgame was not consumed")
 	}
 	onePuzzle(t, guard)
@@ -385,7 +399,7 @@ func TestGamesRunOnlyInAllowedChannels(t *testing.T) {
 	opts.AllowChannels = []string{"c1"}
 	s, guard, _, _ := fixture(t, opts)
 
-	if consumed := s.Command("!wordgame", "", "c2", admin(snowflake(1)), noNames); !consumed {
+	if consumed := s.Command("!wordgame", "", testGuild, "c2", admin(snowflake(1)), noNames); !consumed {
 		t.Error("!wordgame in a disallowed channel was not consumed; it is still a command")
 	}
 	if got := guard.puzzles(); len(got) != 0 {
@@ -395,7 +409,7 @@ func TestGamesRunOnlyInAllowedChannels(t *testing.T) {
 		t.Errorf("the refusal said nothing: %v", guard.posts())
 	}
 
-	s.Command("!wordgame", "", "c1", admin(snowflake(1)), noNames)
+	s.Command("!wordgame", "", testGuild, "c1", admin(snowflake(1)), noNames)
 	onePuzzle(t, guard)
 }
 
@@ -434,7 +448,7 @@ func TestAWinAnnouncesDeletesAndScores(t *testing.T) {
 	manager.Announced("c1", snowflake(500))
 
 	const guessID = "1600000000000000001"
-	if !s.Guess("c1", guessID, g.Word, snowflake(42), "winner") {
+	if !s.Guess(testGuild, "c1", guessID, g.Word, snowflake(42), "winner") {
 		t.Fatal("a correct guess was not recognized as a win")
 	}
 
@@ -457,7 +471,7 @@ func TestAWrongGuessIsNotAWin(t *testing.T) {
 	if _, err := manager.Start("c1"); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if s.Guess("c1", snowflake(501), "definitelynottheword", snowflake(42), "player") {
+	if s.Guess(testGuild, "c1", snowflake(501), "definitelynottheword", snowflake(42), "player") {
 		t.Error("a wrong guess was treated as a win")
 	}
 	if deleted := guard.deleted(); len(deleted) != 0 {
@@ -476,7 +490,7 @@ func TestGuessesAreIgnoredWithTheFeatureOff(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if s.Guess("c1", snowflake(502), g.Word, snowflake(42), "player") {
+	if s.Guess(testGuild, "c1", snowflake(502), g.Word, snowflake(42), "player") {
 		t.Error("a guess was processed with word games disabled")
 	}
 }
@@ -528,17 +542,17 @@ func TestTheSweepEndsExpiredGames(t *testing.T) {
 func TestTheWeeklyResetCatchesUp(t *testing.T) {
 	s, _, _, _ := fixture(t, enabled())
 
-	s.board.AddWin(snowflake(42), "winner", time.Second, 1)
-	if got := len(s.board.Entries()); got != 1 {
+	s.board(testGuild).AddWin(snowflake(42), "winner", time.Second, 1)
+	if got := len(s.board(testGuild).Entries()); got != 1 {
 		t.Fatalf("the board holds %d entries, want the win just recorded", got)
 	}
 
 	// A week and a half later, which is a bot that was off across a Monday.
-	future := s.board.WeekStart().AddDate(0, 0, 10)
-	if !s.board.MaybeReset(future) {
+	future := s.board(testGuild).WeekStart().AddDate(0, 0, 10)
+	if !s.board(testGuild).MaybeReset(future) {
 		t.Fatal("the board did not reset for a week that had clearly turned")
 	}
-	if got := len(s.board.Entries()); got != 0 {
+	if got := len(s.board(testGuild).Entries()); got != 0 {
 		t.Errorf("the board holds %d entries after a reset, want 0", got)
 	}
 }
@@ -552,7 +566,7 @@ func TestTheLeaderboardCommandWorksWithTheGameOff(t *testing.T) {
 	opts.Enabled = false
 	s, guard, _, _ := fixture(t, opts)
 
-	if consumed := s.Command("!leaderboard", "", "c1", admin(snowflake(42)), noNames); !consumed {
+	if consumed := s.Command("!leaderboard", "", testGuild, "c1", admin(snowflake(42)), noNames); !consumed {
 		t.Error("!leaderboard was not consumed with word games off")
 	}
 	// An embed now, not a code block. The board is deliberately NOT gated on the feature
@@ -566,7 +580,7 @@ func TestTheLeaderboardCommandWorksWithTheGameOff(t *testing.T) {
 // TestAnUnknownCommandIsNotConsumed, so ordinary chat is not swallowed.
 func TestAnUnknownCommandIsNotConsumed(t *testing.T) {
 	s, _, _, _ := fixture(t, enabled())
-	if s.Command("!nonsense", "", "c1", admin(snowflake(42)), noNames) {
+	if s.Command("!nonsense", "", testGuild, "c1", admin(snowflake(42)), noNames) {
 		t.Error("an unrecognized command was consumed")
 	}
 }
@@ -579,15 +593,15 @@ func TestIntervalModePicksAChannelWithTraffic(t *testing.T) {
 	s, guard, _, tracker := fixture(t, opts)
 
 	// Nothing tracked yet: a cold start has nowhere to post.
-	s.startInterval()
+	s.startInterval(testGuild)
 	if posts := guard.posts(); len(posts) != 0 {
 		t.Errorf("posted a puzzle with no active channel: %v", posts)
 	}
 
 	for range 5 {
-		tracker.Note("c1", snowflake(42))
+		tracker.Note(testGuild, "c1", snowflake(42))
 	}
-	s.startInterval()
+	s.startInterval(testGuild)
 	onePuzzle(t, guard)
 }
 
@@ -619,7 +633,7 @@ func TestTheSweepRepostsTheAnnouncementToDeliverAHint(t *testing.T) {
 		HintAfter: time.Millisecond,
 	})
 	guard := &fakeGuard{}
-	s := New(dbtest.Store(t), guard, manager, tracker, fakeChannels{}, enabled())
+	s := New(dbtest.Set(t), guard, manager, tracker, fakeChannels{}, enabled())
 	if err := s.Init(core.Deps{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
@@ -673,7 +687,7 @@ func TestTheSweepRepostsTheAnnouncementToDeliverAHint(t *testing.T) {
 func TestAPlantedWordBecomesThePuzzle(t *testing.T) {
 	s, guard, manager, _ := fixture(t, enabled())
 
-	if consumed := s.Command("!wordgame", "banana", "c1", admin(snowflake(1)), noNames); !consumed {
+	if consumed := s.Command("!wordgame", "banana", testGuild, "c1", admin(snowflake(1)), noNames); !consumed {
 		t.Fatal("!wordgame with a word was not consumed")
 	}
 	if manager.Active() != 1 {
@@ -694,7 +708,7 @@ func TestAPlantedWordBecomesThePuzzle(t *testing.T) {
 func TestAnUnusableWordIsRefusedOutLoudNamingTheRules(t *testing.T) {
 	s, guard, manager, _ := fixture(t, enabled())
 
-	if consumed := s.Command("!wordgame", "aaaaa", "c1", admin(snowflake(1)), noNames); !consumed {
+	if consumed := s.Command("!wordgame", "aaaaa", testGuild, "c1", admin(snowflake(1)), noNames); !consumed {
 		t.Fatal("a refused !wordgame was not consumed; it is still a command")
 	}
 	if manager.Active() != 0 {
@@ -715,7 +729,7 @@ func TestAnUnusableWordIsRefusedOutLoudNamingTheRules(t *testing.T) {
 func TestAPlantedWordFromANonAdminStartsNothing(t *testing.T) {
 	s, guard, manager, _ := fixture(t, enabled())
 
-	if consumed := s.Command("!wordgame", "banana", "c1", admin(snowflake(999)), noNames); !consumed {
+	if consumed := s.Command("!wordgame", "banana", testGuild, "c1", admin(snowflake(999)), noNames); !consumed {
 		t.Error("an unauthorized !wordgame was not consumed")
 	}
 	if manager.Active() != 0 {
@@ -744,7 +758,7 @@ func TestTheLeaderboardResolvesOnlyTheNamesItRenders(t *testing.T) {
 	for i := range 200 {
 		id := snowflake(1000 + i)
 		for range 200 - i {
-			s.board.AddWin(id, "player", time.Second, 1)
+			s.board(testGuild).AddWin(id, "player", time.Second, 1)
 		}
 	}
 
@@ -755,7 +769,7 @@ func TestTheLeaderboardResolvesOnlyTheNamesItRenders(t *testing.T) {
 	}
 
 	// The viewer sits well outside the top ten, so their own row is resolved too.
-	s.Command("!leaderboard", "", "c1", admin(snowflake(1150)), names)
+	s.Command("!leaderboard", "", testGuild, "c1", admin(snowflake(1150)), names)
 
 	// Ten rows plus the viewer on the word-game board. The chat board is empty in this
 	// fixture, so it needs none.
@@ -774,17 +788,21 @@ func TestANameOnBothBoardsIsResolvedOnce(t *testing.T) {
 	s, _, _, _ := fixture(t, enabled())
 
 	viewer := snowflake(500)
-	s.board.AddWin(viewer, "player", time.Second, 1)
+	s.board(testGuild).AddWin(viewer, "player", time.Second, 1)
 
 	// The same person also has chat activity.
-	if err := s.store.Update(func(w *storage.Writer) error {
+	store, err := s.corpora.For(testGuild)
+	if err != nil {
+		t.Fatalf("corpus: %v", err)
+	}
+	if err := store.Update(func(w *storage.Writer) error {
 		return w.IncUserStat(viewer, time.Now())
 	}); err != nil {
 		t.Fatalf("seeding a chat stat: %v", err)
 	}
 
 	seen := map[string]int{}
-	s.Command("!leaderboard", "", "c1", admin(viewer), func(userID string) string {
+	s.Command("!leaderboard", "", testGuild, "c1", admin(viewer), func(userID string) string {
 		seen[userID]++
 		return "name"
 	})
@@ -801,12 +819,12 @@ func TestTheBoardShowsTheViewerTheirOwnRank(t *testing.T) {
 	for i := range 30 {
 		id := snowflake(2000 + i)
 		for range 30 - i {
-			s.board.AddWin(id, "player", time.Second, 1)
+			s.board(testGuild).AddWin(id, "player", time.Second, 1)
 		}
 	}
 
 	viewer := snowflake(2017) // eighteenth by score
-	s.Command("!leaderboard", "", "c1", admin(viewer), func(userID string) string { return "user-" + userID })
+	s.Command("!leaderboard", "", testGuild, "c1", admin(viewer), func(userID string) string { return "user-" + userID })
 
 	embeds := guard.posted()
 	if len(embeds) != 1 {
@@ -825,9 +843,9 @@ func TestTheBoardShowsTheViewerTheirOwnRank(t *testing.T) {
 // indistinguishable from a bug.
 func TestTheBoardTellsAViewerWithNoScoreThatTheyHaveNone(t *testing.T) {
 	s, guard, _, _ := fixture(t, enabled())
-	s.board.AddWin(snowflake(3001), "somebody", time.Second, 1)
+	s.board(testGuild).AddWin(snowflake(3001), "somebody", time.Second, 1)
 
-	s.Command("!leaderboard", "", "c1", admin(snowflake(9999)), func(userID string) string { return "n" })
+	s.Command("!leaderboard", "", testGuild, "c1", admin(snowflake(9999)), func(userID string) string { return "n" })
 
 	embeds := guard.posted()
 	if len(embeds) != 1 {
@@ -847,7 +865,7 @@ func TestARefusedBoardIsNotRetriedAsPlainText(t *testing.T) {
 	s, guard, _, _ := fixture(t, enabled())
 	guard.refuse = true
 
-	if consumed := s.Command("!leaderboard", "", "c1", admin(snowflake(1)), noNames); !consumed {
+	if consumed := s.Command("!leaderboard", "", testGuild, "c1", admin(snowflake(1)), noNames); !consumed {
 		t.Error("!leaderboard was not consumed when the guard refused it")
 	}
 	if got := guard.posts(); len(got) != 0 {

@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"syscall"
@@ -96,6 +97,10 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 	_ = flag.Bool("corpus-report", false,
 		"Measure the corpus and print its distributions, then exit. Opens read-only and "+
 			"writes nothing, so it runs against a snapshot from -compact or the backup service.")
+	guildID := flag.String("guild", "",
+		"Which guild's corpus a maintenance mode operates on. Corpora are per guild as of "+
+			"M31, so -compact requires this; -clean-db, -purge-author and -corpus-report "+
+			"take every corpus in the directory when it is omitted.")
 	tuningReport := flag.String("tuning-report", "",
 		"Summarize a tuning export directory (or one .jsonl file) and exit. Reads no corpus "+
 			"and contacts nothing, so it runs against an archive pulled off the host.")
@@ -157,7 +162,7 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 	// live credential to do it. bbolt holds an exclusive flock, so these fail
 	// within five seconds against a live bot rather than hanging.
 	if passed["clean-db"] || passed["compact"] || passed["purge-author"] || passed["corpus-report"] {
-		return runMaintenance(cfg, log, passed, *compactTo, *purgeAuthor)
+		return runMaintenance(cfg, log, passed, *compactTo, *purgeAuthor, *guildID)
 	}
 
 	// SIGTERM is the one that matters in production: it is what `docker stop`
@@ -170,41 +175,29 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 		return err
 	}
 
-	// The corpus is opened here, and closed here, LAST. It used to be a defer
-	// inside the same function that spawned the message goroutines, so shutdown
-	// raced them: a handler still in flight could reach a closed database. Owning
-	// the open and the close at the outermost level is what makes the ordering
-	// below statable at all.
+	// The corpora are opened here, and closed here, LAST. That used to be a defer inside the
+	// same function that spawned the message goroutines, so shutdown raced them: a handler
+	// still in flight could reach a closed database. Owning the open and the close at the
+	// outermost level is what makes the ordering below statable at all.
 	//
-	// storage.Open also refuses a corpus whose schema_version it does not
-	// recognize, which is what turns "the layout changed in M6" from silently
-	// reading garbage into a startup error that says to start the corpus over.
-	store, err := storage.Open(cfg.DBPath)
+	// One corpus per guild as of M31, opened lazily: the guild list is not knowable here,
+	// because the gateway is not open yet and a bot that eagerly opened every file it found
+	// would also open corpora for guilds it has been removed from. Each file is an ordinary
+	// corpus, so storage.Open still refuses a schema_version it does not recognize.
+	//
+	// The learn generation is stamped by the set on each corpus's FIRST open rather than once
+	// here. It used to be stamped here, which ran before the gateway and therefore could not
+	// know a guild, and a corpus created three weeks from now would have carried no boundary
+	// for a repair to measure itself against.
+	corpora, err := storage.OpenSet(cfg.DBPath, cfg.MaxGuildCorpora, learn.Generation)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		if err := store.Close(); err != nil {
-			log.Error("closing corpus", "err", err)
+		if err := corpora.Close(); err != nil {
+			log.Error("closing corpora", "err", err)
 		}
 	}()
-
-	// STAMP WHICH GENERATION OF THE WRITE PATH IS ABOUT TO RUN, before anything writes.
-	//
-	// This is the boundary a future history repair measures itself against: everything older
-	// than the first run of the generation that fixed a writer bug went through the broken
-	// path, and everything newer did not. Recording it costs one idempotent key and removes
-	// the need for an operator to remember a deploy timestamp, which is the part of the M17
-	// design that did not survive contact with a second repair (SPEC.md section 8, finding 46).
-	//
-	// Here rather than in storage.Open because storage is the bottom layer and must not import
-	// learn; here rather than in the learner because a stamp that depends on a message arriving
-	// is a stamp that a quiet server never writes.
-	if err := store.Update(func(w *storage.Writer) error {
-		return w.RecordLearnGeneration(learn.Generation, time.Now())
-	}); err != nil {
-		return fmt.Errorf("recording learn generation: %w", err)
-	}
 
 	// The safety gate, built before the session so a bad ruleset stops the process
 	// before it can connect to anything.
@@ -227,11 +220,11 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 		Session:    session,
 		Config:     cfg,
 		Logger:     log,
-		Store:      store,
+		Corpora:    corpora,
 		Dispatcher: dispatcher,
 		Gate:       gate,
 	}, log)
-	if err := registerServices(registry, cfg, session, store, gate, dispatcher, log); err != nil {
+	if err := registerServices(registry, cfg, session, corpora, gate, dispatcher, log); err != nil {
 		return err
 	}
 
@@ -306,7 +299,7 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 // More than one mode at a time is refused rather than ordered. Compacting a corpus
 // that a clean pass in the same invocation has just emptied is a plausible thing to
 // want and an ambiguous thing to write, so the operator states the sequence.
-func runMaintenance(cfg *config.Config, log *slog.Logger, passed map[string]bool, compactTo, purgeAuthor string) error {
+func runMaintenance(cfg *config.Config, log *slog.Logger, passed map[string]bool, compactTo, purgeAuthor, guildID string) error {
 	modes := 0
 	for _, name := range []string{"clean-db", "compact", "purge-author", "corpus-report"} {
 		if passed[name] {
@@ -326,6 +319,20 @@ func runMaintenance(cfg *config.Config, log *slog.Logger, passed map[string]bool
 			"replacing the corpus in place, so that a compaction that goes wrong costs nothing")
 	}
 
+	// Compaction is one source file to one destination file, so with per-guild corpora it needs
+	// to be told which. Its neighbours iterate instead, because their destination is the corpus
+	// itself and doing them all is what an operator means by "clean the corpus".
+	if passed["compact"] && guildID == "" {
+		return errors.New("-compact needs -guild <id>: it writes ONE destination file, and " +
+			"corpora are per guild. Run -corpus-report with no -guild to see which guilds have one")
+	}
+
+	corpora, err := maintenanceTargets(cfg.DBPath, guildID)
+	if err != nil {
+		return err
+	}
+	log.Info("maintenance targets", "corpora", len(corpora), "dir", cfg.DBPath)
+
 	// The report opens read-only and therefore takes a SHARED flock, so unlike its
 	// neighbours it cannot run against a corpus a live bot is holding. That is the honest
 	// outcome rather than a limitation to work around: the intended input is a snapshot,
@@ -333,26 +340,76 @@ func runMaintenance(cfg *config.Config, log *slog.Logger, passed map[string]bool
 	// rather than in a branch below because storage.Open and storage.OpenReadOnly are
 	// different calls, and the whole point of the mode is which one it makes.
 	if passed["corpus-report"] {
-		store, err := storage.OpenReadOnly(cfg.DBPath)
-		if err != nil {
-			return err
-		}
-		defer func() {
+		for _, path := range corpora {
+			store, err := storage.OpenReadOnly(path)
+			if err != nil {
+				return err
+			}
+			log.Info("running maintenance mode", "mode", "corpus-report", "corpus", path,
+				"min_distinct_authors", cfg.MinDistinctAuthors)
+			st, err := store.CorpusStats(cfg.MinDistinctAuthors, learn.EndToken)
+			if err != nil {
+				_ = store.Close()
+				return err
+			}
 			if err := store.Close(); err != nil {
 				log.Error("closing corpus", "err", err)
 			}
-		}()
-
-		log.Info("running maintenance mode", "mode", "corpus-report", "corpus", cfg.DBPath,
-			"min_distinct_authors", cfg.MinDistinctAuthors)
-		st, err := store.CorpusStats(cfg.MinDistinctAuthors, learn.EndToken)
-		if err != nil {
-			return err
+			// One heading per corpus, because a report with no name on it describing one of
+			// several guilds is a report an operator cannot act on.
+			_, _ = fmt.Fprintf(os.Stdout, "\n=== %s ===\n", path)
+			if err := maintenance.CorpusReport(st, cfg.MinDistinctAuthors, os.Stdout); err != nil {
+				return err
+			}
 		}
-		return maintenance.CorpusReport(st, cfg.MinDistinctAuthors, os.Stdout)
+		return nil
 	}
 
-	store, err := storage.Open(cfg.DBPath)
+	// The write-mode corpora are opened ONE AT A TIME rather than all at once. Each holds an
+	// exclusive flock for as long as it is open, and a mode that takes every lock up front
+	// fails entirely because of the one guild that happens to be busy.
+	for _, path := range corpora {
+		if err := runOneMaintenance(cfg, log, passed, compactTo, purgeAuthor, path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// maintenanceTargets is the corpus files a mode should operate on.
+//
+// A named guild is one file, whether or not it exists yet: a typo'd guild ID that silently
+// cleaned every other corpus would be worse than an error about a missing file.
+func maintenanceTargets(dir, guildID string) ([]string, error) {
+	if guildID != "" {
+		path := filepath.Join(dir, guildID+".db")
+		if _, err := os.Stat(path); err != nil {
+			return nil, fmt.Errorf("no corpus for guild %s at %s: %w", guildID, path, err)
+		}
+		return []string{path}, nil
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read corpus directory %s: %w", dir, err)
+	}
+	var paths []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".db") {
+			paths = append(paths, filepath.Join(dir, e.Name()))
+		}
+	}
+	if len(paths) == 0 {
+		return nil, fmt.Errorf("no corpora in %s. Corpora are per guild as of M31 and are "+
+			"created as the bot learns from each guild", dir)
+	}
+	return paths, nil
+}
+
+// runOneMaintenance is the write-mode half, against one corpus.
+func runOneMaintenance(cfg *config.Config, log *slog.Logger, passed map[string]bool,
+	compactTo, purgeAuthor, path string) error {
+	store, err := storage.Open(path)
 	if err != nil {
 		return err
 	}
@@ -372,7 +429,7 @@ func runMaintenance(cfg *config.Config, log *slog.Logger, passed map[string]bool
 		if err != nil {
 			return err
 		}
-		log.Info("running maintenance mode", "mode", "clean-db", "corpus", cfg.DBPath)
+		log.Info("running maintenance mode", "mode", "clean-db", "corpus", path)
 		res, err := maintenance.Clean(store, gate, log)
 		if err != nil {
 			return err
@@ -384,11 +441,11 @@ func runMaintenance(cfg *config.Config, log *slog.Logger, passed map[string]bool
 		return nil
 
 	case compactTo != "":
-		log.Info("running maintenance mode", "mode", "compact", "corpus", cfg.DBPath, "destination", compactTo)
+		log.Info("running maintenance mode", "mode", "compact", "corpus", path, "destination", compactTo)
 		return maintenance.Compact(store, compactTo, log)
 
 	default:
-		log.Info("running maintenance mode", "mode", "purge-author", "corpus", cfg.DBPath, "author", purgeAuthor)
+		log.Info("running maintenance mode", "mode", "purge-author", "corpus", path, "author", purgeAuthor)
 		_, err := maintenance.PurgeAuthor(store, purgeAuthor, log)
 		return err
 	}

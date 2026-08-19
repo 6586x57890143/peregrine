@@ -168,9 +168,20 @@ func (s *Service) post() {
 	start := time.Now()
 	log.Println("[AUTONOMOUS] Starting autonomous post cycle...")
 
-	channelID := channels.Busiest(s.counter, s.resolver, s.opts.ActiveChannelWindow, s.opts.Channels)
+	channelID := channels.Busiest(s.counter, s.resolver, s.opts.ActiveChannelWindow, s.opts.Channels, "")
 	if channelID == "" {
 		log.Println("[AUTONOMOUS] No active channel found, skipping post.")
+		return
+	}
+
+	// WHICH SERVER'S WORDS, M31. This loop picks a channel and then speaks from a corpus, and
+	// before per-guild corpora that corpus was every server at once: the clearest cross-guild
+	// quote path in the bot, because nothing here was ever addressed to anybody. The guild
+	// comes off the state cache with the rest of the channel's details.
+	info, ok := s.resolver.Channel(channelID)
+	if !ok || info.GuildID == "" {
+		log.Printf("[AUTONOMOUS] Channel %s is not in the state cache, so there is no guild to "+
+			"speak from. Skipping.", channelID)
 		return
 	}
 
@@ -187,10 +198,11 @@ func (s *Service) post() {
 	// here: an unprompted post steered by nothing is a non-sequitur by construction.
 	var trace generate.Trace
 	msg, outcome, err := s.speaker.Sentence(generate.Request{
-		Prompt: "autonomous thought",
-		Memory: s.memories.For(channelID),
-		Emoji:  s.emoji,
-		Trace:  &trace,
+		GuildID: info.GuildID,
+		Prompt:  "autonomous thought",
+		Memory:  s.memories.For(channelID),
+		Emoji:   s.emoji,
+		Trace:   &trace,
 	})
 
 	// One helper for all four exits, so a path cannot be added that records nothing. The

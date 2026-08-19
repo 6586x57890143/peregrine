@@ -47,7 +47,7 @@ func (g *fakeGuard) counts() (int, int) {
 // fakeActivity is a fixed candidate list.
 type fakeActivity []string
 
-func (f fakeActivity) RecentAuthors(time.Duration) []string {
+func (f fakeActivity) RecentAuthors(string, time.Duration) []string {
 	return append([]string(nil), f...)
 }
 
@@ -57,9 +57,10 @@ func opts() Options {
 
 func fixture(t *testing.T, act Activity, o Options) (*Service, *storage.Store, *fakeGuard) {
 	t.Helper()
-	store := dbtest.Store(t)
+	set := dbtest.Set(t)
+	store := dbtest.Guild(t, set, "111")
 	guard := &fakeGuard{}
-	s := New(store, guard, act, o)
+	s := New(set, guard, act, o)
 	if err := s.Init(core.Deps{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
@@ -73,7 +74,7 @@ func TestTriggerPicksAndPersistsATarget(t *testing.T) {
 
 	s.maybeTrigger()
 
-	target, until := s.Target()
+	target, until := s.Target("111")
 	if target != snowflake(42) {
 		t.Errorf("target = %q, want the only recently active user", target)
 	}
@@ -108,7 +109,7 @@ func TestTriggerNeverPicksTheBot(t *testing.T) {
 	s.SetBotID(func() string { return me })
 
 	s.maybeTrigger()
-	if target, _ := s.Target(); target != "" {
+	if target, _ := s.Target("111"); target != "" {
 		t.Errorf("target = %q, want empty: the bot must not be a target", target)
 	}
 }
@@ -122,7 +123,7 @@ func TestTriggerDoesNothingWithNobodyAround(t *testing.T) {
 	s.SetBotID(func() string { return snowflake(1) })
 
 	s.maybeTrigger()
-	if target, _ := s.Target(); target != "" {
+	if target, _ := s.Target("111"); target != "" {
 		t.Errorf("target = %q with nobody active, want empty", target)
 	}
 }
@@ -137,7 +138,7 @@ func TestTriggerRespectsTheChance(t *testing.T) {
 	for range 50 {
 		s.maybeTrigger()
 	}
-	if target, _ := s.Target(); target != "" {
+	if target, _ := s.Target("111"); target != "" {
 		t.Errorf("target = %q with a chance of 0", target)
 	}
 }
@@ -149,11 +150,11 @@ func TestTriggerDoesNotReplaceALiveAggro(t *testing.T) {
 	s.SetBotID(func() string { return snowflake(1) })
 
 	s.maybeTrigger()
-	first, _ := s.Target()
+	first, _ := s.Target("111")
 	for range 20 {
 		s.maybeTrigger()
 	}
-	got, _ := s.Target()
+	got, _ := s.Target("111")
 	if got != first {
 		t.Errorf("target changed from %q to %q while the first aggro was still live", first, got)
 	}
@@ -165,12 +166,12 @@ func TestHandleReactsToTheTargetAndNobodyElse(t *testing.T) {
 	s.SetBotID(func() string { return snowflake(1) })
 	s.maybeTrigger()
 
-	s.Handle("c1", snowflake(500), snowflake(42))
+	s.Handle("111", "c1", snowflake(500), snowflake(42))
 	if reacts, _ := guard.counts(); reacts != 1 {
 		t.Errorf("reacted %d times to the target's message, want 1", reacts)
 	}
 
-	s.Handle("c1", snowflake(501), snowflake(99))
+	s.Handle("111", "c1", snowflake(501), snowflake(99))
 	if reacts, _ := guard.counts(); reacts != 1 {
 		t.Errorf("reacted %d times after a non-target's message, want still 1", reacts)
 	}
@@ -189,7 +190,7 @@ func TestAnExpiredAggroIsReleasedAndTakesItsReactionBack(t *testing.T) {
 	s.maybeTrigger()
 
 	time.Sleep(25 * time.Millisecond)
-	s.Handle("c1", snowflake(502), snowflake(42))
+	s.Handle("111", "c1", snowflake(502), snowflake(42))
 
 	reacts, unreacts := guard.counts()
 	if reacts != 0 {
@@ -198,7 +199,7 @@ func TestAnExpiredAggroIsReleasedAndTakesItsReactionBack(t *testing.T) {
 	if unreacts != 1 {
 		t.Errorf("unreacted %d times, want 1: the bot's mark must come off", unreacts)
 	}
-	if target, _ := s.Target(); target != "" {
+	if target, _ := s.Target("111"); target != "" {
 		t.Errorf("target = %q after expiry, want cleared", target)
 	}
 
@@ -220,7 +221,8 @@ func TestAnExpiredAggroIsReleasedAndTakesItsReactionBack(t *testing.T) {
 
 // TestALiveAggroSurvivesARestart, because the state is persisted and Init reads it.
 func TestALiveAggroSurvivesARestart(t *testing.T) {
-	store := dbtest.Store(t)
+	set := dbtest.Set(t)
+	store := dbtest.Guild(t, set, "111")
 	state := State{TargetID: snowflake(42), EndTime: time.Now().Add(time.Hour)}
 	encoded, err := json.Marshal(state)
 	if err != nil {
@@ -232,11 +234,11 @@ func TestALiveAggroSurvivesARestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := New(store, &fakeGuard{}, fakeActivity{}, opts())
+	s := New(set, &fakeGuard{}, fakeActivity{}, opts())
 	if err := s.Init(core.Deps{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	if target, _ := s.Target(); target != snowflake(42) {
+	if target, _ := s.Target("111"); target != snowflake(42) {
 		t.Errorf("target after a restart = %q, want the persisted one", target)
 	}
 }
@@ -244,7 +246,8 @@ func TestALiveAggroSurvivesARestart(t *testing.T) {
 // TestAnExpiredAggroIsClearedAtStartup rather than left to the first message from a target the
 // bot is no longer bothering.
 func TestAnExpiredAggroIsClearedAtStartup(t *testing.T) {
-	store := dbtest.Store(t)
+	set := dbtest.Set(t)
+	store := dbtest.Guild(t, set, "111")
 	state := State{TargetID: snowflake(42), EndTime: time.Now().Add(-time.Hour)}
 	encoded, err := json.Marshal(state)
 	if err != nil {
@@ -256,11 +259,11 @@ func TestAnExpiredAggroIsClearedAtStartup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := New(store, &fakeGuard{}, fakeActivity{}, opts())
+	s := New(set, &fakeGuard{}, fakeActivity{}, opts())
 	if err := s.Init(core.Deps{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	if target, _ := s.Target(); target != "" {
+	if target, _ := s.Target("111"); target != "" {
 		t.Errorf("target = %q, want an expired aggro cleared at startup", target)
 	}
 
@@ -287,10 +290,10 @@ func TestANilBotIDDoesNotPanic(t *testing.T) {
 	// SetBotID deliberately not called.
 
 	s.maybeTrigger()
-	if target, _ := s.Target(); target != snowflake(42) {
+	if target, _ := s.Target("111"); target != snowflake(42) {
 		t.Errorf("target = %q, want the active user even with no bot ID yet", target)
 	}
-	s.Handle("c1", snowflake(503), snowflake(42))
+	s.Handle("111", "c1", snowflake(503), snowflake(42))
 	if reacts, _ := guard.counts(); reacts != 1 {
 		t.Errorf("reacted %d times, want 1", reacts)
 	}
@@ -307,7 +310,7 @@ func TestConcurrentHandleAndTrigger(t *testing.T) {
 	for range 8 {
 		wg.Go(func() {
 			for i := range 100 {
-				s.Handle("c1", snowflake(600+i), snowflake(42+i%3))
+				s.Handle("111", "c1", snowflake(600+i), snowflake(42+i%3))
 			}
 		})
 	}
@@ -315,7 +318,7 @@ func TestConcurrentHandleAndTrigger(t *testing.T) {
 		wg.Go(func() {
 			for range 100 {
 				s.maybeTrigger()
-				_, _ = s.Target()
+				_, _ = s.Target("111")
 			}
 		})
 	}

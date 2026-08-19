@@ -27,7 +27,7 @@ import (
 func TestAGauntletRunsItsRoundsThroughTheSweep(t *testing.T) {
 	s, guard, _, _ := fixtureGauntlet(t)
 
-	if consumed := s.Command("!wordgame", "3", "c1", admin(snowflake(1)), noNames); !consumed {
+	if consumed := s.Command("!wordgame", "3", testGuild, "c1", admin(snowflake(1)), noNames); !consumed {
 		t.Fatal("!wordgame 3 was not consumed")
 	}
 
@@ -49,7 +49,7 @@ func TestAGauntletRunsItsRoundsThroughTheSweep(t *testing.T) {
 	}
 
 	// Conclude round one, and the sweep brings round two.
-	s.Guess("c1", snowflake(600), theWord, snowflake(42), "ann")
+	s.Guess(testGuild, "c1", snowflake(600), theWord, snowflake(42), "ann")
 	s.sweep()
 
 	posts = guard.posts()
@@ -68,10 +68,10 @@ func TestAGauntletRunsItsRoundsThroughTheSweep(t *testing.T) {
 func TestTheLastRoundSaysTheRunIsOver(t *testing.T) {
 	s, guard, _, _ := fixtureGauntlet(t)
 
-	if consumed := s.Command("!wordgame", "1", "c1", admin(snowflake(1)), noNames); !consumed {
+	if consumed := s.Command("!wordgame", "1", testGuild, "c1", admin(snowflake(1)), noNames); !consumed {
 		t.Fatal("!wordgame 1 was not consumed")
 	}
-	s.Guess("c1", snowflake(601), theWord, snowflake(42), "ann")
+	s.Guess(testGuild, "c1", snowflake(601), theWord, snowflake(42), "ann")
 
 	var sawDone bool
 	for _, p := range guard.posts() {
@@ -98,7 +98,7 @@ func TestTheLastRoundSaysTheRunIsOver(t *testing.T) {
 func TestASoloWordgameIsNotARound(t *testing.T) {
 	s, guard, _, _ := fixtureGauntlet(t)
 
-	if consumed := s.Command("!wordgame", "", "c1", admin(snowflake(1)), noNames); !consumed {
+	if consumed := s.Command("!wordgame", "", testGuild, "c1", admin(snowflake(1)), noNames); !consumed {
 		t.Fatal("!wordgame was not consumed")
 	}
 	posts := guard.posts()
@@ -122,9 +122,9 @@ func TestAHintCostsAPointAndARefusedHintDoesNot(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 		s.sweep()
 
-		s.Guess("c1", snowflake(610), theWord, snowflake(42), "ann")
+		s.Guess(testGuild, "c1", snowflake(610), theWord, snowflake(42), "ann")
 
-		if got := s.board.Scores()[snowflake(42)]; got != 3 {
+		if got := s.board(testGuild).Scores()[snowflake(42)]; got != 3 {
 			t.Errorf("scored %d, want 3: a base of 4 less one delivered rung", got)
 		}
 	})
@@ -139,9 +139,9 @@ func TestAHintCostsAPointAndARefusedHintDoesNot(t *testing.T) {
 		s.sweep()
 		guard.refuse = false
 
-		s.Guess("c1", snowflake(611), theWord, snowflake(43), "bob")
+		s.Guess(testGuild, "c1", snowflake(611), theWord, snowflake(43), "bob")
 
-		if got := s.board.Scores()[snowflake(43)]; got != 4 {
+		if got := s.board(testGuild).Scores()[snowflake(43)]; got != 4 {
 			t.Errorf("scored %d, want the full 4: the hint was refused, so nobody saw it and "+
 				"nobody should pay for it", got)
 		}
@@ -174,7 +174,7 @@ func TestASolvedPuzzleIsNotStillWorthItsOpeningStake(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	s.sweep()
 
-	s.Guess("c1", snowflake(620), theWord, snowflake(44), "cat")
+	s.Guess(testGuild, "c1", snowflake(620), theWord, snowflake(44), "cat")
 
 	// What is asserted is that the message and the board agree about one number. Found by the
 	// winner's name rather than by the wording around it, so a copy change is not a failure.
@@ -189,7 +189,7 @@ func TestASolvedPuzzleIsNotStillWorthItsOpeningStake(t *testing.T) {
 	}
 	if !strings.Contains(won, "3 pts") {
 		t.Errorf("the win announces a different number from the one the board recorded "+
-			"(%d):\n%s", s.board.Scores()[snowflake(44)], won)
+			"(%d):\n%s", s.board(testGuild).Scores()[snowflake(44)], won)
 	}
 }
 
@@ -282,7 +282,7 @@ func fixtureDict(t *testing.T, opts Options, mopts wordgame.Options) (
 	guard := &fakeGuard{}
 	chans := fakeChannels{"c1": {ID: "c1", Name: "memes", Text: true}}
 
-	s := New(dbtest.Store(t), guard, manager, tracker, chans, opts)
+	s := New(dbtest.Set(t), guard, manager, tracker, chans, opts)
 	if err := s.Init(core.Deps{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}

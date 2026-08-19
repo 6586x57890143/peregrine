@@ -52,14 +52,14 @@ func (f fakeChannels) Channel(id string) (channels.Info, bool) {
 }
 
 func textChannel(id, name string) channels.Info {
-	return channels.Info{ID: id, Name: name, Text: true}
+	return channels.Info{ID: id, Name: name, Text: true, GuildID: "111"}
 }
 
 func fixture(t *testing.T, chans fakeChannels, opts Options) (*Service, *storage.Store, *fakeGuard) {
 	t.Helper()
 	store := dbtest.Store(t)
 	guard := &fakeGuard{}
-	return New(store, guard, chans, opts), store, guard
+	return New(storage.Single(store), guard, chans, opts), store, guard
 }
 
 func always() Options {
@@ -146,7 +146,7 @@ func TestRepostRefusesADestinationItCannotIdentify(t *testing.T) {
 			}); err != nil {
 				t.Fatalf("seed the cache: %v", err)
 			}
-			s.set([]string{url})
+			s.set("111", []string{url})
 
 			s.MaybeRepost("c1", false)
 			if posts := guard.posts(); len(posts) != 0 {
@@ -163,7 +163,7 @@ func TestRepostRefusesADestinationItCannotIdentify(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed the cache: %v", err)
 	}
-	s.set([]string{url})
+	s.set("111", []string{url})
 
 	s.MaybeRepost("c1", false)
 	if posts := guard.posts(); len(posts) != 1 || posts[0] != url {
@@ -188,9 +188,9 @@ func TestForgetRevokesADeletedMessagesURL(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed the cache: %v", err)
 	}
-	s.set([]string{url})
+	s.set("111", []string{url})
 
-	s.Forget(doomed)
+	s.Forget("111", doomed)
 
 	if got := s.Cached(); got != 0 {
 		t.Errorf("the in-memory cache still holds %d URLs; the repost path reads this, not the store", got)
@@ -213,9 +213,9 @@ func TestForgettingAnUnknownMessageIsQuiet(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed the cache: %v", err)
 	}
-	s.set([]string{url})
+	s.set("111", []string{url})
 
-	s.Forget(snowflake(9999))
+	s.Forget("111", snowflake(9999))
 	if got := s.Cached(); got != 1 {
 		t.Errorf("cache holds %d URLs after deleting an unrelated message, want it untouched", got)
 	}
@@ -240,7 +240,7 @@ func TestABulkDeletionIsOneTransaction(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed the cache: %v", err)
 	}
-	s.Forget(ids...)
+	s.Forget("111", ids...)
 
 	if got := s.Cached(); got != 0 {
 		t.Errorf("cache holds %d URLs after every source message was deleted", got)
@@ -261,7 +261,7 @@ func TestTheAmbientRateIsHigherThanTheDirectOne(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed the cache: %v", err)
 	}
-	s.set([]string{url})
+	s.set("111", []string{url})
 
 	s.MaybeRepost("c1", true) // addressed: uses Direct, which is 0
 	if posts := guard.posts(); len(posts) != 0 {

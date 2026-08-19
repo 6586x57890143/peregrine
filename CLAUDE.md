@@ -4,6 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
+**Start here after a context reset: [`HANDOFF.md`](./HANDOFF.md).** It records which branch is
+which, what the last milestone changed, what an operator has to do differently because of it, and
+what is deliberately not done yet. It is the file to update at the end of a milestone, not a file
+to let go stale.
+
 `peregrine` is a Markov-chain Discord engagement bot (Go 1.25, `discordgo` v0.29, `bbolt` v1.5). It learns from channel messages and replies in the server's own voice. Full design doc: [`SPEC.md`](./SPEC.md). Read it before any non-trivial change, especially §4 (safety and threat model) and §5 (the generation pipeline). The bot lives in a meme-heavy server and exists to cause engagement, fun and chaos, so **output that lands matters more than output that is grammatical**, and several things that look like bugs are deliberate register. The things that are actually bugs are catalogued in §8.
 
 **The restructure is complete as of M13.** The repository went from a single 3,200-line `package main` to merlin's `cmd/` plus `internal/` layout, one subsystem per milestone (`SPEC.md` §9), and `internal/legacy` is **deleted**. If you find a reference to it in a comment, that comment is stale and worth fixing.
@@ -136,6 +141,54 @@ Recorded as a shape rather than a one-off: two indexes written from the same loo
 ### The storage seam, and why it is a seam rather than a fix
 
 `internal/storage` is the only package that knows a bucket exists. Everything above it gets a `*storage.Reader` or `*storage.Writer`, handed to a callback and bound to one transaction.
+
+**There is one corpus PER GUILD as of M31, and the guild is chosen where the TRANSACTION opens.**
+`storage.Set` owns them, `storage.Corpora` is the one-method interface consumers take, and
+`storage.Single` wraps one store for tests. Nothing below `Store.View`/`Store.Update` knows what a
+guild is, which is why `learn.Learner.Message` needed no new parameter and its AST-pinned gate did
+not move. Separate FILES rather than a guild dimension on every key, because a prefix is isolation
+by convention that one forgetful call site defeats silently, whereas a `*Store` for guild A cannot
+name guild B's keys at all: the same argument `Reader` makes about nested transactions. Services
+that legitimately fan out (`games`, `aggro`, `health`, `repair`, `backup`) take the concrete
+`*storage.Set`; everything else takes the interface.
+
+**`For("")` is an error, and that is the DM decision.** A message with no guild is not learned and
+there is deliberately no fallback corpus, because a shared "no guild" file is where every threading
+mistake would drain. The trap it guards is specific: `internal/plugins/ingest` and
+`internal/plugins/repair` wrap a message fetched over REST, whose `GuildID` is EMPTY, so anything
+reaching for `m.GuildID` instead of the threaded guild would file every backfilled message in the
+bot under one key. A guild ID is also a path component, so a non-numeric one is refused.
+
+**`For` after `Close` is an error too**, because without it a goroutine still in flight at shutdown
+reopens the corpus it wanted, creating a file and taking a flock nothing alive will release. Self
+learning is the path that does this, and a test failing to delete its own temp directory is how it
+was found.
+
+**A CHANNEL ALLOWLIST IS READ PER GUILD, and that is `channels.Allows`.** The lists saying where
+the bot may speak unprompted are flat sets of channel IDs in the environment, written when the bot
+was in one server. Read as a flat set they refuse every channel in every OTHER server, so binding
+word games to one channel in one guild silently turned them off everywhere else: settings being
+per guild was not enough, because the SEED was one global list. A list is a statement about the
+guilds it names. It restricts those and says nothing about the rest, which is the reading an empty
+list has always had. Two fallbacks are deliberate: a list that resolves to no guild at all reverts
+to plain membership, because an unresolvable list is a cold state cache or a stale ID and treating
+either as "no opinion" would quietly UNBIND a live setting; and a blank entry, which is what a
+trailing comma in `.env` produces, is skipped rather than matched.
+
+**What is per guild, and what is deliberately not.** Per guild: the corpus, the weekly
+leaderboard, the word-game settings, aggro's target, the image repost pool, ingest and repair
+cursors, repair state and boundaries, and backup families. Process-wide on purpose: the safety
+gate and its blocklist, `PAUSE_ALL_WRITES`, the guard's ignore list (channel IDs are unique, so it
+is already per channel), the dispatcher, and the presence line, because an incident is bot-wide
+and there is only one presence. A dial that turns out to want a per-guild answer follows
+`/wordgame-config`'s pattern: a blob in that guild's corpus, seeded from the environment, with a
+command that owns it afterwards.
+
+**`PEREGRINE_DB_PATH` is a DIRECTORY of `<guild id>.db` files and kept its name on purpose.** The
+rule is rescale-and-refuse over rename: a rename would let an existing `/data/markov.db` silently
+stop being read, so a value naming a file is a startup error that names the new shape. There is no
+migration and there will not be one, for the reason `schema_version` refuses a pre-M6 corpus: the
+corpus is re-derivable from Discord history.
 
 That shape exists to make the worst bug in the review **unwritable**. Generation used to run inside a `db.View` and call helpers that each opened their own `db.View`; bbolt holds `mmaplock.RLock` for a read transaction's whole life and takes the write lock to grow the mmap, and Go's `RWMutex` queues new readers behind a waiting writer, so outer-read plus waiting-writer plus inner-read is a deadlock with no timeout and no recovery. **`Reader` has no method that starts a transaction**, so a consumer cannot nest one even by accident. A `Writer` embeds `Reader`, which is why nesting is never necessary: a write path can read its own writes.
 

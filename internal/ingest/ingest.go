@@ -45,6 +45,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
@@ -62,14 +63,19 @@ type Session interface {
 	ChannelMessages(channelID string, limit int, beforeID, afterID, aroundID string, options ...discordgo.RequestOption) ([]*discordgo.Message, error)
 }
 
-// Cursors is the high-water mark store. *storage.Store satisfies it through a small
-// adapter in the caller, because storage's own methods take a Reader or a Writer.
+// Cursors is the high-water mark store. A corpus satisfies it through a small adapter in the
+// caller, because storage's own methods take a Reader or a Writer.
+//
+// Both methods take the GUILD as well as the channel, as of M31: a cursor lives in the corpus
+// of the guild it belongs to, and the walk already knows which that is. Passing only the
+// channel would leave the adapter guessing, and the guess would be wrong in the direction that
+// re-reads history, which is finding 13.
 type Cursors interface {
 	// Cursor returns the newest message ID ingested from a channel, or "".
-	Cursor(channelID string) (string, error)
+	Cursor(guildID, channelID string) (string, error)
 
 	// SetCursor advances the mark. Implementations must refuse to move it backwards.
-	SetCursor(channelID, messageID string) error
+	SetCursor(guildID, channelID, messageID string) error
 }
 
 // Learner consumes one historical message.
@@ -102,6 +108,14 @@ type Options struct {
 
 	// PageSize is how many messages to request per call, capped at Discord's 100.
 	PageSize int
+
+	// OnlyGuild restricts the pass to one guild, or every guild when empty.
+	//
+	// It exists for the repair service, which is per corpus as of M31: a repair's boundary and
+	// its done marker live in the guild's own corpus, so a pass that walked every guild at
+	// once would have to pick one guild's boundary and apply it to all of them. One pass per
+	// guild keeps each one measured against its own.
+	OnlyGuild string
 
 	// Until stops a channel's walk at the first message created at or after this instant.
 	//
@@ -170,6 +184,12 @@ func (in *Ingester) Run(ctx context.Context) (Stats, error) {
 	var total stats
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(in.opts.GuildConcurrency)
+
+	if in.opts.OnlyGuild != "" {
+		guilds = slices.DeleteFunc(guilds, func(g *discordgo.UserGuild) bool {
+			return g == nil || g.ID != in.opts.OnlyGuild
+		})
+	}
 
 	for _, guild := range guilds {
 		if guild == nil {
@@ -240,7 +260,7 @@ func (in *Ingester) guild(ctx context.Context, guildID, guildName string) Stats 
 func (in *Ingester) channel(ctx context.Context, ch *discordgo.Channel, guildID string) Stats {
 	var st Stats
 
-	after, err := in.cursors.Cursor(ch.ID)
+	after, err := in.cursors.Cursor(guildID, ch.ID)
 	if err != nil {
 		in.log.Warn("read cursor failed", "channel", ch.Name, "err", err)
 		return st
@@ -327,7 +347,7 @@ func (in *Ingester) channel(ctx context.Context, ch *discordgo.Channel, guildID 
 	// A page of bot messages is progress: leaving the mark behind would mean re-reading
 	// them on every pass forever, which is the shape of the bug this replaces.
 	if newest != "" {
-		if err := in.cursors.SetCursor(ch.ID, newest); err != nil {
+		if err := in.cursors.SetCursor(guildID, ch.ID, newest); err != nil {
 			in.log.Warn("advance cursor failed", "channel", ch.Name, "err", err)
 		}
 	}

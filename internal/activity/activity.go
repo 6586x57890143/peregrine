@@ -102,7 +102,12 @@ type Tracker struct {
 	mu       sync.Mutex
 	opts     Options
 	channels map[string]*ring
-	authors  map[string]time.Time
+
+	// authors is keyed by GUILD then by person, as of M31. Aggro is the consumer, and it
+	// picks somebody to poke in one server: a flat map would offer it a candidate who is not
+	// in the guild the poke would land in. The outer map is bounded by the corpus cap through
+	// the same MaxChannels-style eviction the inner one has.
+	authors map[string]map[string]time.Time
 }
 
 // New returns a tracker. It starts empty, which matters at startup: for the first
@@ -113,7 +118,7 @@ func New(o Options) *Tracker {
 	return &Tracker{
 		opts:     o,
 		channels: make(map[string]*ring),
-		authors:  make(map[string]time.Time),
+		authors:  make(map[string]map[string]time.Time),
 	}
 }
 
@@ -155,7 +160,7 @@ func (r *ring) countSince(cutoff time.Time) int {
 // and attract the bot to exactly the place it should be ignoring. An empty author is
 // tolerated (the bot's own output reaches learnMessage that way) and simply does not
 // make anybody a candidate for attention.
-func (t *Tracker) Note(channelID, authorID string) {
+func (t *Tracker) Note(guildID, channelID, authorID string) {
 	if channelID == "" {
 		return
 	}
@@ -174,10 +179,15 @@ func (t *Tracker) Note(channelID, authorID string) {
 		t.evictQuietestChannel(channelID)
 	}
 
-	if authorID != "" {
-		t.authors[authorID] = now
-		if len(t.authors) > t.opts.MaxAuthors {
-			t.evictOldestAuthor(authorID)
+	if authorID != "" && guildID != "" {
+		byGuild := t.authors[guildID]
+		if byGuild == nil {
+			byGuild = map[string]time.Time{}
+			t.authors[guildID] = byGuild
+		}
+		byGuild[authorID] = now
+		if len(byGuild) > t.opts.MaxAuthors {
+			t.evictOldestAuthor(guildID, authorID)
 		}
 	}
 }
@@ -227,12 +237,13 @@ func (t *Tracker) Busiest(window time.Duration) []Channel {
 // Sorted for the same reason Busiest is: the caller picks one at random, and a
 // randomly ordered candidate list plus a random index is two sources of randomness
 // where one is wanted, which makes a seeded test meaningless.
-func (t *Tracker) RecentAuthors(window time.Duration) []string {
+func (t *Tracker) RecentAuthors(guildID string, window time.Duration) []string {
 	cutoff := t.opts.Now().Add(-window)
 
 	t.mu.Lock()
-	out := make([]string, 0, len(t.authors))
-	for id, at := range t.authors {
+	byGuild := t.authors[guildID]
+	out := make([]string, 0, len(byGuild))
+	for id, at := range byGuild {
 		if at.After(cutoff) {
 			out = append(out, id)
 		}
@@ -255,7 +266,11 @@ func (t *Tracker) Channels() int {
 func (t *Tracker) Authors() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return len(t.authors)
+	total := 0
+	for _, byGuild := range t.authors {
+		total += len(byGuild)
+	}
+	return total
 }
 
 // evictQuietestChannel drops the channel whose last message is oldest, never the one
@@ -282,13 +297,18 @@ func (t *Tracker) evictQuietestChannel(protect string) {
 	}
 }
 
-// evictOldestAuthor is the same, for the author map. Called with the lock held.
-func (t *Tracker) evictOldestAuthor(protect string) {
+// evictOldestAuthor is the same, for one guild's author map. Called with the lock held.
+//
+// The cap is per guild, which is the reading that keeps it a cap: a busy server would
+// otherwise evict a quiet server's entire membership, and the quiet server is precisely where
+// a single recent speaker matters most.
+func (t *Tracker) evictOldestAuthor(guildID, protect string) {
+	byGuild := t.authors[guildID]
 	var (
 		victim string
 		oldest time.Time
 	)
-	for id, at := range t.authors {
+	for id, at := range byGuild {
 		if id == protect {
 			continue
 		}
@@ -297,6 +317,9 @@ func (t *Tracker) evictOldestAuthor(protect string) {
 		}
 	}
 	if victim != "" {
-		delete(t.authors, victim)
+		delete(byGuild, victim)
+	}
+	if len(byGuild) == 0 {
+		delete(t.authors, guildID)
 	}
 }

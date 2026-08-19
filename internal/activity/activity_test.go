@@ -36,7 +36,7 @@ func TestCountIsWindowed(t *testing.T) {
 	tr := activity.New(activity.Options{Now: c.Now})
 
 	for range 5 {
-		tr.Note("chan", "author")
+		tr.Note("g1", "chan", "author")
 		c.advance(time.Minute)
 	}
 
@@ -64,9 +64,9 @@ func TestEachConsumerBringsItsOwnWindow(t *testing.T) {
 	c := newClock()
 	tr := activity.New(activity.Options{Now: c.Now})
 
-	tr.Note("chan", "old-timer")
+	tr.Note("g1", "chan", "old-timer")
 	c.advance(2 * time.Hour)
-	tr.Note("chan", "just-now")
+	tr.Note("g1", "chan", "just-now")
 
 	if got := tr.Count("chan", 5*time.Minute); got != 1 {
 		t.Errorf("short window sees %d messages, want 1", got)
@@ -74,10 +74,10 @@ func TestEachConsumerBringsItsOwnWindow(t *testing.T) {
 	if got := tr.Count("chan", 6*time.Hour); got != 2 {
 		t.Errorf("long window sees %d messages, want 2", got)
 	}
-	if got := tr.RecentAuthors(5 * time.Minute); len(got) != 1 || got[0] != "just-now" {
+	if got := tr.RecentAuthors("g1", 5*time.Minute); len(got) != 1 || got[0] != "just-now" {
 		t.Errorf("short window authors = %v, want just-now", got)
 	}
-	if got := tr.RecentAuthors(6 * time.Hour); len(got) != 2 {
+	if got := tr.RecentAuthors("g1", 6*time.Hour); len(got) != 2 {
 		t.Errorf("long window authors = %v, want both", got)
 	}
 }
@@ -90,14 +90,14 @@ func TestBusiestIsSortedAndDeterministic(t *testing.T) {
 	tr := activity.New(activity.Options{Now: newClock().Now})
 
 	for range 3 {
-		tr.Note("quiet", "u1")
+		tr.Note("g1", "quiet", "u1")
 	}
 	for range 9 {
-		tr.Note("loud", "u1")
+		tr.Note("g1", "loud", "u1")
 	}
 	for range 3 {
 		// Same count as "quiet", so the tie has to break somewhere predictable.
-		tr.Note("also-quiet", "u1")
+		tr.Note("g1", "also-quiet", "u1")
 	}
 
 	got := tr.Busiest(time.Hour)
@@ -120,9 +120,9 @@ func TestBusiestSkipsChannelsOutsideTheWindow(t *testing.T) {
 	c := newClock()
 	tr := activity.New(activity.Options{Now: c.Now})
 
-	tr.Note("stale", "u1")
+	tr.Note("g1", "stale", "u1")
 	c.advance(time.Hour)
-	tr.Note("fresh", "u1")
+	tr.Note("g1", "fresh", "u1")
 
 	got := tr.Busiest(10 * time.Minute)
 	if len(got) != 1 || got[0].ID != "fresh" {
@@ -138,7 +138,7 @@ func TestChannelMapIsBounded(t *testing.T) {
 	tr := activity.New(activity.Options{MaxChannels: 10, Now: c.Now})
 
 	for i := range 100 {
-		tr.Note(fmt.Sprintf("chan-%03d", i), "u1")
+		tr.Note("g1", fmt.Sprintf("chan-%03d", i), "u1")
 		c.advance(time.Second)
 	}
 
@@ -159,14 +159,14 @@ func TestAuthorMapIsBounded(t *testing.T) {
 	tr := activity.New(activity.Options{MaxAuthors: 10, Now: c.Now})
 
 	for i := range 100 {
-		tr.Note("chan", fmt.Sprintf("user-%03d", i))
+		tr.Note("g1", "chan", fmt.Sprintf("user-%03d", i))
 		c.advance(time.Second)
 	}
 
 	if got := tr.Authors(); got > 10 {
 		t.Errorf("remembering %d authors against a bound of 10", got)
 	}
-	authors := tr.RecentAuthors(time.Hour)
+	authors := tr.RecentAuthors("g1", time.Hour)
 	found := false
 	for _, a := range authors {
 		if a == "user-099" {
@@ -188,7 +188,7 @@ func TestRingSaturatesRatherThanGrowing(t *testing.T) {
 	tr := activity.New(activity.Options{PerChannel: 8, Now: newClock().Now})
 
 	for range 1000 {
-		tr.Note("busy", "u1")
+		tr.Note("g1", "busy", "u1")
 	}
 	if got := tr.Count("busy", time.Hour); got != 8 {
 		t.Errorf("Count = %d, want it saturated at PerChannel (8)", got)
@@ -201,8 +201,8 @@ func TestRingSaturatesRatherThanGrowing(t *testing.T) {
 func TestAnEmptyAuthorIsNotACandidate(t *testing.T) {
 	tr := activity.New(activity.Options{Now: newClock().Now})
 
-	tr.Note("chan", "")
-	if got := tr.RecentAuthors(time.Hour); len(got) != 0 {
+	tr.Note("g1", "chan", "")
+	if got := tr.RecentAuthors("g1", time.Hour); len(got) != 0 {
 		t.Errorf("RecentAuthors = %v, want empty", got)
 	}
 	if got := tr.Count("chan", time.Hour); got != 1 {
@@ -219,10 +219,10 @@ func TestEmptyTrackerAnswersNothingRatherThanPanicking(t *testing.T) {
 	if got := tr.Busiest(time.Hour); len(got) != 0 {
 		t.Errorf("Busiest = %v, want empty", got)
 	}
-	if got := tr.RecentAuthors(time.Hour); len(got) != 0 {
+	if got := tr.RecentAuthors("g1", time.Hour); len(got) != 0 {
 		t.Errorf("RecentAuthors = %v, want empty", got)
 	}
-	tr.Note("", "someone") // an empty channel ID is ignored rather than tracked
+	tr.Note("g1", "", "someone") // an empty channel ID is ignored rather than tracked
 	if got := tr.Channels(); got != 0 {
 		t.Errorf("Channels = %d after noting an empty channel ID, want 0", got)
 	}
@@ -238,7 +238,7 @@ func TestConcurrentNotesAndReads(t *testing.T) {
 	for w := range 24 {
 		wg.Go(func() {
 			for i := range 200 {
-				tr.Note(fmt.Sprintf("chan-%d", (w+i)%40), fmt.Sprintf("user-%d", (w*i)%80))
+				tr.Note("g1", fmt.Sprintf("chan-%d", (w+i)%40), fmt.Sprintf("user-%d", (w*i)%80))
 			}
 		})
 	}
@@ -246,7 +246,7 @@ func TestConcurrentNotesAndReads(t *testing.T) {
 		wg.Go(func() {
 			for range 200 {
 				_ = tr.Busiest(time.Minute)
-				_ = tr.RecentAuthors(time.Minute)
+				_ = tr.RecentAuthors("g1", time.Minute)
 				_ = tr.Count("chan-1", time.Minute)
 			}
 		})

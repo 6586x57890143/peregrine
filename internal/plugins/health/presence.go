@@ -155,9 +155,9 @@ func commas(n uint64) string {
 
 // CorpusTopics returns a Topics backed by the corpus, mirroring SessionLatency above: the
 // adapter lives here so cmd/bot does not have to know how a topic word gets chosen.
-func CorpusTopics(store *storage.Store) Topics { return corpusTopics{store: store} }
+func CorpusTopics(corpora *storage.Set) Topics { return corpusTopics{corpora: corpora} }
 
-type corpusTopics struct{ store *storage.Store }
+type corpusTopics struct{ corpora *storage.Set }
 
 // topicScanLimit bounds how much of the vocabulary one lookup walks.
 //
@@ -178,7 +178,20 @@ const topicMinCount = 5
 // line built from it would say the same thing forever. Sampling gives a line that moves while
 // still only ever showing something the server genuinely says a lot.
 func (c corpusTopics) TopTopicWord() string {
-	if c.store == nil {
+	if c.corpora == nil {
+		return ""
+	}
+
+	// One guild's vocabulary, chosen at random, rather than a word merged across servers. The
+	// presence line is one line for a bot that is in several servers, so it has to be a word
+	// from somewhere rather than a word from everywhere: merging vocabularies would put one
+	// server's inside joke in front of another, which is the thing M31 exists to stop.
+	guilds := c.corpora.Guilds()
+	if len(guilds) == 0 {
+		return ""
+	}
+	store, err := c.corpora.For(guilds[rand.IntN(len(guilds))])
+	if err != nil {
 		return ""
 	}
 
@@ -188,7 +201,7 @@ func (c corpusTopics) TopTopicWord() string {
 
 	var best string
 	var bestCount uint64
-	_ = c.store.View(func(r *storage.Reader) error {
+	_ = store.View(func(r *storage.Reader) error {
 		r.ScanTopics(from, topicScanLimit, func(word string, count uint64) bool {
 			if count < topicMinCount || count <= bestCount {
 				return true

@@ -19,12 +19,12 @@ import (
 func TestAFinishedRunRecapsWhatPeopleTook(t *testing.T) {
 	s, guard, _, _ := fixtureGauntlet(t)
 
-	if consumed := s.Command("!wordgame", "2", "c1", admin(snowflake(1)), noNames); !consumed {
+	if consumed := s.Command("!wordgame", "2", testGuild, "c1", admin(snowflake(1)), noNames); !consumed {
 		t.Fatal("!wordgame 2 was not consumed")
 	}
-	s.Guess("c1", snowflake(700), theWord, snowflake(42), "ann")
+	s.Guess(testGuild, "c1", snowflake(700), theWord, snowflake(42), "ann")
 	s.sweep() // round two
-	s.Guess("c1", snowflake(701), theWord, snowflake(43), "bob")
+	s.Guess(testGuild, "c1", snowflake(701), theWord, snowflake(43), "bob")
 
 	recap := lastRecap(t, guard)
 	if !strings.Contains(recap, "**ann**") || !strings.Contains(recap, "**bob**") {
@@ -133,7 +133,7 @@ func TestAbandoningARunForgetsItsTally(t *testing.T) {
 func TestASoloWinIsNotRecorded(t *testing.T) {
 	s, _, manager, _ := fixtureGauntlet(t)
 	s.start("c1")
-	s.Guess("c1", snowflake(710), theWord, snowflake(42), "ann")
+	s.Guess(testGuild, "c1", snowflake(710), theWord, snowflake(42), "ann")
 
 	if got := manager.TakeRunTally("c1"); len(got) != 0 {
 		t.Errorf("a standalone win was recorded against a run: %+v", got)
