@@ -343,12 +343,14 @@ type Board struct {
 	// Top is the leading rows, at most the requested count.
 	Top []Row
 
-	// You is the viewer's own row when they have a score but are NOT in Top. Nil when they
-	// are already shown above or have no score at all.
+	// You is the viewer's own row when they have a score but are NOT on this page. Nil when
+	// they are already shown above or have no score at all.
 	//
 	// This is the eleventh slot: ranks 1 to 10 as usual, and then the viewer's real position
 	// under a divider, so somebody sitting at 18th can see it without scrolling a board that
-	// does not go that far.
+	// does not go that far. Since M32 it means "not on THIS PAGE" rather than "not in the top
+	// ten", which is the reading that survives paging: turning to page 2 must not hide where
+	// you stand, and turning to the page you are on must not print you twice.
 	You *Row
 
 	// Unranked is true when the viewer has no score this week. Reported rather than omitted,
@@ -358,6 +360,13 @@ type Board struct {
 	// Players is how many people have any score at all, which is what makes a rank legible:
 	// 18th of 20 and 18th of 300 are different news.
 	Players int
+
+	// Page is the one-based page Top came from, and Pages is how many there are.
+	//
+	// Both are always set, including for a single-page board, because the renderer and the
+	// buttons need to know they are at the end and "no page number" would have to mean one.
+	Pages int
+	Page  int
 }
 
 // Rank turns raw scores into a Board.
@@ -374,7 +383,14 @@ type Board struct {
 // which reads as the bot being wrong about who is winning. Ordering ties by NAME would be
 // prettier and would put the names back on the critical path, which is the cost this whole
 // change exists to remove.
-func Rank(scores map[string]int, viewerID string, top int) Board {
+//
+// # Paging (M32)
+//
+// page is one-based and CLAMPED rather than refused, because it arrives from a button on a
+// message that may be older than the board: a press on page 4 of a week that has since reset
+// should show page 1, not an error. Ranks are computed over the whole field before the slice,
+// so a row's number is its real position and not its offset on the page.
+func Rank(scores map[string]int, viewerID string, top, page int) Board {
 	if top <= 0 {
 		top = 10
 	}
@@ -402,12 +418,13 @@ func Rank(scores map[string]int, viewerID string, top int) Board {
 		rows[i].Rank = rank
 	}
 
-	board := Board{Players: len(rows)}
-	if len(rows) > top {
-		board.Top = append(board.Top, rows[:top]...)
-	} else {
-		board.Top = append(board.Top, rows...)
-	}
+	// Pages is at least one, so an empty board is page 1 of 1 rather than page 1 of 0, which
+	// would make the next button look available on a board with nothing on it.
+	pages := max((len(rows)+top-1)/top, 1)
+	page = min(max(page, 1), pages)
+
+	board := Board{Players: len(rows), Pages: pages, Page: page}
+	board.Top = append(board.Top, rows[min((page-1)*top, len(rows)):min(page*top, len(rows))]...)
 
 	if viewerID == "" {
 		return board
@@ -416,7 +433,10 @@ func Rank(scores map[string]int, viewerID string, top int) Board {
 		if rows[i].UserID != viewerID {
 			continue
 		}
-		if i >= len(board.Top) {
+		// Off THIS page, which is what the eleventh slot means once there is more than one:
+		// paging away from your own row should not hide where you stand, and paging ONTO it
+		// should not print it twice.
+		if i < (page-1)*top || i >= page*top {
 			you := rows[i]
 			board.You = &you
 		}

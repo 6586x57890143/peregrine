@@ -483,7 +483,7 @@ func TestTheBoardRanksByPointsRatherThanWins(t *testing.T) {
 	l.AddWin("few", "few", time.Second, 4)
 	l.AddWin("few", "few", time.Second, 4)
 
-	b := Rank(l.Scores(), "", 10)
+	b := Rank(l.Scores(), "", 10, 1)
 	if len(b.Top) < 2 {
 		t.Fatalf("board = %v", b.Top)
 	}

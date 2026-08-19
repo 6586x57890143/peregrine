@@ -966,7 +966,7 @@ func TestRankNeedsNoNamesAndUsesCompetitionRanking(t *testing.T) {
 		"e": 0, // no score at all, so not a player
 	}
 
-	board := Rank(scores, "", 10)
+	board := Rank(scores, "", 10, 1)
 
 	if board.Players != 4 {
 		t.Errorf("Players = %d, want 4: a zero score is not a placing", board.Players)
@@ -997,7 +997,7 @@ func TestABoardCarriesTheViewersOwnRowWhenTheyAreOutsideTheTop(t *testing.T) {
 		scores[fmt.Sprintf("u%02d", i)] = 100 - i
 	}
 
-	board := Rank(scores, "u17", 10)
+	board := Rank(scores, "u17", 10, 1)
 
 	if len(board.Top) != 10 {
 		t.Fatalf("Top has %d rows, want 10", len(board.Top))
@@ -1020,7 +1020,7 @@ func TestABoardCarriesTheViewersOwnRowWhenTheyAreOutsideTheTop(t *testing.T) {
 func TestAViewerInsideTheTopGetsNoSecondRow(t *testing.T) {
 	scores := map[string]int{"a": 10, "b": 9, "c": 8}
 
-	board := Rank(scores, "b", 10)
+	board := Rank(scores, "b", 10, 1)
 
 	if board.You != nil {
 		t.Errorf("a viewer already shown at rank %d got a duplicate row", board.You.Rank)
@@ -1033,7 +1033,7 @@ func TestAViewerInsideTheTopGetsNoSecondRow(t *testing.T) {
 // A viewer with nothing this week is REPORTED rather than omitted. A missing row is
 // indistinguishable from a bug, and "you have none" is a real answer to what was asked.
 func TestAViewerWithNoScoreIsReportedAsUnranked(t *testing.T) {
-	board := Rank(map[string]int{"a": 3}, "nobody", 10)
+	board := Rank(map[string]int{"a": 3}, "nobody", 10, 1)
 
 	if !board.Unranked {
 		t.Error("a viewer with no score was not reported as unranked")
@@ -1043,7 +1043,7 @@ func TestAViewerWithNoScoreIsReportedAsUnranked(t *testing.T) {
 	}
 
 	// And with no viewer at all, neither is claimed.
-	anonymous := Rank(map[string]int{"a": 3}, "", 10)
+	anonymous := Rank(map[string]int{"a": 3}, "", 10, 1)
 	if anonymous.Unranked || anonymous.You != nil {
 		t.Error("a board with no viewer claimed something about one")
 	}
@@ -1057,7 +1057,7 @@ func TestNamesNeededIsBoundedByWhatIsRendered(t *testing.T) {
 		scores[fmt.Sprintf("u%03d", i)] = 200 - i
 	}
 
-	board := Rank(scores, "u150", 10)
+	board := Rank(scores, "u150", 10, 1)
 	needed := board.NamesNeeded()
 
 	if len(needed) != 11 {
@@ -1088,9 +1088,9 @@ func TestNamesNeededIsBoundedByWhatIsRendered(t *testing.T) {
 func TestTiedRowsOrderStably(t *testing.T) {
 	scores := map[string]int{"z": 5, "a": 5, "m": 5, "q": 5}
 
-	first := Rank(scores, "", 10)
+	first := Rank(scores, "", 10, 1)
 	for range 20 {
-		again := Rank(scores, "", 10)
+		again := Rank(scores, "", 10, 1)
 		for i := range first.Top {
 			if first.Top[i].UserID != again.Top[i].UserID {
 				t.Fatalf("tied rows shuffled between calls: %v then %v",
@@ -1125,5 +1125,91 @@ func TestNextResetAgreesWithTheResetThatHappens(t *testing.T) {
 	}
 	if !l.MaybeReset(next.Add(time.Second)) {
 		t.Error("the board did not reset at the moment it promised")
+	}
+}
+
+// M32: paging.
+
+// TestPageTwoShowsTheSecondTenAtTheirRealRanks.
+//
+// The ranks are computed over the whole field before the slice, so row one of page two is
+// eleventh rather than first. Getting that wrong produces a board that looks right on page one
+// and renumbers everybody from there on.
+func TestPageTwoShowsTheSecondTenAtTheirRealRanks(t *testing.T) {
+	scores := map[string]int{}
+	for i := range 25 {
+		scores[fmt.Sprintf("u%02d", i)] = 100 - i
+	}
+
+	board := Rank(scores, "", 10, 2)
+	if board.Pages != 3 {
+		t.Errorf("Pages = %d, want 3 for 25 players ten to a page", board.Pages)
+	}
+	if board.Page != 2 {
+		t.Errorf("Page = %d, want 2", board.Page)
+	}
+	if len(board.Top) != 10 {
+		t.Fatalf("page two has %d rows, want 10", len(board.Top))
+	}
+	if board.Top[0].Rank != 11 || board.Top[9].Rank != 20 {
+		t.Errorf("page two covers ranks %d to %d, want 11 to 20",
+			board.Top[0].Rank, board.Top[9].Rank)
+	}
+}
+
+// TestTheLastPageIsShortRatherThanPadded, and an out-of-range page is CLAMPED.
+//
+// A press arrives from a button on a message that may be older than the board: a page 4 request
+// against a week that has since reset should show page 1, not an error and not an empty card.
+func TestAnOutOfRangePageIsClamped(t *testing.T) {
+	scores := map[string]int{"a": 3, "b": 2, "c": 1}
+
+	for _, page := range []int{-1, 0, 1, 7} {
+		board := Rank(scores, "", 10, page)
+		if board.Page != 1 || board.Pages != 1 {
+			t.Errorf("page %d resolved to %d/%d, want 1/1", page, board.Page, board.Pages)
+		}
+		if len(board.Top) != 3 {
+			t.Errorf("page %d showed %d rows, want all 3", page, len(board.Top))
+		}
+	}
+
+	// An empty board is page 1 of 1, not page 1 of 0: a next button on a board with nothing on
+	// it would be a control that leads nowhere.
+	if empty := Rank(map[string]int{}, "", 10, 1); empty.Pages != 1 || empty.Page != 1 {
+		t.Errorf("an empty board is page %d/%d, want 1/1", empty.Page, empty.Pages)
+	}
+}
+
+// TestTheEleventhSlotFollowsThePage.
+//
+// The viewer's own row means "not on THIS page" once there is more than one. Paging away from
+// your own row must not hide where you stand, and paging ONTO it must not print you twice.
+func TestTheEleventhSlotFollowsThePage(t *testing.T) {
+	scores := map[string]int{}
+	for i := range 25 {
+		scores[fmt.Sprintf("u%02d", i)] = 100 - i
+	}
+	viewer := "u14" // fifteenth, which is on page two
+
+	first := Rank(scores, viewer, 10, 1)
+	if first.You == nil {
+		t.Fatal("the viewer is off page one and their own row is missing from it")
+	}
+	if first.You.Rank != 15 {
+		t.Errorf("the viewer's row says rank %d, want 15", first.You.Rank)
+	}
+
+	second := Rank(scores, viewer, 10, 2)
+	if second.You != nil {
+		t.Error("the viewer is on page two and was ALSO printed under the divider, so they " +
+			"appear twice on one card")
+	}
+	found := false
+	for _, row := range second.Top {
+		found = found || row.UserID == viewer
+	}
+	if !found {
+		t.Error("the viewer is not in page two's rows either, so they vanished entirely")
 	}
 }

@@ -47,15 +47,35 @@ const leaderboardRows = 10
 var medals = []string{"🥇", "🥈", "🥉"}
 
 // leaderboardEmbed renders both boards as one message.
-func leaderboardEmbed(wins, chat wordgame.Board, nextReset time.Time, footer string) *discordgo.MessageEmbed {
+//
+// The scope is in the TITLE and the page is in the subtext, which is the split M32 needed: the
+// title answers "whose board is this", which changes what the numbers mean, and the page
+// answers "where am I in it", which is navigation. A reader who scrolls past this card later
+// has to be able to tell a global board from a local one without pressing anything, because
+// the two rank the same people against different fields.
+func leaderboardEmbed(wins, chat wordgame.Board, nextReset time.Time, footer string,
+	sc scope, guilds, page, pages int) *discordgo.MessageEmbed {
+
+	title := "weekly leaderboard"
+	if sc == scopeGlobal {
+		title = fmt.Sprintf("weekly leaderboard · every server (%d)", guilds)
+	}
+
+	// A Discord relative timestamp rather than a rendered duration, so it stays correct in
+	// every reader's timezone and keeps counting down without the bot editing anything.
+	//
+	// As SUBTEXT since M27: the reset is context for the board rather than a statement in its
+	// own right, and it used to render at the same size as the thing it annotates.
+	sub := fmt.Sprintf("resets <t:%d:R>", nextReset.Unix())
+	if pages > 1 {
+		// Only when there is more than one, because "page 1/1" is a control that does nothing
+		// dressed up as information.
+		sub = fmt.Sprintf("page %d/%d%sresets <t:%d:R>", page, pages, sep, nextReset.Unix())
+	}
+
 	return &discordgo.MessageEmbed{
-		Title: "weekly leaderboard",
-		// A Discord relative timestamp rather than a rendered duration, so it stays correct in
-		// every reader's timezone and keeps counting down without the bot editing anything.
-		//
-		// As SUBTEXT since M27: the reset is context for the board rather than a statement in
-		// its own right, and it used to render at the same size as the thing it annotates.
-		Description: subtext(fmt.Sprintf("resets <t:%d:R>", nextReset.Unix())),
+		Title:       title,
+		Description: subtext(sub),
 		Color:       0xF1C40F,
 		Fields: []*discordgo.MessageEmbedField{
 			{
@@ -144,17 +164,20 @@ func line(r wordgame.Row) string {
 // rather than about a player and a third column would push the two boards into stacking on a
 // desktop. Each part is omitted when it has nothing to say: an empty week says the counts and
 // stops, rather than printing "fastest: nobody".
-func leaderboardFooter(b *wordgame.Leaderboard, wins, chat wordgame.Board, names func(string) string) string {
+func leaderboardFooter(t tally, wins, chat wordgame.Board, names func(string) string) string {
 	parts := []string{fmt.Sprintf("%s playing, %s talking",
 		plural(wins.Players, "player"), plural(chat.Players, "person", "people"))}
 
-	if e, ok := b.Fastest(); ok {
+	// The records arrive already merged for a global board, which is why this takes the tally
+	// rather than a *Leaderboard: asking one guild's board for the fastest solve of a week that
+	// spans several would print a record that is true of one server and shown to all of them.
+	if e := t.fastest; e != nil {
 		parts = append(parts, fmt.Sprintf("fastest %s by %s",
 			seconds(e.FastestMS), wordgame.TruncateRunes(names(e.UserID), 16)))
 	}
 	// Only the current winner can be on a streak, and only from two wins up. A line that
 	// appeared after every single game would be noise rather than news.
-	if e, ok := b.Streak(); ok {
+	if e := t.streak; e != nil {
 		parts = append(parts, fmt.Sprintf("%s on %d in a row",
 			wordgame.TruncateRunes(names(e.UserID), 16), e.Streak))
 	}

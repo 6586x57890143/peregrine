@@ -1,122 +1,97 @@
-# Handoff: M31 (per-guild corpora), and what M32 is
+# Handoff: M32 (the paginated local and global leaderboard), and what comes next
 
-Written 2026-08-19, at the end of M31. Read this with `CLAUDE.md` and `SPEC.md` section 9.
+Written 2026-08-19, at the end of M32. Read this with `CLAUDE.md` and `SPEC.md` section 9.
 
 ## Where the branches are
 
 | Branch | State |
 |---|---|
-| `main` | Has M29. |
-| `m30-wordgame-settings` | **PR #50, open.** `/wordgame-config`: the word-game channel list, mode and interval move from the environment into a `BlobConfig` blob. CI is red for a reason unrelated to the code: GitHub Actions is blocked on account billing ("recent account payments have failed"), so all four jobs fail in 2-3 seconds without starting. Locally the same checks are green. |
-| `m31-per-guild-corpora` | **This work, two commits: M31 and the M31b allowlist fix. Branched off M30, not off `main`, because it edits M30's `settings.go`.** |
+| `main` | Has M31. PR #50 (M30) and PR #51 (M31, including the M31b allowlist fix) are both merged. |
+| `m32-leaderboard-paging` | **This work.** One commit, branched off `main`. |
 
-Merge order is M30 then M31. If M30 is rejected, M31 does not apply cleanly.
+Note for the next context reset: the previous handoff recorded M30 as an open PR and M31 as
+unmerged, and both had landed by the time M32 was written. **Check `gh pr list --state all`
+rather than trusting this table**, which is a snapshot of a moment.
 
-## What M31 did
+CI may still be red for a reason unrelated to the code: GitHub Actions was blocked on account
+billing ("recent account payments have failed"), so all four jobs failed in 2-3 seconds without
+starting. All four checks are green locally.
 
-One bbolt corpus per guild, in a directory, instead of one shared corpus for every guild.
+## What M32 did
 
-The old arrangement let the bot generate one server's text into another. `SPEC.md`'s M31 row has
-the full reasoning; the short version is that separate files make the isolation structural, in
-the same way `storage.Reader` makes a nested transaction fail to compile rather than fail at
-runtime.
+`/leaderboard`, with a `scope` of local or global and **prev/next buttons** under the board.
+`!leaderboard` still works and posts page one of the local board with the same buttons.
 
-**The rule the whole change follows: the guild is chosen where the TRANSACTION opens.** Nothing
-below `Store.View`/`Store.Update` knows what a guild is, which is why `learn.Learner.Message`
-kept its signature and its AST-pinned gate untouched.
+The pieces, and the reasons worth keeping:
 
-New API, all in `internal/storage/set.go`:
+- **The button state rides in the `custom_id`**, `lb:<scope>:<page>`. No pending map, no TTL,
+  nothing to leak, and a restart still answers a press on a board posted last week.
+  **The guild is deliberately NOT in it**, against the approved plan's own sketch. A component
+  interaction already carries the guild it was pressed in, so a second copy creates a pair that
+  can disagree, and the only way to resolve a disagreement is to render one server's board from
+  a press in another. That is the exact leak M31 exists to make unwritable.
+- **`wordgame.Rank` gained a page** and `Board` gained `Page` and `Pages`. The eleventh slot now
+  means "not on THIS page": paging away from your own row must not hide it, and paging onto it
+  must not print it twice. Ranks are computed over the whole field before the slice, or page two
+  would renumber everybody from one. An out-of-range page is CLAMPED, because a press arrives
+  from a button on a message that may be older than the board.
+- **The guard work came first, the way M26 did it.** `onInteraction` used to discard
+  `InteractionMessageComponent`. `Guard.UpdateEmbed` runs the same `CheckEmit`-over-every-field
+  walk, pause switch, ignore list and explicit `AllowedMentions` as `SendEmbed`, because "the
+  reader already had this message open" exempts nothing about what is going INTO it.
+  `SendEmbed` and `RespondEmbed` took a variadic `components` argument, so every existing call
+  site is unchanged.
+- **Global merges `AllUserStats` and the per-guild board across `Set.Guilds()`.** What crosses a
+  guild boundary is a user ID and an integer, never a word anybody typed, which is why this does
+  not undo M31. An unreachable corpus is skipped for a global board and fatal for a local one.
+- **`/leaderboard` is registered whether or not word games are on**, and `definitions(bool)`
+  filters out the two commands that ARE the feature. `!leaderboard` has never been gated on the
+  flag, so a slash form that was would be one command refusing what its twin answers.
 
-- `storage.Set` - the corpora, opened lazily, bounded by `PEREGRINE_MAX_GUILD_CORPORA`, closed
-  together. `For("")` returns `ErrNoGuild`; a non-numeric guild ID is refused because it becomes
-  a path component; `For` after `Close` returns `ErrSetClosed`.
-- `storage.Corpora` - the one-method interface every consumer takes.
-- `storage.Single(store)` - one store for every guild. Tests only; using it in production would
-  undo the milestone.
-- `dbtest.Set(t)` and `dbtest.Guild(t, set, id)` alongside the existing `dbtest.Store(t)`.
+## Two things the work found rather than planned
 
-Services that legitimately fan out over guilds (`games`, `aggro`, `health`, `repair`, `backup`)
-take the concrete `*storage.Set`. Everything else takes the interface.
-
-## What is per guild now, and what is not
-
-**Per guild:** the corpus itself, the weekly leaderboard, M30's word-game settings, aggro's
-target, the image repost pool, ingest and repair cursors, repair state and boundaries, backup
-families, and the activity tracker's author map.
-
-**Still process-wide, deliberately:** the dispatcher, the safety gate and its blocklist, the
-guard's ignore list and pause switch, `activity`'s per-CHANNEL traffic ring (a channel belongs to
-one guild anyway), conversation memory (per channel), the word-game `Manager` (per channel), the
-presence line (there is one, so it quotes one guild picked at random), and the health status log
-(summed, with a `guilds` count).
-
-## M31b: a channel allowlist is read per guild
-
-Found on a live multi-guild bot after M31 and fixed in the same branch. Settings being per guild
-was not enough: a guild that has never run `/wordgame-config` is SEEDED from
-`PEREGRINE_WORDGAME_CHANNELS`, one flat list of channel IDs, so every channel in every other
-server matched nothing and word games were dead there.
-
-`channels.Allows` is the one place that reads a list now, used by `games.allowed` and by
-`channels.Busiest` (so interval-mode games and the autonomous poster share it). The rule: **a list
-is a statement about the guilds it names.** It restricts those, and says nothing about the rest.
-Two fallbacks are deliberate and both are pinned by tests: a list resolving to no guild at all
-falls back to plain membership, because that means a cold state cache or stale IDs rather than "no
-opinion", and blank entries (a trailing comma in `.env`) are skipped.
+- **`discordgo.MessageComponentData` type-ASSERTS**, so an interaction whose type and data
+  disagree panics the goroutine reading it. Those are two independent fields off the wire.
+  `games.componentID` is the comma-ok version. A test built the mismatched payload by hand and
+  found it in one run.
+- **The display-name resolver moved out of `chat`.** It was `chat.displayName`, handed to
+  `games.Command` as a closure, so the reactor carried a member cache for one call it made on
+  somebody else's behalf. It is `names.Display` now, `chat.Deps.Members` is gone, and
+  `games.New` takes the `names.Session`. A global board is what forced it: it resolves people
+  who are not in the caller's guild at all, which makes the `User` fallback ordinary rather than
+  rare.
 
 ## Operational changes an operator must know
 
-1. **`PEREGRINE_DB_PATH` is a DIRECTORY**, `/data/corpora` in production. It kept its name so a
-   stale `/data/markov.db` is a startup ERROR naming the new shape, rather than silently becoming
-   a directory of that name. There is no migration: the old blended corpus is not read, and
-   per-guild corpora rebuild from Discord history through the ingest backfill. That was the
-   operator's decision, recorded here so nobody "fixes" it later.
-2. **Backups multiply.** One snapshot per guild per tick, `markov-<guild>-<ts>.db`, and `Keep` is
-   per guild, so the disk cost is `KEEP x guilds x corpus size`.
-3. **Maintenance modes take `-guild <id>`.** `-compact` requires it (one destination file);
-   `-clean-db`, `-purge-author` and `-corpus-report` iterate every corpus when it is omitted, and
-   `-corpus-report` prints a `=== path ===` heading per corpus.
-4. **The bot is quiet in a guild it has no corpus for until ingest runs**, which is the same
-   young-corpus behaviour `CLAUDE.md` describes for the author-diversity gate, now per server.
-
-## Two bugs the conversion found
-
-Both were pre-existing and are worth knowing because neither was found by reading:
-
-- **A closed `Set` would reopen a corpus.** A goroutine still in flight at shutdown (self-learning
-  is the clearest case) called `For` after `Close`, which created a file and took a flock nothing
-  alive would ever release. A test failed to delete its own temp directory, which is how it
-  surfaced. `ErrSetClosed` is the fix.
-- **`chat.requester` dereferenced a nil state cache.** It was masked by every test message being
-  guildless, so the DM early-return covered it. Fixing the tests exposed it.
+1. **The command set changes on the next start.** Registration is a bulk overwrite, so
+   `/leaderboard` appears and, with `PEREGRINE_ENABLE_WORD_GAMES` off, `/wordgame` and
+   `/wordgame-config` disappear. Global commands can take up to an hour to propagate.
+2. **No new environment variables.** Nothing in `.env.example` changed.
+3. Everything in M31's operational list still applies: `PEREGRINE_DB_PATH` is a DIRECTORY,
+   backups multiply per guild, maintenance modes take `-guild <id>`, and the bot is quiet in a
+   guild it has no corpus for until ingest runs.
 
 ## What is NOT done, in priority order
 
-1. **M32: the paginated local/global leaderboard.** The whole design is in the approved plan at
-   `C:\Users\kon\.claude\plans\agile-singing-hopcroft.md`. Summary: a `/leaderboard` slash command
-   with `scope: local|global` and prev/next BUTTONS; `wordgame.Rank` gains a page and `Board` gains
-   `Page`/`Pages`; global merges `AllUserStats` and the per-guild board across `Set.Guilds()`.
-   Do the guard work FIRST, the way M26 did: `onInteraction` currently discards
-   `InteractionMessageComponent`, and a component response needs a gated `Guard` method
-   (`InteractionResponseUpdateMessage`) running the same `CheckEmit`-over-every-field walk
-   `SendEmbed` uses. Button state rides in the `custom_id` (`lb:<scope>:<page>:<guild>`), so there
-   is no map to leak and a restart still answers a press.
-2. **A live two-guild smoke test.** Nothing here has run against Discord: the verification section
-   of the plan file lists the five things to check, the important one being that guild B's replies
-   never contain guild A's distinctive words.
-3. **`docker-compose.prod.yml` mentions `/data` generally and needs no edit, but the deploy still
-   has to be told the volume now holds a directory of corpora** rather than one file, and the old
-   `markov.db` inside the volume can be deleted once the operator is satisfied.
+1. **A live smoke test, for M31 and M32 together.** Nothing on this branch has run against
+   Discord. The five checks are in the plan file
+   (`C:\Users\kon\.claude\plans\agile-singing-hopcroft.md`); the important ones are that guild
+   B's replies never contain guild A's distinctive words, and that a button press on a board
+   posted BEFORE a restart still answers.
+2. **`docker-compose.prod.yml` needs no edit, but the deploy still has to be told the volume now
+   holds a directory of corpora** rather than one file, and the old `markov.db` inside the
+   volume can be deleted once the operator is satisfied.
+3. **`-tuning-report` has no guild dimension.** `plugins/tuning/map.go` writes one record per
+   tick with no corpus identity in it, so an archive from a multi-guild bot averages servers
+   together. Adding a `GuildID` field to the wire type is a deliberate decision about the
+   format, which is why it was not done quietly.
 4. **The remaining global dials are scalars, not lists.** Aggro's chance and duration, the
    autopost interval and skip chance, the roast chance and the word-game trigger chances are all
-   process-wide, and nothing has asked for them per guild yet. If one does, the pattern is
-   `/wordgame-config`: a blob in that guild's corpus, seeded from the environment, with a command
-   that owns it afterwards. `PEREGRINE_IGNORE_CHANNELS` needs no change, because a channel ID is
-   unique across Discord, so a denylist of them is already per channel.
-5. **`-tuning-report` has no guild dimension.** `plugins/tuning/map.go` writes one record per tick
-   with no corpus identity in it, so an archive from a multi-guild bot averages servers together.
-   Adding a `GuildID` field to the wire type is a deliberate decision about the format, which is
-   why it was not done quietly here.
+   process-wide. If one wants a per-guild answer, the pattern is `/wordgame-config`: a blob in
+   that guild's corpus, seeded from the environment, with a command that owns it afterwards.
+5. **A kill switch reachable from Discord** is still SPEC.md section 10's open decision. M26
+   answered the surface question and M32 added the component half, so what is left is a decision
+   about scope rather than machinery.
 
 ## The checks this repo runs
 
@@ -127,9 +102,10 @@ em=$'\342\200\224' ell=$'\342\200\246' ldq=$'\342\200\234' rdq=$'\342\200\235'
 grep -rnI --exclude-dir=.git -e "$em" -e "$ell" -e "$ldq" -e "$rdq" .
 ```
 
-All four are green on `m31-per-guild-corpora` as of this writing. `-race` needs a C toolchain
-this checkout does not have and is CI-only.
+All four are green as of this writing. `-race` needs a C toolchain this checkout does not have
+and is CI-only.
 
-The single most valuable test in the milestone is
-`TestOneGuildsWordsNeverReachAnother` in `internal/storage/set_test.go`. If a future change makes
-it fail, the leak is back.
+The single most valuable test on this branch is still `TestOneGuildsWordsNeverReachAnother` in
+`internal/storage/set_test.go`. M32's equivalent is
+`TestALocalBoardCountsOnlyThisServer` in `internal/plugins/games/board_test.go`: if a future
+change makes it fail, the board is blended again.

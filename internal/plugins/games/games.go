@@ -30,7 +30,7 @@ import (
 
 	"github.com/6586x57890143/peregrine/internal/channels"
 	"github.com/6586x57890143/peregrine/internal/core"
-	"github.com/6586x57890143/peregrine/internal/corpus"
+	"github.com/6586x57890143/peregrine/internal/names"
 	"github.com/6586x57890143/peregrine/internal/storage"
 	"github.com/6586x57890143/peregrine/internal/wordgame"
 )
@@ -42,7 +42,8 @@ import (
 // smaller import in exchange for an adapter whose only job was copying an ID.
 type Guard interface {
 	Send(channelID, content string) (*discordgo.Message, bool)
-	SendEmbed(channelID string, embed *discordgo.MessageEmbed) (*discordgo.Message, bool)
+	SendEmbed(channelID string, embed *discordgo.MessageEmbed,
+		components ...discordgo.MessageComponent) (*discordgo.Message, bool)
 	Edit(channelID, messageID, content string) bool
 	Delete(channelID, messageID string) bool
 
@@ -50,6 +51,14 @@ type Guard interface {
 	// RegisterCommands is a write routed through the guard so it is logged and has one home.
 	Respond(i *discordgo.Interaction, content string, ephemeral bool) bool
 	RegisterCommands(appID string, commands []*discordgo.ApplicationCommand) bool
+
+	// The component half, M32. RespondEmbed answers /leaderboard with buttons attached and
+	// UpdateEmbed replaces that message when one is pressed; both are gated sends, because
+	// the board they carry is built from Discord nicknames.
+	RespondEmbed(i *discordgo.Interaction, embed *discordgo.MessageEmbed,
+		ephemeral bool, components ...discordgo.MessageComponent) bool
+	UpdateEmbed(i *discordgo.Interaction, embed *discordgo.MessageEmbed,
+		components ...discordgo.MessageComponent) bool
 }
 
 // Mode selects how puzzles start.
@@ -124,6 +133,14 @@ type Service struct {
 	resolver channels.Resolver
 	opts     Options
 
+	// members resolves a display name, and this package owns that question as of M32 because
+	// it is the only package that asks it: !leaderboard used to be handed a resolver by chat,
+	// which meant the reactor carried a member cache for one closure it passed downwards. The
+	// GLOBAL board is what makes it awkward to keep there, since it ranks people who are not
+	// in the caller's guild at all. Nil falls back to the state cache and a User lookup, which
+	// is what the tests use.
+	members names.Session
+
 	loops       sync.WaitGroup
 	cancelLoops context.CancelFunc
 	logger      *slog.Logger
@@ -142,10 +159,11 @@ type Service struct {
 
 // New builds the service.
 func New(corpora *storage.Set, guard Guard, manager *wordgame.Manager,
-	counter channels.Counter, resolver channels.Resolver, opts Options) *Service {
+	counter channels.Counter, resolver channels.Resolver, members names.Session,
+	opts Options) *Service {
 	return &Service{
 		corpora: corpora, guard: guard, manager: manager,
-		counter: counter, resolver: resolver, opts: opts,
+		counter: counter, resolver: resolver, members: members, opts: opts,
 		guilds: map[string]*guildState{},
 	}
 }
@@ -217,9 +235,13 @@ func (s *Service) Start(ctx context.Context) error {
 	// After READY, because it is a REST call and this is the first moment the bot's own
 	// application ID is knowable. Registration is idempotent and the set is a bulk overwrite,
 	// so doing it on every startup is how a renamed or removed command stops being visible.
-	if s.opts.Enabled {
-		s.registerCommands()
-	}
+	//
+	// UNCONDITIONAL as of M32, because /leaderboard is not part of the word-game feature: its
+	// chat half reads the stats bucket, which is populated whether or not puzzles run, and
+	// !leaderboard has never been gated on the flag. definitions filters out the two commands
+	// that ARE the feature, so turning games off removes them from every client rather than
+	// leaving a command whose only answer is a refusal.
+	s.registerCommands()
 	return nil
 }
 
@@ -344,13 +366,16 @@ func (s *Service) finishRun(channelID string, rounds int) {
 //
 // The caller decides what recognition means for the message; here it only means the command
 // ran, or was refused for a reason the operator can see.
-func (s *Service) Command(cmd, arg, guildID, channelID string, who Requester, names func(userID string) string) bool {
+func (s *Service) Command(cmd, arg, guildID, channelID string, who Requester) bool {
 	switch cmd {
 	case "!leaderboard":
 		// The author's ID reaches the board, which is what makes the eleventh slot possible:
 		// showing somebody their own rank requires knowing which of the rows is theirs, and
 		// the only thing that identifies them is their ID.
-		s.postLeaderboard(guildID, channelID, who.UserID, names)
+		//
+		// Page one of the LOCAL board, with the same buttons /leaderboard gets: a bang command
+		// cannot carry options, and the buttons make that not matter.
+		s.postLeaderboard(guildID, channelID, who.UserID)
 		return true
 	case "!wordgame":
 		// Only a command when word games are available at all. With the feature off it is
@@ -723,106 +748,6 @@ func (s *Service) maybeReset() {
 				guildID, err)
 		}
 	}
-}
-
-// postLeaderboard answers !leaderboard with the word-game wins and the chat leaderboard.
-//
-// Deliberately NOT gated on the feature flag. The chat half reads the stats bucket, which is
-// populated on every message regardless of whether the scramble game runs, so the command is
-// useful with word games off.
-func (s *Service) postLeaderboard(guildID, channelID, viewerID string, names func(userID string) string) {
-	board := s.board(guildID)
-	store, err := s.corpora.For(guildID)
-	if board == nil || err != nil {
-		// THIS server's board, from THIS server's corpus. A leaderboard merged across guilds
-		// would rank people against strangers whose messages they cannot see, which is the
-		// same leak as generating one server's text into another, wearing a scoreboard.
-		log.Printf("[LEADERBOARD] no corpus for guild %s: %v", guildID, err)
-		s.guard.Send(channelID, "could not build the leaderboard")
-		return
-	}
-
-	var chatScores map[string]int
-	if err := store.View(func(r *storage.Reader) error {
-		var err error
-		chatScores, err = weeklyScores(r)
-		return err
-	}); err != nil {
-		log.Printf("[LEADERBOARD] Error loading user stats: %v", err)
-		s.guard.Send(channelID, "could not build the leaderboard")
-		return
-	}
-
-	// RANK FIRST, RESOLVE NAMES SECOND, and that order is the entire performance fix.
-	//
-	// This used to resolve a display name for EVERY user in the week's stats before sorting
-	// anything, through an uncached GuildMember REST GET with a User fallback. On a server
-	// with two hundred weekly talkers that was two hundred-odd sequential, rate-limited
-	// requests to render twenty rows, and the command took long enough that people assumed
-	// the bot had ignored them.
-	//
-	// A rank is one plus the number of people strictly ahead, so it needs no names at all.
-	// Only the rows that are actually displayed need one, which is at most eleven per board.
-	//
-	// It also fixes a real defect rather than only the speed: the old code keyed the board by
-	// resolved NAME, so two people with the same nickname merged into one row.
-	now := time.Now()
-	wins := wordgame.Rank(board.Scores(), viewerID, leaderboardRows)
-	chat := wordgame.Rank(chatScores, viewerID, leaderboardRows)
-
-	// Memoized across BOTH boards, so somebody who is on the word-game board and the chat
-	// board costs one lookup rather than two. In practice that is most of the overlap.
-	resolve := memoize(names)
-	wins = wins.WithNames(resolve)
-	chat = chat.WithNames(resolve)
-
-	// The footer's two record holders go through the SAME memoized resolver, so a record held
-	// by somebody already on a board costs nothing extra. That is at most two more lookups.
-	footer := leaderboardFooter(board, wins, chat, resolve)
-
-	embed := leaderboardEmbed(wins, chat, board.NextReset(now), footer)
-	if _, ok := s.guard.SendEmbed(channelID, embed); !ok {
-		// The guard has already logged whether this was a refusal or a failure. Said here as
-		// well because a command that produced nothing is a question the operator will be
-		// asked, and silence on the reply path is the bug finding 32 was about.
-		log.Printf("[LEADERBOARD] the board was not sent in %s", channelID)
-	}
-}
-
-// memoize wraps a name resolver so each user is looked up at most once.
-//
-// Not concurrency-safe, and does not need to be: one command invocation resolves its own
-// board on one goroutine. A mutex here would be structure with no failure mode behind it.
-func memoize(resolve func(userID string) string) func(string) string {
-	cache := map[string]string{}
-	return func(userID string) string {
-		if name, ok := cache[userID]; ok {
-			return name
-		}
-		name := resolve(userID)
-		cache[userID] = name
-		return name
-	}
-}
-
-// weeklyScores returns each user's message count for the current week.
-//
-// It no longer skips keys that are not numeric, because the stats bucket no longer holds a
-// non-user key: total_messages_learned is a meta counter. Anything that forgot to skip it
-// used to decode an integer as a stat and count a phantom user.
-func weeklyScores(r *storage.Reader) (map[string]int, error) {
-	all, err := r.AllUserStats()
-	if err != nil {
-		return nil, err
-	}
-	start := corpus.StartOfWeekUTC(time.Now())
-	scores := make(map[string]int, len(all))
-	for userID, stat := range all {
-		if !stat.LastTimestamp.Before(start) {
-			scores[userID] = int(stat.Count)
-		}
-	}
-	return scores, nil
 }
 
 // gauntletArg reads "!wordgame 5" and reports the count.
