@@ -61,7 +61,7 @@ type fakeActivity struct {
 	notes []string
 }
 
-func (a *fakeActivity) Note(channelID, authorID string) {
+func (a *fakeActivity) Note(_, channelID, authorID string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.notes = append(a.notes, channelID+"/"+authorID)
@@ -75,7 +75,7 @@ func (a *fakeActivity) count() int {
 
 type fakeAggro struct{ handled int }
 
-func (a *fakeAggro) Handle(string, string, string) { a.handled++ }
+func (a *fakeAggro) Handle(string, string, string, string) { a.handled++ }
 
 type fakeImages struct {
 	captured int
@@ -85,7 +85,7 @@ type fakeImages struct {
 
 func (i *fakeImages) Capture(string, string, string, string, []images.Attachment) { i.captured++ }
 func (i *fakeImages) MaybeRepost(string, bool)                                    { i.reposts++ }
-func (i *fakeImages) Forget(ids ...string)                                        { i.forgot = append(i.forgot, ids...) }
+func (i *fakeImages) Forget(_ string, ids ...string)                              { i.forgot = append(i.forgot, ids...) }
 
 type fakeGames struct {
 	guesses    int
@@ -94,12 +94,12 @@ type fakeGames struct {
 	consume    bool
 }
 
-func (g *fakeGames) Guess(string, string, string, string, string) bool {
+func (g *fakeGames) Guess(string, string, string, string, string, string) bool {
 	g.guesses++
 	return false
 }
 
-func (g *fakeGames) Command(cmd, arg, _ string, who games.Requester, _ func(string) string) bool {
+func (g *fakeGames) Command(cmd, arg, _, _ string, who games.Requester, _ func(string) string) bool {
 	if arg != "" {
 		cmd += " " + arg
 	}
@@ -144,7 +144,8 @@ func fixture(t *testing.T) (*Service, *storage.Store, *fakeGuard, *fakeGames, *f
 	}
 	gate := safety.NewGate(bl, slog.New(slog.NewTextHandler(io.Discard, nil)), false)
 
-	store := dbtest.Store(t)
+	corpora := dbtest.Set(t)
+	store := dbtest.Guild(t, corpora, testGuild)
 	learner := learn.New(gate, learn.Options{MaxNGram: 3, MaxHistory: 1000, CooccurrenceWindow: 5})
 	learner.SetBotID(snowflake(1))
 
@@ -155,7 +156,7 @@ func fixture(t *testing.T) (*Service, *storage.Store, *fakeGuard, *fakeGames, *f
 
 	s := New(Deps{
 		Session:  nil, // no gateway: every step under test must work without one
-		Store:    store,
+		Corpora:  corpora,
 		Gate:     gate,
 		Guard:    guard,
 		Learner:  learner,
@@ -184,10 +185,15 @@ func chatOptions() Options {
 	}
 }
 
+// testGuild is the server every fixture message comes from. A real snowflake, because the
+// corpus set refuses anything else: a guild ID is a path component.
+const testGuild = "111"
+
 func message(content string) *reaction {
 	return &reaction{
 		m: &discordgo.MessageCreate{Message: &discordgo.Message{
 			ID:        snowflake(4242),
+			GuildID:   testGuild,
 			ChannelID: "c1",
 			Content:   content,
 			Author:    &discordgo.User{ID: snowflake(77), Username: "someone"},

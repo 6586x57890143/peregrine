@@ -23,7 +23,9 @@ type fakeStore struct {
 	paths []string
 }
 
-func (f *fakeStore) Backup(path string) error {
+func (f *fakeStore) Guilds() []string { return []string{"111"} }
+
+func (f *fakeStore) Backup(_, path string) error {
 	f.calls++
 	f.paths = append(f.paths, path)
 	if f.fail {
@@ -141,7 +143,7 @@ func TestAFailedSnapshotLeavesNoDebrisAndPrunesNothing(t *testing.T) {
 
 	// Two snapshots against a Keep of one, so a prune has something to destroy.
 	for _, stamp := range []string{"20260101-000001", "20260102-000002"} {
-		if err := os.WriteFile(filepath.Join(dir, prefix+stamp+suffix), []byte("old"), 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, familyPrefix("111")+stamp+suffix), []byte("old"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -183,19 +185,19 @@ func TestRetentionKeepsTheNewest(t *testing.T) {
 	// Written by hand rather than by taking five snapshots, because the name carries a
 	// one-second-resolution timestamp and five real snapshots in the same second would collide.
 	for _, stamp := range []string{"20260101-000001", "20260102-000002", "20260103-000003", "20260104-000004"} {
-		path := filepath.Join(dir, prefix+stamp+suffix)
+		path := filepath.Join(dir, familyPrefix("111")+stamp+suffix)
 		if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	s.prune()
+	s.prune("111")
 
 	got := names(t, dir)
 	if len(got) != 3 {
 		t.Fatalf("directory holds %v, want 3", got)
 	}
-	if got[0] != prefix+"20260102-000002"+suffix {
+	if got[0] != familyPrefix("111")+"20260102-000002"+suffix {
 		t.Errorf("the oldest snapshot survived: %v", got)
 	}
 }
@@ -213,7 +215,8 @@ func TestRetentionOnlyTouchesFilesThisServiceNamed(t *testing.T) {
 		"markov.db.tmp",          // and its temp file
 		"notes.txt",              // anything else
 		prefix + "nope" + ".txt", // right prefix, wrong suffix
-		prefix + "20260101-000001" + suffix + tempMark, // a partial from a failed run
+		familyPrefix("111") + "20260101-000001" + suffix + tempMark, // a partial from a failed run
+		familyPrefix("222") + "20260101-000001" + suffix,            // ANOTHER guild's snapshot
 	}
 	for _, name := range strangers {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
@@ -222,12 +225,12 @@ func TestRetentionOnlyTouchesFilesThisServiceNamed(t *testing.T) {
 	}
 	// Plus two real snapshots, so the prune has something to do.
 	for _, stamp := range []string{"20260101-000001", "20260102-000002"} {
-		if err := os.WriteFile(filepath.Join(dir, prefix+stamp+suffix), []byte("x"), 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, familyPrefix("111")+stamp+suffix), []byte("x"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	s.prune()
+	s.prune("111")
 
 	got := names(t, dir)
 	for _, stranger := range strangers {
@@ -252,11 +255,11 @@ func TestRetentionDoesNothingBelowTheLimit(t *testing.T) {
 	s, _ := fixture(t, Options{Dir: dir, Every: time.Hour, Keep: 5})
 
 	for _, stamp := range []string{"20260101-000001", "20260102-000002"} {
-		if err := os.WriteFile(filepath.Join(dir, prefix+stamp+suffix), []byte("x"), 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, familyPrefix("111")+stamp+suffix), []byte("x"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	s.prune()
+	s.prune("111")
 
 	if got := names(t, dir); len(got) != 2 {
 		t.Errorf("directory holds %v, want both snapshots", got)
@@ -348,7 +351,8 @@ func TestDescribeSaysWhatIsConfigured(t *testing.T) {
 // that usually appears to work. So this takes a real snapshot of a real corpus with data in it,
 // opens the result, and reads the data back.
 func TestARealSnapshotIsAReadableCorpus(t *testing.T) {
-	source := dbtest.Store(t)
+	corpora := dbtest.Set(t)
+	source := dbtest.Guild(t, corpora, "111")
 	if err := source.Update(func(w *storage.Writer) error {
 		return w.LearnNgram("the bird", "flew", "author-1")
 	}); err != nil {
@@ -356,7 +360,7 @@ func TestARealSnapshotIsAReadableCorpus(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	s := New(source, Options{Dir: dir, Every: time.Hour, Keep: 7})
+	s := New(corpora, Options{Dir: dir, Every: time.Hour, Keep: 7})
 	if err := s.Init(core.Deps{Logger: logger()}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
@@ -388,5 +392,46 @@ func TestARealSnapshotIsAReadableCorpus(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("reading the restored corpus: %v", err)
+	}
+}
+
+// TestRetentionIsPerGuild, M31.
+//
+// Keep is a promise about how far back an operator can go, and with one corpus per guild it has
+// to be a promise per guild. A prune that saw every guild's snapshots as one family would keep
+// Keep files in TOTAL, so on five guilds each server would be one generation deep and a busy
+// server's hourly snapshots would evict a quiet server's only copy.
+func TestRetentionIsPerGuild(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := fixture(t, Options{Dir: dir, Every: time.Hour, Keep: 2})
+
+	for _, guild := range []string{"111", "222"} {
+		for _, stamp := range []string{"20260101-000001", "20260102-000002", "20260103-000003"} {
+			path := filepath.Join(dir, familyPrefix(guild)+stamp+suffix)
+			if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	s.prune("111")
+
+	got := names(t, dir)
+	if len(got) != 5 {
+		t.Fatalf("directory holds %v, want two for guild 111 and all three for 222", got)
+	}
+	for _, name := range got {
+		if name == familyPrefix("111")+"20260101-000001"+suffix {
+			t.Error("the oldest snapshot of the pruned guild survived")
+		}
+	}
+	kept := 0
+	for _, name := range got {
+		if strings.HasPrefix(name, familyPrefix("222")) {
+			kept++
+		}
+	}
+	if kept != 3 {
+		t.Errorf("pruning guild 111 removed %d of guild 222's snapshots", 3-kept)
 	}
 }

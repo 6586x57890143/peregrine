@@ -33,6 +33,13 @@ type Info struct {
 	Name string
 	NSFW bool
 
+	// GuildID is which server this channel is in, and it is how a feature that starts from a
+	// channel finds the corpus to use. Several do: the autonomous poster picks a channel and
+	// then has to generate from THAT server's text, and image reposting has to stay inside
+	// the server an image came from. It comes free from the state cache, which already holds
+	// the channel this was built from.
+	GuildID string
+
 	// Text reports whether this is a guild text channel. A voice channel can carry
 	// messages in Discord's data model and is not somewhere the bot should be talking.
 	Text bool
@@ -66,10 +73,11 @@ func (r stateResolver) Channel(id string) (Info, bool) {
 		return Info{}, false
 	}
 	return Info{
-		ID:   ch.ID,
-		Name: ch.Name,
-		NSFW: ch.NSFW,
-		Text: ch.Type == discordgo.ChannelTypeGuildText,
+		ID:      ch.ID,
+		Name:    ch.Name,
+		NSFW:    ch.NSFW,
+		GuildID: ch.GuildID,
+		Text:    ch.Type == discordgo.ChannelTypeGuildText,
 	}, true
 }
 
@@ -103,7 +111,10 @@ type Counter interface {
 // first window after a restart, and the obvious fallback, ranking by the state cache's
 // LastMessageID, offers recency without volume: a channel whose last message was 59 minutes
 // ago would win the choice of where to start talking unprompted.
-func Busiest(c Counter, r Resolver, window time.Duration, allow []string) string {
+// guildID, when non-empty, restricts the choice to one server. Interval-mode word games need
+// that as of M31: the settings that decide whether to post at all are per guild, so the channel
+// the decision produces has to be in the guild whose settings were consulted.
+func Busiest(c Counter, r Resolver, window time.Duration, allow []string, guildID string) string {
 	allowed := make(map[string]struct{}, len(allow))
 	for _, id := range allow {
 		if id != "" {
@@ -121,6 +132,9 @@ func Busiest(c Counter, r Resolver, window time.Duration, allow []string) string
 		}
 		info, ok := r.Channel(ranked.ID)
 		if !ok || !info.Text || info.NotSafeForWork() {
+			continue
+		}
+		if guildID != "" && info.GuildID != guildID {
 			continue
 		}
 

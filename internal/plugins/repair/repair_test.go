@@ -18,7 +18,8 @@ import (
 // the generation stamp exists to stop depending on, and if the override won it would be
 // depending on it forever.
 func TestABoundaryComesFromTheCorpusBeforeTheOverride(t *testing.T) {
-	s := dbtest.Store(t)
+	set := dbtest.Set(t)
+	s := dbtest.Guild(t, set, "111")
 
 	stamped := time.Now().Add(-72 * time.Hour).Truncate(time.Second)
 	override := time.Now().Add(-1 * time.Hour)
@@ -29,8 +30,8 @@ func TestABoundaryComesFromTheCorpusBeforeTheOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	svc := New(nil, s, nil, Options{Override: override})
-	got, err := svc.boundary(Job{Name: "associations", FixedIn: 2})
+	svc := New(nil, set, nil, Options{Override: override})
+	got, err := svc.boundary(s, Job{Name: "associations", FixedIn: 2})
 	if err != nil {
 		t.Fatalf("boundary: %v", err)
 	}
@@ -45,11 +46,12 @@ func TestABoundaryComesFromTheCorpusBeforeTheOverride(t *testing.T) {
 // Generation 2 shipped in M14 without a stamp, so its real start instant is unrecoverable.
 // That one case is what the override is for, and it should not grow a second.
 func TestTheOverrideCoversAGenerationThatShippedBeforeStamping(t *testing.T) {
-	s := dbtest.Store(t)
+	set := dbtest.Set(t)
+	s := dbtest.Guild(t, set, "111")
 	override := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
 
-	svc := New(nil, s, nil, Options{Override: override})
-	got, err := svc.boundary(Job{Name: "associations", FixedIn: 2})
+	svc := New(nil, set, nil, Options{Override: override})
+	got, err := svc.boundary(s, Job{Name: "associations", FixedIn: 2})
 	if err != nil {
 		t.Fatalf("boundary: %v", err)
 	}
@@ -66,10 +68,11 @@ func TestTheOverrideCoversAGenerationThatShippedBeforeStamping(t *testing.T) {
 // wrote. The error has to name the variable that fixes it, because the operator cannot
 // otherwise tell which of those two happened.
 func TestAJobWithNoKnownBoundaryRefusesToRun(t *testing.T) {
-	s := dbtest.Store(t)
+	set := dbtest.Set(t)
+	s := dbtest.Guild(t, set, "111")
 
-	svc := New(nil, s, nil, Options{})
-	_, err := svc.boundary(Job{Name: "associations", FixedIn: 2})
+	svc := New(nil, set, nil, Options{})
+	_, err := svc.boundary(s, Job{Name: "associations", FixedIn: 2})
 	if err == nil {
 		t.Fatal("a job with no stamp and no override produced a boundary")
 	}
@@ -81,7 +84,8 @@ func TestAJobWithNoKnownBoundaryRefusesToRun(t *testing.T) {
 // TestAFinishedJobIsNotRunAgain, which is what the completion marker is for: without it every
 // restart would re-walk all of history.
 func TestAFinishedJobIsNotRunAgain(t *testing.T) {
-	s := dbtest.Store(t)
+	set := dbtest.Set(t)
+	s := dbtest.Guild(t, set, "111")
 
 	if err := s.Update(func(w *storage.Writer) error {
 		return w.SetRepairState("associations", storage.RepairDone)
@@ -89,10 +93,10 @@ func TestAFinishedJobIsNotRunAgain(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	svc := New(nil, s, nil, Options{Enabled: []string{AllJobs}})
+	svc := New(nil, set, nil, Options{Enabled: []string{AllJobs}})
 	svc.logger = quietLogger()
 
-	if got := svc.pending(); len(got) != 0 {
+	if got := svc.pending(s); len(got) != 0 {
 		t.Errorf("a job marked done is still pending: %v", got)
 	}
 }
@@ -100,7 +104,8 @@ func TestAFinishedJobIsNotRunAgain(t *testing.T) {
 // TestOnlyEnabledJobsArePending, since a repair re-reads the whole of history and running one
 // the operator did not name is not a decision this service gets to make.
 func TestOnlyEnabledJobsArePending(t *testing.T) {
-	s := dbtest.Store(t)
+	set := dbtest.Set(t)
+	s := dbtest.Guild(t, set, "111")
 
 	for _, c := range []struct {
 		name    string
@@ -113,9 +118,9 @@ func TestOnlyEnabledJobsArePending(t *testing.T) {
 		{"by all", []string{AllJobs}, 1},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			svc := New(nil, s, nil, Options{Enabled: c.enabled})
+			svc := New(nil, set, nil, Options{Enabled: c.enabled})
 			svc.logger = quietLogger()
-			if got := len(svc.pending()); got != c.want {
+			if got := len(svc.pending(s)); got != c.want {
 				t.Errorf("%d jobs pending, want %d", got, c.want)
 			}
 		})

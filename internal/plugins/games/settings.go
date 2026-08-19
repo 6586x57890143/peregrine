@@ -49,13 +49,17 @@ const (
 	maxInterval = 24 * time.Hour
 )
 
-// loadSettings restores the stored settings, or seeds them from Options.
+// loadSettings restores one guild's stored settings, or seeds them from Options.
+//
+// Per guild as of M31, in that guild's own corpus under the key it always used. Sharing one
+// blob across servers meant an admin binding a channel in their server rebound it in every
+// other server the bot was in, which nobody could see and nobody would think to check.
 //
 // A load failure seeds from Options rather than failing startup, for the reason the leaderboard
 // load states: word games are one optional behaviour and exactly one feature failing should
 // disable that one. Unlike the leaderboard there is nothing here that is not re-derivable, since
 // the environment still holds a usable answer.
-func (s *Service) loadSettings() {
+func (s *Service) loadSettings(store *storage.Store, guildID string) settings {
 	seed := settings{
 		Channels: s.opts.AllowChannels,
 		Mode:     s.opts.Mode,
@@ -63,7 +67,7 @@ func (s *Service) loadSettings() {
 	}
 
 	var stored *settings
-	if err := s.store.View(func(r *storage.Reader) error {
+	if err := store.View(func(r *storage.Reader) error {
 		v, err := r.GetBlob(storage.BlobConfig, settingsKey)
 		if err != nil || v == nil {
 			return err
@@ -75,28 +79,29 @@ func (s *Service) loadSettings() {
 		stored = &set
 		return nil
 	}); err != nil {
-		log.Printf("[WARN] Failed to load word-game settings, using the environment: %v", err)
+		log.Printf("[WARN] Failed to load word-game settings for guild %s, using the "+
+			"environment: %v", guildID, err)
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if stored == nil {
-		s.set = seed
-		log.Printf("[WORDGAME] Settings from the environment: %s. /wordgame-config changes them "+
-			"and they are stored from then on.", seed)
-		return
+		log.Printf("[WORDGAME] Guild %s: settings from the environment: %s. /wordgame-config "+
+			"changes them and they are stored from then on.", guildID, seed)
+		return seed
 	}
-	s.set = *stored
+
+	set := *stored
 	// Validated on the way in, not only on the way out. A blob written by an older build, or by
 	// one whose mode names differed, must not be able to leave the feature in a state no command
 	// can produce.
-	if s.set.Mode != ModeActivity && s.set.Mode != ModeInterval {
-		s.set.Mode = seed.Mode
+	if set.Mode != ModeActivity && set.Mode != ModeInterval {
+		set.Mode = seed.Mode
 	}
-	s.set.Interval = min(max(s.set.Interval, minInterval), maxInterval)
-	log.Printf("[WORDGAME] Stored settings: %s. The environment supplies these only until the "+
-		"first /wordgame-config, so PEREGRINE_WORDGAME_CHANNELS, _FREQUENCY_MODE and _INTERVAL "+
-		"are being ignored. /wordgame-config reset:true writes their values back over these.", s.set)
+	set.Interval = min(max(set.Interval, minInterval), maxInterval)
+	log.Printf("[WORDGAME] Guild %s: stored settings: %s. The environment supplies these only "+
+		"until the first /wordgame-config, so PEREGRINE_WORDGAME_CHANNELS, _FREQUENCY_MODE and "+
+		"_INTERVAL are being ignored. /wordgame-config reset:true writes their values back over "+
+		"these.", guildID, set)
+	return set
 }
 
 // String is what the command prints and what Init logs, which is one renderer rather than two
@@ -123,17 +128,27 @@ func (s settings) String() string {
 // The mutation happens under the lock and the write does not, because store.Update takes bbolt's
 // single writer and holding a mutex across it would block every read of these settings on
 // whatever else is writing to the corpus. Same rule as imageURLMutex not wrapping a store.Update.
-func (s *Service) update(fn func(*settings)) settings {
+func (s *Service) update(guildID string, fn func(*settings)) settings {
+	st, err := s.state(guildID)
+	if err != nil {
+		log.Printf("[ERR] No corpus for guild %s, so its word-game settings were not "+
+			"changed: %v", guildID, err)
+		return settings{}
+	}
+
 	s.mu.Lock()
-	fn(&s.set)
-	set := s.set
+	fn(&st.set)
+	set := st.set
 	s.mu.Unlock()
 
-	encoded, err := json.Marshal(set)
+	store, err := s.corpora.For(guildID)
 	if err == nil {
-		err = s.store.Update(func(w *storage.Writer) error {
-			return w.PutBlob(storage.BlobConfig, settingsKey, encoded)
-		})
+		var encoded []byte
+		if encoded, err = json.Marshal(set); err == nil {
+			err = store.Update(func(w *storage.Writer) error {
+				return w.PutBlob(storage.BlobConfig, settingsKey, encoded)
+			})
+		}
 	}
 	if err != nil {
 		// Applied in memory and not persisted, which is the honest outcome: the operator's
@@ -144,11 +159,17 @@ func (s *Service) update(fn func(*settings)) settings {
 	return set
 }
 
-// snapshot is the settings as one consistent copy, for a reader that needs more than one field.
-func (s *Service) snapshot() settings {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.set
+// snapshot is one guild's settings as a consistent copy, for a reader that needs more than one
+// field. A guild whose corpus cannot be reached reads as the environment's defaults, which is
+// the quiet direction: activity mode in every channel is what an unconfigured bot does.
+func (s *Service) snapshot(guildID string) settings {
+	st, err := s.state(guildID)
+	if err != nil {
+		return settings{Channels: s.opts.AllowChannels, Mode: s.opts.Mode, Interval: s.opts.Interval}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return st.set
 }
 
 // allowed reports whether a puzzle may run in a channel.
@@ -156,8 +177,7 @@ func (s *Service) snapshot() settings {
 // PEREGRINE_IGNORE_CHANNELS is the guard's denylist and says where the bot must not speak at
 // all; this is the allowlist for one feature, so a server that wants puzzles in exactly one
 // channel does not have to list every other channel it has.
-func (s *Service) allowed(channelID string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.set.Channels) == 0 || slices.Contains(s.set.Channels, channelID)
+func (s *Service) allowed(guildID, channelID string) bool {
+	set := s.snapshot(guildID)
+	return len(set.Channels) == 0 || slices.Contains(set.Channels, channelID)
 }

@@ -98,7 +98,11 @@ type Options struct {
 // Service runs the enabled jobs.
 type Service struct {
 	session *discordgo.Session
-	store   *storage.Store
+
+	// corpora is the SET rather than the interface, because this service legitimately fans
+	// out over every guild: a repair's state and its boundary live in each guild's own
+	// corpus, so it has to know which corpora exist.
+	corpora *storage.Set
 	learner *learn.Learner
 	opts    Options
 	logger  *slog.Logger
@@ -110,8 +114,8 @@ type Service struct {
 // New builds the service, taking the shared Learner for the same reason the ingest plugin
 // does: the corpus writer is one per process, and a second one would carry its own bot ID that
 // nothing ever sets.
-func New(session *discordgo.Session, store *storage.Store, learner *learn.Learner, opts Options) *Service {
-	return &Service{session: session, store: store, learner: learner, opts: opts}
+func New(session *discordgo.Session, corpora *storage.Set, learner *learn.Learner, opts Options) *Service {
+	return &Service{session: session, corpora: corpora, learner: learner, opts: opts}
 }
 
 func (s *Service) Name() string { return "repair" }
@@ -166,18 +170,30 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// Once runs every enabled job that is not already done.
+// Once runs every enabled job that is not already done, for every guild.
+//
+// ONE PASS PER GUILD, as of M31. A job's done marker and its boundary both live in the corpus
+// they describe, so a single pass over every guild would have to pick one guild's boundary and
+// measure the others against it. Per guild also means a corpus created last week and one
+// created this morning each get repaired back to their own generation stamp.
 func (s *Service) Once(ctx context.Context) {
-	for _, job := range s.pending() {
-		if ctx.Err() != nil {
-			return
+	for _, guildID := range s.corpora.Guilds() {
+		store, err := s.corpora.For(guildID)
+		if err != nil {
+			s.logger.Error("skipping repairs for a guild", "guild", guildID, "err", err)
+			continue
 		}
-		s.run(ctx, job)
+		for _, job := range s.pending(store) {
+			if ctx.Err() != nil {
+				return
+			}
+			s.run(ctx, store, guildID, job)
+		}
 	}
 }
 
-// pending returns the enabled jobs the corpus has not recorded as finished.
-func (s *Service) pending() []Job {
+// pending returns the enabled jobs this corpus has not recorded as finished.
+func (s *Service) pending(store *storage.Store) []Job {
 	enabled := map[string]bool{}
 	all := false
 	for _, name := range s.opts.Enabled {
@@ -188,7 +204,7 @@ func (s *Service) pending() []Job {
 	}
 
 	var out []Job
-	if err := s.store.View(func(r *storage.Reader) error {
+	if err := store.View(func(r *storage.Reader) error {
 		for _, job := range jobs(s.learner) {
 			if !all && !enabled[job.Name] {
 				continue
@@ -207,8 +223,8 @@ func (s *Service) pending() []Job {
 }
 
 // run performs one job.
-func (s *Service) run(ctx context.Context, job Job) {
-	boundary, err := s.boundary(job)
+func (s *Service) run(ctx context.Context, store *storage.Store, guildID string, job Job) {
+	boundary, err := s.boundary(store, job)
 	if err != nil {
 		// Declining is the safe direction. A job with no boundary would either walk
 		// everything, re-counting data the fixed writer already wrote, or walk nothing while
@@ -217,7 +233,7 @@ func (s *Service) run(ctx context.Context, job Job) {
 		return
 	}
 
-	if err := s.store.Update(func(w *storage.Writer) error {
+	if err := store.Update(func(w *storage.Writer) error {
 		return w.SetRepairState(job.Name, storage.RepairRunning)
 	}); err != nil {
 		s.logger.Error("marking repair running failed", "job", job.Name, "err", err)
@@ -235,15 +251,18 @@ func (s *Service) run(ctx context.Context, job Job) {
 
 	in := ingest.New(
 		s.session,
-		cursors{store: s.store, job: job.Name},
-		learner{session: cache, store: s.store, job: job},
+		cursors{store: store, job: job.Name},
+		learner{session: cache, corpora: storage.Single(store), store: store, job: job},
 		s.logger,
 		ingest.Options{
 			// From the beginning of time. SnowflakeAt clamps below the Discord epoch, which
 			// is what that clamp was written for, so an absurd lookback says "everything"
 			// without inventing a second mechanism for it.
-			Lookback:           100 * 365 * 24 * time.Hour,
-			Until:              boundary,
+			Lookback: 100 * 365 * 24 * time.Hour,
+			Until:    boundary,
+
+			// One guild per pass, so this walk writes only into the corpus it was given.
+			OnlyGuild:          guildID,
 			GuildConcurrency:   s.opts.GuildConcurrency,
 			ChannelConcurrency: s.opts.ChannelConcurrency,
 			BatchDelay:         s.opts.BatchDelay,
@@ -261,7 +280,7 @@ func (s *Service) run(ctx context.Context, job Job) {
 		return
 	}
 
-	if err := s.store.Update(func(w *storage.Writer) error {
+	if err := store.Update(func(w *storage.Writer) error {
 		return w.SetRepairState(job.Name, storage.RepairDone)
 	}); err != nil {
 		s.logger.Error("marking repair done failed", "job", job.Name, "err", err)
@@ -279,12 +298,12 @@ func (s *Service) run(ctx context.Context, job Job) {
 //
 // The stamp is the right answer and the override is the fallback, not the other way round: an
 // operator's memory of a deploy time is what this whole mechanism exists to stop depending on.
-func (s *Service) boundary(job Job) (time.Time, error) {
+func (s *Service) boundary(store *storage.Store, job Job) (time.Time, error) {
 	var (
 		at    time.Time
 		known bool
 	)
-	if err := s.store.View(func(r *storage.Reader) error {
+	if err := store.View(func(r *storage.Reader) error {
 		at, known = r.LearnGenerationStart(job.FixedIn)
 		return nil
 	}); err != nil {
@@ -309,12 +328,17 @@ func (s *Service) boundary(job Job) (time.Time, error) {
 // re-reading history through it would count every n-gram a second time (finding 13).
 type learner struct {
 	session names.Session
+
+	// corpora is Single over the one store this pass is repairing. The name resolver takes
+	// the interface because the live path hands it a real set; here the pass is already
+	// scoped to one guild, so every lookup must land in that guild's corpus.
+	corpora storage.Corpora
 	store   *storage.Store
 	job     Job
 }
 
 func (l learner) Learn(m *discordgo.Message, guildID string) error {
-	mentioned := names.OfMessage(l.session, l.store, &discordgo.MessageCreate{Message: m}, guildID)
+	mentioned := names.OfMessage(l.session, l.corpora, &discordgo.MessageCreate{Message: m}, guildID)
 	author := names.Primary(m.Author, m.Member)
 
 	return l.store.Update(func(w *storage.Writer) error {
@@ -328,7 +352,7 @@ type cursors struct {
 	job   string
 }
 
-func (c cursors) Cursor(channelID string) (string, error) {
+func (c cursors) Cursor(_, channelID string) (string, error) {
 	var id string
 	err := c.store.View(func(r *storage.Reader) error {
 		id = r.RepairCursor(c.job, channelID)
@@ -337,7 +361,7 @@ func (c cursors) Cursor(channelID string) (string, error) {
 	return id, err
 }
 
-func (c cursors) SetCursor(channelID, messageID string) error {
+func (c cursors) SetCursor(_, channelID, messageID string) error {
 	return c.store.Update(func(w *storage.Writer) error {
 		return w.SetRepairCursor(c.job, channelID, messageID)
 	})

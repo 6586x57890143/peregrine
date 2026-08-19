@@ -61,12 +61,12 @@ type Guard interface {
 
 // Activity records where people are talking and who is around.
 type Activity interface {
-	Note(channelID, authorID string)
+	Note(guildID, channelID, authorID string)
 }
 
 // Aggro reacts to the current target's messages.
 type Aggro interface {
-	Handle(channelID, messageID, authorID string)
+	Handle(guildID, channelID, messageID, authorID string)
 }
 
 // Images remembers URLs and occasionally reposts one.
@@ -78,13 +78,13 @@ type Aggro interface {
 type Images interface {
 	Capture(channelID, messageID, authorID, content string, attachments []images.Attachment)
 	MaybeRepost(channelID string, addressed bool)
-	Forget(messageIDs ...string)
+	Forget(guildID string, messageIDs ...string)
 }
 
 // Games handles guesses and the bang commands.
 type Games interface {
-	Guess(channelID, messageID, content, authorID, displayName string) bool
-	Command(cmd, arg, channelID string, who games.Requester, names func(userID string) string) bool
+	Guess(guildID, channelID, messageID, content, authorID, displayName string) bool
+	Command(cmd, arg, guildID, channelID string, who games.Requester, names func(userID string) string) bool
 }
 
 // Voice queues a voice attachment for transcription and reports whether it took it.
@@ -142,7 +142,7 @@ type Options struct {
 // Service is the reactor.
 type Service struct {
 	session  *discordgo.Session
-	store    *storage.Store
+	corpora  storage.Corpora
 	gate     *safety.Gate
 	guard    Guard
 	learner  *learn.Learner
@@ -179,7 +179,7 @@ func (noRecorder) Count(string)             {}
 // fifteen-parameter constructor is a positional-argument bug waiting to happen.
 type Deps struct {
 	Session  *discordgo.Session
-	Store    *storage.Store
+	Corpora  storage.Corpora
 	Gate     *safety.Gate
 	Guard    Guard
 	Learner  *learn.Learner
@@ -210,7 +210,7 @@ func New(d Deps) *Service {
 		recorder = noRecorder{}
 	}
 	return &Service{
-		session: d.Session, store: d.Store, gate: d.Gate, guard: d.Guard,
+		session: d.Session, corpora: d.Corpora, gate: d.Gate, guard: d.Guard,
 		learner: d.Learner, speaker: d.Speaker, memories: d.Memories, emoji: d.Emoji,
 		activity: d.Activity, aggro: d.Aggro, images: d.Images, games: d.Games,
 		voice: d.Voice, recorder: recorder, members: d.Members, opts: d.Options,
@@ -293,7 +293,10 @@ func (s *Service) onDelete(_ *discordgo.Session, m *discordgo.MessageDelete) {
 	if m.ID == "" {
 		return
 	}
-	if !s.dispatcher.Submit(func(context.Context) { s.images.Forget(m.ID) }) {
+	// The guild rides along because the cache is per guild now: a deletion revokes an image
+	// in the server it was posted in and nowhere else.
+	guildID, id := m.GuildID, m.ID
+	if !s.dispatcher.Submit(func(context.Context) { s.images.Forget(guildID, id) }) {
 		log.Printf("[QUEUE] dropped a message deletion in %s: work queue full (%d dropped so far)",
 			m.ChannelID, s.dispatcher.Dropped())
 	}
@@ -307,7 +310,8 @@ func (s *Service) onBulkDelete(_ *discordgo.Session, m *discordgo.MessageDeleteB
 		return
 	}
 	ids := append([]string(nil), m.Messages...)
-	if !s.dispatcher.Submit(func(context.Context) { s.images.Forget(ids...) }) {
+	guildID := m.GuildID
+	if !s.dispatcher.Submit(func(context.Context) { s.images.Forget(guildID, ids...) }) {
 		log.Printf("[QUEUE] dropped a bulk deletion of %d messages in %s: work queue full (%d dropped so far)",
 			len(ids), m.ChannelID, s.dispatcher.Dropped())
 	}
@@ -388,7 +392,16 @@ func (s *Service) handle(m *discordgo.MessageCreate) {
 // mentions resolves the people in this message at most once.
 func (s *Service) mentions(r *reaction) []names.User {
 	if !r.mentionedSet {
-		r.mentioned = names.OfMessage(s.session, s.store, r.m, r.m.GuildID)
+		// A nil session is passed as a nil INTERFACE rather than as a typed nil pointer, which
+		// is the difference between names.Resolve skipping the member lookup and dereferencing
+		// nothing. Its guard reads `s != nil`, and an interface holding a nil *discordgo.Session
+		// is not nil. Unreachable in production, where there is always a session, and reachable
+		// in every test that hands this package one message from a guild.
+		var session names.Session
+		if s.session != nil {
+			session = s.session
+		}
+		r.mentioned = names.OfMessage(session, s.corpora, r.m, r.m.GuildID)
 		r.mentionedSet = true
 	}
 	return r.mentioned
@@ -421,7 +434,7 @@ func (s *Service) stepLearnGate(r *reaction) bool {
 // whether a channel has earned a word game, and who gets aggro, so counting spam would pull
 // it toward the place it should be ignoring.
 func (s *Service) stepActivity(r *reaction) bool {
-	s.activity.Note(r.m.ChannelID, r.m.Author.ID)
+	s.activity.Note(r.m.GuildID, r.m.ChannelID, r.m.Author.ID)
 
 	// The tuning export's denominator, recorded from the same place and after the same gate,
 	// so "did anyone say anything after the bot spoke" counts only traffic the corpus was
@@ -465,7 +478,7 @@ func (s *Service) stepWordGame(r *reaction) bool {
 	if r.m.Member != nil && r.m.Member.Nick != "" {
 		name = r.m.Member.Nick
 	}
-	s.games.Guess(r.m.ChannelID, r.m.ID, r.m.Content, r.m.Author.ID, name)
+	s.games.Guess(r.m.GuildID, r.m.ChannelID, r.m.ID, r.m.Content, r.m.Author.ID, name)
 	return false
 }
 
@@ -486,7 +499,7 @@ func (s *Service) stepCommands(r *reaction) bool {
 	// Counted by command, never by argument. A planted word is user text, and a usage tally
 	// carrying it would put arbitrary content into the tuning archive by a side door.
 	s.recorder.Count("command:" + cmd)
-	return s.games.Command(cmd, arg, r.m.ChannelID, s.requester(r), func(userID string) string {
+	return s.games.Command(cmd, arg, r.m.GuildID, r.m.ChannelID, s.requester(r), func(userID string) string {
 		return s.displayName(r.m.GuildID, userID)
 	})
 }
@@ -507,6 +520,12 @@ func (s *Service) requester(r *reaction) games.Requester {
 	who := games.Requester{UserID: r.m.Author.ID}
 	if r.m.GuildID == "" {
 		// A DM has no administrators. Nothing to resolve, and nothing this bot runs there.
+		return who
+	}
+	if s.session == nil || s.session.State == nil {
+		// No state cache is the same answer as a cache miss below: we could not tell, so the
+		// permissions stay zero and the check fails closed. It was unreachable while every
+		// test message was guildless, and M31 gave them guilds.
 		return who
 	}
 	perms, err := s.session.State.UserChannelPermissions(r.m.Author.ID, r.m.ChannelID)
@@ -656,7 +675,7 @@ func memberName(m *discordgo.Member) string {
 // Never consumes: a reaction is not an answer, and the target's message still gets learned
 // and possibly replied to, which is the point of aggro.
 func (s *Service) stepAggro(r *reaction) bool {
-	s.aggro.Handle(r.m.ChannelID, r.m.ID, r.m.Author.ID)
+	s.aggro.Handle(r.m.GuildID, r.m.ChannelID, r.m.ID, r.m.Author.ID)
 	return false
 }
 
@@ -816,6 +835,7 @@ func (s *Service) stepReply(r *reaction) bool {
 	var trace generate.Trace
 
 	reply, outcome, err := s.speaker.Sentence(generate.Request{
+		GuildID:      m.GuildID,
 		Prompt:       prompt,
 		Context:      context,
 		ContextNames: contextNames,
@@ -935,8 +955,14 @@ func (s *Service) selfLearn(r *reaction, replyID, replyContent string) {
 	// should be the freshest entry when the next message arrives.
 	s.memories.For(channelID).Add(replyContent, nil)
 
+	guildID := r.m.GuildID
 	go func() {
-		if err := s.store.Update(func(w *storage.Writer) error {
+		store, err := s.corpora.For(guildID)
+		if err != nil {
+			log.Printf("[WARN] self-learning skipped for reply %s in %s: %v", replyID, channelID, err)
+			return
+		}
+		if err := store.Update(func(w *storage.Writer) error {
 			return s.learner.Message(w, replyContent, replyID, botAsMention, mentioned)
 		}); err != nil {
 			log.Printf("[WARN] self-learning failed for reply %s in %s: %v", replyID, channelID, err)
@@ -952,8 +978,20 @@ func (s *Service) stepLearn(r *reaction) bool {
 	m := r.m
 	mentioned := s.mentions(r)
 
+	// The corpus this guild's text belongs in, resolved ONCE for the whole step.
+	//
+	// A message with no guild is a DM, and DMs are not learned: there is deliberately no
+	// shared corpus for them, because a fallback file is where every threading mistake would
+	// quietly drain. Said out loud rather than dropped, because a bot that silently learns
+	// nothing is the failure mode this repository keeps rediscovering.
+	store, err := s.corpora.For(m.GuildID)
+	if err != nil {
+		log.Printf("[LEARN] not learning message %s in %s: %v", m.ID, m.ChannelID, err)
+		return false
+	}
+
 	if len(mentioned) > 0 {
-		_ = s.store.Update(func(w *storage.Writer) error {
+		_ = store.Update(func(w *storage.Writer) error {
 			for _, user := range mentioned {
 				if _, err := names.Record(w, user.Name, user.UserID, user.Username); err != nil {
 					log.Printf("[WARN] Failed to learn name %q during extraction: %v", user.Name, err)
@@ -969,7 +1007,7 @@ func (s *Service) stepLearn(r *reaction) bool {
 	// backfill did not, so every backfilled message learned no associations at all.
 	author := names.Primary(m.Author, m.Member)
 
-	if err := s.store.Update(func(w *storage.Writer) error {
+	if err := store.Update(func(w *storage.Writer) error {
 		return s.learner.Message(w, m.Content, m.ID, author, mentioned)
 	}); err != nil {
 		log.Printf("[WARN] learning message %s failed: %v", m.ID, err)

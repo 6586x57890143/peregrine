@@ -97,7 +97,7 @@ type memCursors struct {
 
 func newCursors() *memCursors { return &memCursors{m: map[string]string{}} }
 
-func (c *memCursors) Cursor(channelID string) (string, error) {
+func (c *memCursors) Cursor(_, channelID string) (string, error) {
 	if c.readErr != nil {
 		return "", c.readErr
 	}
@@ -106,7 +106,7 @@ func (c *memCursors) Cursor(channelID string) (string, error) {
 	return c.m[channelID], nil
 }
 
-func (c *memCursors) SetCursor(channelID, messageID string) error {
+func (c *memCursors) SetCursor(_, channelID, messageID string) error {
 	if c.writeErr != nil {
 		return c.writeErr
 	}
@@ -409,7 +409,7 @@ func TestTheCursorAdvancesPastBotMessagesToo(t *testing.T) {
 		t.Errorf("skipped %d, want 2", st.Skipped)
 	}
 
-	got, _ := c.Cursor("c1")
+	got, _ := c.Cursor("g1", "c1")
 	if got == "" {
 		t.Fatal("the cursor did not advance past a page of bot messages, so they will be " +
 			"re-requested on every pass forever")
@@ -430,13 +430,13 @@ func TestTheCursorAdvancesPastBotMessagesToo(t *testing.T) {
 // route.
 func TestCursorNeverGoesBackwards(t *testing.T) {
 	c := newCursors()
-	if err := c.SetCursor("c1", "2000"); err != nil {
+	if err := c.SetCursor("g1", "c1", "2000"); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.SetCursor("c1", "1000"); err != nil {
+	if err := c.SetCursor("g1", "c1", "1000"); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := c.Cursor("c1"); got != "2000" {
+	if got, _ := c.Cursor("g1", "c1"); got != "2000" {
 		t.Errorf("cursor moved backwards to %q", got)
 	}
 }

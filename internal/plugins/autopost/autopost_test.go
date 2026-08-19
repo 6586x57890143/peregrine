@@ -65,9 +65,9 @@ func fixture(t *testing.T, o Options, traffic map[string]int) (*Service, *fakeGu
 	tracker := activity.New(activity.Options{})
 	chans := fakeChannels{}
 	for id, n := range traffic {
-		chans[id] = channels.Info{ID: id, Name: id, Text: true}
+		chans[id] = channels.Info{ID: id, Name: id, Text: true, GuildID: "111"}
 		for range n {
-			tracker.Note(id, snowflake(42))
+			tracker.Note("111", id, snowflake(42))
 		}
 	}
 

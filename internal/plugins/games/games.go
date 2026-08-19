@@ -18,7 +18,6 @@ package games
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -114,29 +113,25 @@ type Options struct {
 
 // Service is the feature.
 type Service struct {
-	store    *storage.Store
+	// corpora is the SET, because a weekly board and a set of word-game settings belong to
+	// one server: two guilds sharing a leaderboard means people competing with strangers they
+	// cannot see, and M30's settings command would have let an admin in one server rebind
+	// another server's channels.
+	corpora  *storage.Set
 	guard    Guard
 	manager  *wordgame.Manager
 	counter  channels.Counter
 	resolver channels.Resolver
 	opts     Options
 
-	board *wordgame.Leaderboard
-
 	loops       sync.WaitGroup
 	cancelLoops context.CancelFunc
 	logger      *slog.Logger
 
-	// The runtime dials, in settings.go: where puzzles may run, activity or interval, and how
-	// often. Options seeds them and /wordgame-config owns them from then on, which is why they
-	// are behind a mutex: the sweep reads them on a ticker and an interaction writes them.
-	mu  sync.RWMutex
-	set settings
-
-	// lastInterval is when interval mode last posted. It is here rather than in settings
-	// because it is not a setting: persisting it would mean a restart owing a puzzle for time
-	// the bot was not running.
-	lastInterval time.Time
+	// The per-guild boards, settings and interval clocks, in state.go. Behind a mutex because
+	// the sweep reads them on a ticker and an interaction writes them.
+	mu     sync.Mutex
+	guilds map[string]*guildState
 
 	// The slash command's two dependencies, both filled in by Init from core.Deps. Nil in
 	// tests that do not exercise it, which every path here tolerates: a service that needed a
@@ -146,11 +141,12 @@ type Service struct {
 }
 
 // New builds the service.
-func New(store *storage.Store, guard Guard, manager *wordgame.Manager,
+func New(corpora *storage.Set, guard Guard, manager *wordgame.Manager,
 	counter channels.Counter, resolver channels.Resolver, opts Options) *Service {
 	return &Service{
-		store: store, guard: guard, manager: manager,
+		corpora: corpora, guard: guard, manager: manager,
 		counter: counter, resolver: resolver, opts: opts,
+		guilds: map[string]*guildState{},
 	}
 }
 
@@ -174,41 +170,16 @@ func (s *Service) Init(deps core.Deps) error {
 		s.session.AddHandler(s.onInteraction)
 	}
 
-	s.loadSettings()
-
-	if err := s.store.View(func(r *storage.Reader) error {
-		v, err := r.GetBlob(storage.BlobLeaderboard, "current")
-		if err != nil {
-			return err
+	// Warmed for the guilds that already have a corpus, and lazily loaded for any that turn
+	// up later. Init runs before the gateway is open, so this list is what is on disk rather
+	// than what the bot is currently in, which is the right list anyway: a guild with no
+	// corpus has no board to load.
+	for _, guildID := range s.corpora.Guilds() {
+		if _, err := s.state(guildID); err != nil {
+			log.Printf("[WARN] Failed to load word-game state for guild %s: %v", guildID, err)
 		}
-		if v == nil {
-			s.board = wordgame.NewLeaderboard(time.Now())
-			return nil
-		}
-		var board wordgame.Leaderboard
-		if err := json.Unmarshal(v, &board); err != nil {
-			return err
-		}
-		s.board = &board
-		return nil
-	}); err != nil {
-		log.Printf("[WARN] Failed to load the leaderboard, starting fresh: %v", err)
-		s.board = wordgame.NewLeaderboard(time.Now())
-		return nil
 	}
-	// A board written before points existed ranks everybody at zero, which would show an empty
-	// leaderboard to a server that has been playing all week. Converting on load is the one
-	// moment the number is knowable and the board is not yet being read.
-	//
-	// Here rather than in internal/wordgame because PointsBase is configuration and that
-	// package reads none, which is the same reason ScanTopics leaves its filters to health.
-	if converted := s.board.BackfillPoints(s.opts.PointsBase); converted > 0 {
-		log.Printf("[LEADERBOARD] Converted %d entries from wins to points at %d each. This "+
-			"happens once, on the first load after the hint ladder shipped.",
-			converted, s.opts.PointsBase)
-	}
-
-	log.Println("[INFO] Leaderboard loaded.")
+	log.Println("[INFO] Leaderboards loaded.")
 	return nil
 }
 
@@ -229,9 +200,6 @@ func (s *Service) Start(ctx context.Context) error {
 	}}
 
 	if s.opts.Enabled {
-		s.mu.Lock()
-		s.lastInterval = time.Now()
-		s.mu.Unlock()
 		loops = append(loops, core.Loop{
 			Name:  "wordgame-sweep",
 			Every: s.opts.SweepTick,
@@ -275,12 +243,22 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		log.Println("[WARN] Word-game loops still running at the shutdown deadline.")
 	}
 
-	if s.board != nil {
-		if err := s.save(); err != nil {
-			return fmt.Errorf("save leaderboard: %w", err)
+	// Every loaded board, and a failure on one does not skip the rest: each is a week of wins
+	// that is not re-derivable from anything.
+	s.mu.Lock()
+	loaded := make([]string, 0, len(s.guilds))
+	for guildID := range s.guilds {
+		loaded = append(loaded, guildID)
+	}
+	s.mu.Unlock()
+
+	var firstErr error
+	for _, guildID := range loaded {
+		if err := s.saveBoard(guildID); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("save leaderboard for guild %s: %w", guildID, err)
 		}
 	}
-	return nil
+	return firstErr
 }
 
 // Guess handles a message that might solve the live puzzle, and reports whether it did.
@@ -289,7 +267,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 // is a real word a real person typed in conversation, and the deletion below is cleanup of a
 // puzzle exchange rather than a judgement about the content. Consuming it would stop the bot
 // learning from a legitimate message because of a housekeeping decision (SPEC.md section 10).
-func (s *Service) Guess(channelID, messageID, content, authorID, displayName string) bool {
+func (s *Service) Guess(guildID, channelID, messageID, content, authorID, displayName string) bool {
 	if !s.opts.Enabled || !s.manager.Available() {
 		return false
 	}
@@ -298,7 +276,7 @@ func (s *Service) Guess(channelID, messageID, content, authorID, displayName str
 	if !solved {
 		// No win. Start a game if the channel has earned one. The Manager asks the shared
 		// activity tracker how busy the channel has been rather than counting for itself.
-		if s.allowed(channelID) && s.manager.MaybeStart(channelID) {
+		if s.allowed(guildID, channelID) && s.manager.MaybeStart(channelID) {
 			s.start(channelID)
 		}
 		return false
@@ -320,14 +298,22 @@ func (s *Service) Guess(channelID, messageID, content, authorID, displayName str
 	// A gauntlet win is an ORDINARY win and is worth exactly what the same puzzle would have
 	// been worth on its own. A second scoring economy for runs would mean two ways to reach one
 	// leaderboard and a reason to argue about which was the real one.
-	s.board.AddWin(authorID, displayName, solveTime, points)
+	board := s.board(guildID)
+	if board == nil {
+		// No corpus for this guild means no board to score into. The puzzle was still solved
+		// and still announced, which is the right order of priorities: the game is the point
+		// and the tally is the record of it.
+		log.Printf("[WORDGAME] A win in guild %s could not be scored: no corpus.", guildID)
+		return true
+	}
+	board.AddWin(authorID, displayName, solveTime, points)
 	if won.Rounds > 0 {
 		// Asked of the GAME rather than of the Manager, because StartWord deletes the queue when
 		// the last round starts: a gauntlet is already "not running" by the time its final
 		// puzzle is solved, so anything gating on that would drop the win closing every run.
 		s.manager.RecordRunWin(channelID, authorID, displayName, points)
 	}
-	if err := s.save(); err != nil {
+	if err := s.saveBoard(guildID); err != nil {
 		log.Printf("[WORDGAME] failed to persist a win: %v", err)
 	}
 
@@ -358,13 +344,13 @@ func (s *Service) finishRun(channelID string, rounds int) {
 //
 // The caller decides what recognition means for the message; here it only means the command
 // ran, or was refused for a reason the operator can see.
-func (s *Service) Command(cmd, arg, channelID string, who Requester, names func(userID string) string) bool {
+func (s *Service) Command(cmd, arg, guildID, channelID string, who Requester, names func(userID string) string) bool {
 	switch cmd {
 	case "!leaderboard":
 		// The author's ID reaches the board, which is what makes the eleventh slot possible:
 		// showing somebody their own rank requires knowing which of the rows is theirs, and
 		// the only thing that identifies them is their ID.
-		s.postLeaderboard(channelID, who.UserID, names)
+		s.postLeaderboard(guildID, channelID, who.UserID, names)
 		return true
 	case "!wordgame":
 		// Only a command when word games are available at all. With the feature off it is
@@ -373,7 +359,7 @@ func (s *Service) Command(cmd, arg, channelID string, who Requester, names func(
 		if !s.opts.Enabled || !s.manager.Available() {
 			return false
 		}
-		s.startOnRequest(channelID, who, arg)
+		s.startOnRequest(guildID, channelID, who, arg)
 		return true
 	}
 	return false
@@ -529,7 +515,7 @@ func (s *Service) startGauntlet(channelID string, n int) {
 // It stays silent IN THE CHANNEL, which is a different decision from staying silent in the
 // log. Answering a non-admin advertises that the command exists and that they are not allowed
 // to use it, which is an invitation. The message is still consumed either way.
-func (s *Service) startOnRequest(channelID string, who Requester, arg string) {
+func (s *Service) startOnRequest(guildID, channelID string, who Requester, arg string) {
 	if !s.Authorized(who) {
 		if s.opts.AdminUserID == "" {
 			log.Printf("[WORDGAME] !wordgame in %s was refused because "+
@@ -543,7 +529,7 @@ func (s *Service) startOnRequest(channelID string, who Requester, arg string) {
 		return
 	}
 
-	if !s.allowed(channelID) {
+	if !s.allowed(guildID, channelID) {
 		// Answered, unlike the authorization refusal above: this caller IS an admin, so
 		// there is nothing to hide from them and a command that silently does nothing is
 		// the failure mode that refusal comment is about.
@@ -606,28 +592,46 @@ func (s *Service) startOnRequest(channelID string, who Requester, arg string) {
 // The elapsed check is under the lock with the timestamp write, so two sweeps cannot both decide
 // the same period is over.
 func (s *Service) maybeInterval() {
-	s.mu.Lock()
-	if s.set.Mode != ModeInterval || time.Since(s.lastInterval) < s.set.Interval {
+	for _, guildID := range s.corpora.Guilds() {
+		st, err := s.state(guildID)
+		if err != nil {
+			continue
+		}
+
+		s.mu.Lock()
+		// A guild whose clock has never been set starts it now rather than owing a puzzle
+		// immediately: the first interval is measured from when the bot came up, not from the
+		// zero time.
+		if st.lastInterval.IsZero() {
+			st.lastInterval = time.Now()
+		}
+		due := st.set.Mode == ModeInterval && time.Since(st.lastInterval) >= st.set.Interval
+		if due {
+			st.lastInterval = time.Now()
+		}
 		s.mu.Unlock()
-		return
+
+		if due {
+			s.startInterval(guildID)
+		}
 	}
-	s.lastInterval = time.Now()
-	s.mu.Unlock()
-	s.startInterval()
 }
 
 // startInterval posts a puzzle on a timer, in interval mode.
 //
 // It picks the busiest channel the bot can see, for the same reason the activity trigger
 // exists at all: a puzzle in a dead channel is the bot talking to itself.
-func (s *Service) startInterval() {
+func (s *Service) startInterval(guildID string) {
 	if !s.manager.Available() {
 		return
 	}
+	// Restricted to this guild, because the settings that decided to post are this guild's:
+	// picking the busiest channel bot-wide would post one server's scheduled puzzle into
+	// another server, on a schedule that server never set.
 	channelID := channels.Busiest(s.counter, s.resolver, s.opts.ActiveChannelWindow,
-		s.snapshot().Channels)
+		s.snapshot(guildID).Channels, guildID)
 	if channelID == "" {
-		log.Println("[WORDGAME] No active channel found for an interval game.")
+		log.Printf("[WORDGAME] No active channel found for an interval game in guild %s.", guildID)
 		return
 	}
 	s.start(channelID)
@@ -704,13 +708,20 @@ func (s *Service) sweep() {
 // Comparing week boundaries CATCHES UP: a bot that was off all Monday resets on its first
 // tick back, because the week it holds is still the old one.
 func (s *Service) maybeReset() {
-	if s.board == nil || !s.board.MaybeReset(time.Now()) {
-		return
-	}
-	log.Printf("[LEADERBOARD] New week starting %s, leaderboard reset.",
-		s.board.WeekStart().Format(time.DateOnly))
-	if err := s.save(); err != nil {
-		log.Printf("[ERR] Failed to persist the leaderboard reset: %v", err)
+	// Every guild, because each holds its own board and the week turns for all of them at
+	// once. A guild whose corpus cannot be reached is skipped rather than failing the tick:
+	// the other boards still need resetting.
+	for _, guildID := range s.corpora.Guilds() {
+		board := s.board(guildID)
+		if board == nil || !board.MaybeReset(time.Now()) {
+			continue
+		}
+		log.Printf("[LEADERBOARD] New week starting %s, leaderboard reset for guild %s.",
+			board.WeekStart().Format(time.DateOnly), guildID)
+		if err := s.saveBoard(guildID); err != nil {
+			log.Printf("[ERR] Failed to persist the leaderboard reset for guild %s: %v",
+				guildID, err)
+		}
 	}
 }
 
@@ -719,9 +730,20 @@ func (s *Service) maybeReset() {
 // Deliberately NOT gated on the feature flag. The chat half reads the stats bucket, which is
 // populated on every message regardless of whether the scramble game runs, so the command is
 // useful with word games off.
-func (s *Service) postLeaderboard(channelID, viewerID string, names func(userID string) string) {
+func (s *Service) postLeaderboard(guildID, channelID, viewerID string, names func(userID string) string) {
+	board := s.board(guildID)
+	store, err := s.corpora.For(guildID)
+	if board == nil || err != nil {
+		// THIS server's board, from THIS server's corpus. A leaderboard merged across guilds
+		// would rank people against strangers whose messages they cannot see, which is the
+		// same leak as generating one server's text into another, wearing a scoreboard.
+		log.Printf("[LEADERBOARD] no corpus for guild %s: %v", guildID, err)
+		s.guard.Send(channelID, "could not build the leaderboard")
+		return
+	}
+
 	var chatScores map[string]int
-	if err := s.store.View(func(r *storage.Reader) error {
+	if err := store.View(func(r *storage.Reader) error {
 		var err error
 		chatScores, err = weeklyScores(r)
 		return err
@@ -745,7 +767,7 @@ func (s *Service) postLeaderboard(channelID, viewerID string, names func(userID 
 	// It also fixes a real defect rather than only the speed: the old code keyed the board by
 	// resolved NAME, so two people with the same nickname merged into one row.
 	now := time.Now()
-	wins := wordgame.Rank(s.board.Scores(), viewerID, leaderboardRows)
+	wins := wordgame.Rank(board.Scores(), viewerID, leaderboardRows)
 	chat := wordgame.Rank(chatScores, viewerID, leaderboardRows)
 
 	// Memoized across BOTH boards, so somebody who is on the word-game board and the chat
@@ -756,9 +778,9 @@ func (s *Service) postLeaderboard(channelID, viewerID string, names func(userID 
 
 	// The footer's two record holders go through the SAME memoized resolver, so a record held
 	// by somebody already on a board costs nothing extra. That is at most two more lookups.
-	footer := leaderboardFooter(s.board, wins, chat, resolve)
+	footer := leaderboardFooter(board, wins, chat, resolve)
 
-	embed := leaderboardEmbed(wins, chat, s.board.NextReset(now), footer)
+	embed := leaderboardEmbed(wins, chat, board.NextReset(now), footer)
 	if _, ok := s.guard.SendEmbed(channelID, embed); !ok {
 		// The guard has already logged whether this was a refusal or a failure. Said here as
 		// well because a command that produced nothing is a question the operator will be
@@ -801,23 +823,6 @@ func weeklyScores(r *storage.Reader) (map[string]int, error) {
 		}
 	}
 	return scores, nil
-}
-
-// save persists the board.
-//
-// json.Marshal is safe to call concurrently with AddWin, because Leaderboard implements
-// MarshalJSON and takes its own lock. It was NOT safe before M11a: the mutex was an exported
-// field of the marshalled struct and the marshalling ran outside it, so a win landing during
-// a save was a concurrent map read and write, which in Go is a fatal runtime error rather
-// than a recoverable panic.
-func (s *Service) save() error {
-	encoded, err := json.Marshal(s.board)
-	if err != nil {
-		return err
-	}
-	return s.store.Update(func(w *storage.Writer) error {
-		return w.PutBlob(storage.BlobLeaderboard, "current", encoded)
-	})
 }
 
 // gauntletArg reads "!wordgame 5" and reports the count.

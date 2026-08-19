@@ -32,8 +32,8 @@ func (t fixedTopic) TopTopicWord() string { return string(t) }
 
 func presenceFixture(t *testing.T, d Deps, p PresenceOptions) *Service {
 	t.Helper()
-	if d.Store == nil {
-		d.Store = dbtest.Store(t)
+	if d.Corpora == nil {
+		d.Corpora = dbtest.Set(t)
 	}
 	if d.Queue == nil {
 		d.Queue = &fakeQueue{}
@@ -182,7 +182,8 @@ func TestPresenceDisabledSetsNothing(t *testing.T) {
 // The topic source must not return a stop word, a short token, or something said twice. Any of
 // those in a public status line reads as the bot quoting noise.
 func TestTheCorpusTopicSourceFiltersWhatItOffers(t *testing.T) {
-	store := dbtest.Store(t)
+	set := dbtest.Set(t)
+	store := dbtest.Guild(t, set, "111")
 
 	if err := store.Update(func(w *storage.Writer) error {
 		// A stop word said constantly, a short token said constantly, a rare real word, and
@@ -203,7 +204,7 @@ func TestTheCorpusTopicSourceFiltersWhatItOffers(t *testing.T) {
 		t.Fatalf("seeding: %v", err)
 	}
 
-	topics := CorpusTopics(store)
+	topics := CorpusTopics(set)
 
 	// Enough draws to visit the whole (tiny) vocabulary from several random starting letters.
 	got := map[string]int{}

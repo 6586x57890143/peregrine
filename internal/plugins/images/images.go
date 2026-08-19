@@ -70,37 +70,35 @@ type Options struct {
 
 // Service is the feature.
 type Service struct {
-	store    *storage.Store
+	corpora  storage.Corpora
 	guard    Guard
 	channels channels.Resolver
 	opts     Options
 
+	// recent is the repostable cache, PER GUILD as of M31.
+	//
+	// It used to be one flat slice fed from one corpus, which made this the purest
+	// cross-guild leak in the bot: an image posted in one server was a repost candidate in
+	// another, and unlike the text paths it did not even need a corpus read to happen. The
+	// map is keyed by guild, which is bounded by the same cap the corpora are.
 	mu     sync.Mutex
-	recent []string
+	recent map[string][]string
 }
 
 // New builds the service.
-func New(store *storage.Store, guard Guard, channels channels.Resolver, opts Options) *Service {
-	return &Service{store: store, guard: guard, channels: channels, opts: opts}
+func New(corpora storage.Corpora, guard Guard, channels channels.Resolver, opts Options) *Service {
+	return &Service{
+		corpora: corpora, guard: guard, channels: channels, opts: opts,
+		recent: map[string][]string{},
+	}
 }
 
 func (s *Service) Name() string { return "images" }
 
-// Init loads the cache from the corpus.
-func (s *Service) Init(core.Deps) error {
-	var urls []string
-	if err := s.store.View(func(r *storage.Reader) error {
-		var err error
-		urls, err = r.ImageURLs()
-		return err
-	}); err != nil {
-		log.Printf("[ERR] Failed to load image URLs from the corpus: %v", err)
-		return nil
-	}
-	s.set(urls)
-	log.Printf("[INFO] Loaded %d image URLs from the corpus.", len(urls))
-	return nil
-}
+// Init no longer preloads, and that is a consequence of per-guild corpora rather than a
+// feature: Init runs before the gateway is open, so there is no guild list to load caches for.
+// Each guild's cache is filled by its first capture, which costs one delayed repost at most.
+func (s *Service) Init(core.Deps) error { return nil }
 
 // Start does nothing: this feature has no background work. The three sleeping goroutines
 // per game that the word games needed are not a pattern to copy.
@@ -153,8 +151,14 @@ func (s *Service) Capture(channelID, messageID, authorID, content string, attach
 	// NOT holding the mutex across this. It used to wrap the whole function including the
 	// write transaction, so one goroutine's bbolt write (which serializes against every
 	// other write in the process) also blocked every other capture from reading the slice.
+	store, err := s.corpora.For(ch.GuildID)
+	if err != nil {
+		log.Printf("[WARN] not caching an image from channel %s: %v", channelID, err)
+		return
+	}
+
 	var urls []string
-	if err := s.store.Update(func(w *storage.Writer) error {
+	if err := store.Update(func(w *storage.Writer) error {
 		if err := w.AddImageURL(chosen, messageID, authorID, s.opts.CacheSize, s.opts.MaxPerAuthor); err != nil {
 			return fmt.Errorf("save image URL: %w", err)
 		}
@@ -168,8 +172,8 @@ func (s *Service) Capture(channelID, messageID, authorID, content string, attach
 
 	// Updated ONLY after the write succeeded, so the two cannot disagree about what is
 	// repostable.
-	s.set(urls)
-	log.Printf("[IMG] Captured URL: %s, cache size: %d", chosen, len(urls))
+	s.set(ch.GuildID, urls)
+	log.Printf("[IMG] Captured URL for guild %s: %s, cache size: %d", ch.GuildID, chosen, len(urls))
 }
 
 // Attachment is the part of a Discord attachment this package reads.
@@ -201,10 +205,13 @@ func (s *Service) MaybeRepost(channelID string, addressed bool) {
 		return
 	}
 
+	// THIS GUILD'S images only. Before M31 the pool was every server the bot is in, so an
+	// image posted in one server could be republished in another, by the bot, under its own
+	// name: SPEC.md section 4 A7 with the blast radius widened to somebody else's server.
 	s.mu.Lock()
 	var url string
-	if len(s.recent) > 0 {
-		url = s.recent[rand.IntN(len(s.recent))]
+	if pool := s.recent[ch.GuildID]; len(pool) > 0 {
+		url = pool[rand.IntN(len(pool))]
 	}
 	s.mu.Unlock() // released before the send
 
@@ -227,10 +234,17 @@ func (s *Service) MaybeRepost(channelID string, addressed bool) {
 //
 // It is deliberately silent about IDs it does not hold, which is almost all of them: every
 // message deletion in every channel the bot can see arrives here.
-func (s *Service) Forget(messageIDs ...string) {
+func (s *Service) Forget(guildID string, messageIDs ...string) {
+	store, err := s.corpora.For(guildID)
+	if err != nil {
+		// A deletion in a guild with no corpus revokes nothing because nothing was ever
+		// cached from it. Quiet on purpose: every deletion the bot can see arrives here.
+		return
+	}
+
 	removed := 0
 	var urls []string
-	if err := s.store.Update(func(w *storage.Writer) error {
+	if err := store.Update(func(w *storage.Writer) error {
 		for _, id := range messageIDs {
 			n, err := w.DeleteImagesByMessage(id)
 			if err != nil {
@@ -252,19 +266,27 @@ func (s *Service) Forget(messageIDs ...string) {
 		return
 	}
 
-	s.set(urls)
+	s.set(guildID, urls)
 	log.Printf("[IMG] Dropped %d cached URL(s) whose source message was deleted.", removed)
 }
 
-// Cached reports how many URLs are held, for the status line and for tests.
+// Cached reports how many URLs are held across every guild, for the status line and for tests.
 func (s *Service) Cached() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.recent)
+	total := 0
+	for _, urls := range s.recent {
+		total += len(urls)
+	}
+	return total
 }
 
-func (s *Service) set(urls []string) {
+func (s *Service) set(guildID string, urls []string) {
 	s.mu.Lock()
-	s.recent = urls
+	if len(urls) == 0 {
+		delete(s.recent, guildID)
+	} else {
+		s.recent[guildID] = urls
+	}
 	s.mu.Unlock()
 }

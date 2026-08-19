@@ -248,7 +248,7 @@ func TestOfMessageDegradesToMentionsWhenTheCorpusIsUnreadable(t *testing.T) {
 		Mentions: []*discordgo.User{{ID: snowflake(1), Username: "alice"}},
 	}}
 
-	got := names.OfMessage(sess, s, m, "g1")
+	got := names.OfMessage(sess, storage.Single(s), m, "g1")
 	if len(got) != 1 || got[0].Name != "alice" {
 		t.Errorf("OfMessage = %+v, want the @mentions alone", got)
 	}
