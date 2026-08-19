@@ -194,3 +194,50 @@ func TestTheStateResolverReadsTheCache(t *testing.T) {
 		t.Errorf("info = %+v, want the cached channel's name, type and NSFW flag", info)
 	}
 }
+
+// TestAnAllowlistIsReadPerGuild, M31b.
+//
+// The lists that say where the bot may speak unprompted are flat sets of channel IDs, written
+// when the bot was in one server. Read as a flat set they refuse every channel in every other
+// server, which is how binding word games to one channel in one guild turned them off in all the
+// rest. A list is a statement about the guilds it names.
+func TestAnAllowlistIsReadPerGuild(t *testing.T) {
+	res := fakeResolver{
+		"a1": {ID: "a1", Name: "general", Text: true, GuildID: "111"},
+		"a2": {ID: "a2", Name: "spam", Text: true, GuildID: "111"},
+		"b1": {ID: "b1", Name: "general", Text: true, GuildID: "222"},
+	}
+	allow := []string{"a1"} // one channel, in guild 111 only
+
+	if !channels.Allows(res, allow, "111", "a1") {
+		t.Error("the listed channel was refused in its own guild")
+	}
+	if channels.Allows(res, allow, "111", "a2") {
+		t.Error("an unlisted channel in a guild the list NAMES was allowed, so the list restricts nothing")
+	}
+	if !channels.Allows(res, allow, "222", "b1") {
+		t.Error("a channel in a guild the list says nothing about was refused, which is the bug: " +
+			"one guild's list silenced every other guild")
+	}
+	if !channels.Allows(res, nil, "111", "a2") {
+		t.Error("an empty list restricted something; empty has always meant anywhere")
+	}
+}
+
+// TestBusiestReadsItsAllowlistPerGuildToo, since interval-mode word games and the autonomous
+// poster both choose through it and would otherwise never speak in a guild the list omits.
+func TestBusiestReadsItsAllowlistPerGuildToo(t *testing.T) {
+	tr := activity.New(activity.Options{})
+	for i := 0; i < 5; i++ {
+		tr.Note("222", "b1", "someone")
+	}
+	res := fakeResolver{
+		"a1": {ID: "a1", Name: "general", Text: true, GuildID: "111"},
+		"b1": {ID: "b1", Name: "general", Text: true, GuildID: "222"},
+	}
+
+	if got := channels.Busiest(tr, res, time.Hour, []string{"a1"}, ""); got != "b1" {
+		t.Errorf("Busiest = %q, want b1: the allowlist names a channel in another guild, so it "+
+			"says nothing about this one", got)
+	}
+}

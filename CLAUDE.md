@@ -164,6 +164,26 @@ reopens the corpus it wanted, creating a file and taking a flock nothing alive w
 learning is the path that does this, and a test failing to delete its own temp directory is how it
 was found.
 
+**A CHANNEL ALLOWLIST IS READ PER GUILD, and that is `channels.Allows`.** The lists saying where
+the bot may speak unprompted are flat sets of channel IDs in the environment, written when the bot
+was in one server. Read as a flat set they refuse every channel in every OTHER server, so binding
+word games to one channel in one guild silently turned them off everywhere else: settings being
+per guild was not enough, because the SEED was one global list. A list is a statement about the
+guilds it names. It restricts those and says nothing about the rest, which is the reading an empty
+list has always had. Two fallbacks are deliberate: a list that resolves to no guild at all reverts
+to plain membership, because an unresolvable list is a cold state cache or a stale ID and treating
+either as "no opinion" would quietly UNBIND a live setting; and a blank entry, which is what a
+trailing comma in `.env` produces, is skipped rather than matched.
+
+**What is per guild, and what is deliberately not.** Per guild: the corpus, the weekly
+leaderboard, the word-game settings, aggro's target, the image repost pool, ingest and repair
+cursors, repair state and boundaries, and backup families. Process-wide on purpose: the safety
+gate and its blocklist, `PAUSE_ALL_WRITES`, the guard's ignore list (channel IDs are unique, so it
+is already per channel), the dispatcher, and the presence line, because an incident is bot-wide
+and there is only one presence. A dial that turns out to want a per-guild answer follows
+`/wordgame-config`'s pattern: a blob in that guild's corpus, seeded from the environment, with a
+command that owns it afterwards.
+
 **`PEREGRINE_DB_PATH` is a DIRECTORY of `<guild id>.db` files and kept its name on purpose.** The
 rule is rescale-and-refuse over rename: a rename would let an existing `/data/markov.db` silently
 stop being read, so a value naming a file is a startup error that names the new shape. There is no
