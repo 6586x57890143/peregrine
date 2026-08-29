@@ -508,6 +508,12 @@ func (s *Service) stepCommands(r *reaction) bool {
 // authorization this command had before M25 rather than to none.
 func (s *Service) requester(r *reaction) games.Requester {
 	who := games.Requester{UserID: r.m.Author.ID}
+	if r.m.Member != nil {
+		// Roles are for games.MayStart's grant list, and MESSAGE_CREATE carries them for a
+		// guild message, so this needs no lookup either. A nil Member is a DM or a fixture,
+		// and an empty role list fails closed the same way zero permissions do.
+		who.Roles = r.m.Member.Roles
+	}
 	if r.m.GuildID == "" {
 		// A DM has no administrators. Nothing to resolve, and nothing this bot runs there.
 		return who

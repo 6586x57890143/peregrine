@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"slices"
 	"strings"
 	"time"
 
@@ -35,6 +36,22 @@ type settings struct {
 
 	Mode     Mode          `json:"mode"`
 	Interval time.Duration `json:"interval"`
+
+	// StarterRoles and StarterUsers are who may start a game besides an administrator. Empty
+	// means administrators only, which is what every guild had before this existed, so an
+	// omitted field is the old behaviour rather than a hole.
+	//
+	// Two slices rather than one mixed list of snowflakes, because rendering needs to know
+	// which it is: <@&id> and <@id> are different markup and a wrong guess prints something
+	// nobody can act on. omitempty for the reason the leaderboard's streak fields have it, an
+	// older blob loads with zero values rather than being refused.
+	//
+	// There is deliberately no environment variable seeding these. A grant names a role or a
+	// person in ONE guild, which is exactly what PEREGRINE_WORDGAME_CHANNELS being a flat
+	// global list turned out to get wrong (M31b), and unlike a channel binding there is no
+	// single-guild deployment whose .env already holds the answer.
+	StarterRoles []string `json:"starterRoles,omitempty"`
+	StarterUsers []string `json:"starterUsers,omitempty"`
 }
 
 // settingsKey is the blob. One key rather than three, so a change is one write and cannot land
@@ -117,10 +134,70 @@ func (s settings) String() string {
 		}
 		where = strings.Join(ids, " ")
 	}
+	mode := "activity mode"
 	if s.Mode == ModeInterval {
-		return fmt.Sprintf("interval mode every %s, in %s", s.Interval, where)
+		mode = fmt.Sprintf("interval mode every %s", s.Interval)
 	}
-	return fmt.Sprintf("activity mode, in %s", where)
+	return fmt.Sprintf("%s, in %s, %s", mode, where, s.starters())
+}
+
+// starters renders the grant list, which is the only part of these settings that is about
+// people rather than about the bot.
+//
+// Mentions rather than names, for the reason the channel list uses them: Discord renders them
+// as links, the guard's AllowedMentions means they cannot notify anybody, and the alternative
+// is a resolver lookup per entry for a line nobody reads twice.
+func (s settings) starters() string {
+	if len(s.StarterRoles)+len(s.StarterUsers) == 0 {
+		// Said out loud rather than omitted, because "administrators only" is the state an
+		// operator is most likely to be checking for and a missing line reads as unknown.
+		return "started by administrators only"
+	}
+	who := make([]string, 0, len(s.StarterRoles)+len(s.StarterUsers))
+	for _, id := range s.StarterRoles {
+		who = append(who, "<@&"+id+">")
+	}
+	for _, id := range s.StarterUsers {
+		who = append(who, "<@"+id+">")
+	}
+	return "started by administrators plus " + strings.Join(who, " ")
+}
+
+// mention is one target of a grant: a snowflake, and which of the two kinds of thing it names.
+//
+// The kind is carried rather than derived, because role and user snowflakes come from the same
+// space and nothing about an ID says which it is. Discord ships the answer in an interaction's
+// resolved data and this is where it is kept.
+type mention struct {
+	id     string
+	isRole bool
+}
+
+// String is the markup Discord renders as a link. It never notifies anybody: the guard sets
+// AllowedMentions explicitly on every send.
+func (m mention) String() string {
+	if m.isRole {
+		return "<@&" + m.id + ">"
+	}
+	return "<@" + m.id + ">"
+}
+
+// grant adds or removes one role or member from the list MayStart reads.
+//
+// Idempotent in both directions, so an operator granting somebody twice gets the same list and
+// the same answer rather than a duplicate entry and a board that is subtly different.
+func (s *settings) grant(m mention, allow bool) {
+	list := &s.StarterUsers
+	if m.isRole {
+		list = &s.StarterRoles
+	}
+	if !allow {
+		*list = slices.DeleteFunc(*list, func(id string) bool { return id == m.id })
+		return
+	}
+	if !slices.Contains(*list, m.id) {
+		*list = append(*list, m.id)
+	}
 }
 
 // update applies a change and stores it.

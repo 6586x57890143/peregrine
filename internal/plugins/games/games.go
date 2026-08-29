@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -403,6 +404,11 @@ func (s *Service) Command(cmd, arg, guildID, channelID string, who Requester) bo
 type Requester struct {
 	UserID      string
 	Permissions int64
+
+	// Roles is the guild role IDs this member holds, which is what MayStart's grant list is
+	// checked against. Raw IDs rather than a resolved permission bit, because a grant here is
+	// this bot's own decision and Discord has no bit for "may start a word game".
+	Roles []string
 }
 
 // Authorized reports whether a user may run an operator command.
@@ -428,6 +434,44 @@ func (s *Service) Authorized(r Requester) bool {
 		return true
 	}
 	return r.Permissions&discordgo.PermissionAdministrator != 0
+}
+
+// MayStart reports whether a user may start a game in this guild.
+//
+// Authorized, or a role or member the guild's own administrators have granted it to with
+// /wordgame-config.
+//
+// # Why this is a SECOND function rather than a wider Authorized
+//
+// Authorized still gates /wordgame-config itself, and that is the whole point of the split.
+// Widening the one check would have made the first grant a route to guild administration:
+// anybody allowed to start a puzzle could then grant that to anybody else, revoke the
+// administrators, or rebind the channels. Being allowed to USE a feature is not being allowed
+// to CONFIGURE it. Anything added later that an ordinary member may run belongs on this side;
+// anything that changes what the bot does belongs on Authorized's.
+//
+// It fails closed the same way, and by the same route. A DM, a guild whose corpus cannot be
+// reached, and a guild that has granted nothing all read as an empty list, which leaves
+// Authorized's answer standing rather than replacing it with a permissive one.
+//
+// The guild is a PARAMETER rather than a field on Requester, which already carries who is
+// asking. A second copy of the guild that can disagree with the caller's is how one server's
+// settings get read for another, which is the leak the per-guild corpus exists to make
+// unwritable.
+func (s *Service) MayStart(guildID string, r Requester) bool {
+	if s.Authorized(r) {
+		return true
+	}
+	if guildID == "" {
+		return false
+	}
+	set := s.snapshot(guildID)
+	if r.UserID != "" && slices.Contains(set.StarterUsers, r.UserID) {
+		return true
+	}
+	return slices.ContainsFunc(r.Roles, func(id string) bool {
+		return slices.Contains(set.StarterRoles, id)
+	})
 }
 
 // start begins a puzzle and announces it.
@@ -541,16 +585,17 @@ func (s *Service) startGauntlet(channelID string, n int) {
 // log. Answering a non-admin advertises that the command exists and that they are not allowed
 // to use it, which is an invitation. The message is still consumed either way.
 func (s *Service) startOnRequest(guildID, channelID string, who Requester, arg string) {
-	if !s.Authorized(who) {
+	if !s.MayStart(guildID, who) {
 		if s.opts.AdminUserID == "" {
 			log.Printf("[WORDGAME] !wordgame in %s was refused because "+
-				"PEREGRINE_BOOTSTRAP_ADMIN_USER_ID is unset and the caller is not a guild "+
-				"administrator, so the check fails closed and refuses everyone. Set it to "+
+				"PEREGRINE_BOOTSTRAP_ADMIN_USER_ID is unset, the caller is not a guild "+
+				"administrator, and no role or member has been granted it with "+
+				"/wordgame-config, so the check fails closed and refuses everyone. Set it to "+
 				"your own Discord user ID, or give yourself Administrator.", channelID)
 			return
 		}
-		log.Printf("[WORDGAME] !wordgame in %s from %s was refused: not the configured admin "+
-			"and not a guild administrator.", channelID, who.UserID)
+		log.Printf("[WORDGAME] !wordgame in %s from %s was refused: not the configured admin, "+
+			"not a guild administrator, and not granted.", channelID, who.UserID)
 		return
 	}
 

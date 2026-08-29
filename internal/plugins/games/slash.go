@@ -79,6 +79,8 @@ const (
 	optMode     = "mode"
 	optInterval = "interval"
 	optReset    = "reset"
+	optAllow    = "allow"
+	optDeny     = "deny"
 
 	optScope = "scope"
 )
@@ -191,6 +193,22 @@ func definitions(wordGames bool) []*discordgo.ApplicationCommand {
 				Description: "Write the environment's values back over the stored ones",
 				Required:    false,
 			},
+			// Mentionable, which is Discord's own "a role or a member" picker, rather than
+			// separate role and user options with a grant/revoke verb beside each. One native
+			// option type covers both halves of the request and the client validates the
+			// target before it costs a round trip.
+			{
+				Type:        discordgo.ApplicationCommandOptionMentionable,
+				Name:        optAllow,
+				Description: "Let this role or member start word games",
+				Required:    false,
+			},
+			{
+				Type:        discordgo.ApplicationCommandOptionMentionable,
+				Name:        optDeny,
+				Description: "Stop this role or member starting word games",
+				Required:    false,
+			},
 		},
 	}}...)
 }
@@ -278,19 +296,22 @@ func (s *Service) handleInteraction(i *discordgo.Interaction) {
 	}
 
 	who := interactionRequester(i)
-	if !s.Authorized(who) {
+	if !s.MayStart(i.GuildID, who) {
 		if s.opts.AdminUserID == "" {
 			log.Printf("[WORDGAME] /%s in %s was refused because "+
-				"PEREGRINE_BOOTSTRAP_ADMIN_USER_ID is unset and the caller is not a guild "+
-				"administrator, so the check fails closed and refuses everyone.",
-				commandName, i.ChannelID)
+				"PEREGRINE_BOOTSTRAP_ADMIN_USER_ID is unset, the caller is not a guild "+
+				"administrator, and no role or member has been granted it with /%s, so the "+
+				"check fails closed and refuses everyone.",
+				commandName, i.ChannelID, configCommandName)
 		} else {
-			log.Printf("[WORDGAME] /%s in %s from %s was refused: not the configured admin and "+
-				"not a guild administrator.", commandName, i.ChannelID, who.UserID)
+			log.Printf("[WORDGAME] /%s in %s from %s was refused: not the configured admin, "+
+				"not a guild administrator, and not granted.",
+				commandName, i.ChannelID, who.UserID)
 		}
 		// Ephemerally, which is the whole point: the person who asked learns why, and nobody
 		// else learns that the command exists.
-		s.guard.Respond(i, "you need Administrator here to start a word game", true)
+		s.guard.Respond(i, "you need Administrator here, or a role an admin has allowed with /"+
+			configCommandName+", to start a word game", true)
 		return
 	}
 
@@ -391,7 +412,9 @@ func interactionRequester(i *discordgo.Interaction) Requester {
 		return Requester{}
 	}
 	if i.Member != nil {
-		who := Requester{Permissions: i.Member.Permissions}
+		// Roles ride along for MayStart's grant list. They are in the payload too, so this
+		// path still makes no REST call and consults no cache.
+		who := Requester{Permissions: i.Member.Permissions, Roles: i.Member.Roles}
 		if i.Member.User != nil {
 			who.UserID = i.Member.User.ID
 		}
@@ -473,8 +496,8 @@ func (s *Service) handleConfig(i *discordgo.Interaction) {
 		return
 	}
 
-	channel, mode, minutes, reset := configArgs(i)
-	if channel == "" && mode == "" && minutes == 0 && !reset {
+	a := readConfig(i)
+	if a == (configArgs{}) {
 		// No options is a read. The command with nothing filled in is how an operator asks what
 		// the bot is currently doing, which is the question the log line at startup answers once
 		// and then scrolls away.
@@ -484,17 +507,36 @@ func (s *Service) handleConfig(i *discordgo.Interaction) {
 
 	var notes []string
 	set := s.update(i.GuildID, func(set *settings) {
-		if reset {
+		if a.reset {
 			// Applied FIRST, so an operator can reset and set something in one command rather
 			// than watching their change be overwritten by the reset in the same call.
+			//
+			// The grants SURVIVE it, which is the one asymmetry here. Reset means "write the
+			// environment's values back", and the environment has nothing to say about who may
+			// start a game: there is no value to write back, so the alternative is not a reset
+			// but a silent mass revocation, in the command an operator reaches for when they
+			// are trying to make an .env edit take effect.
 			*set = settings{
-				Channels: s.opts.AllowChannels,
-				Mode:     s.opts.Mode,
-				Interval: s.opts.Interval,
+				Channels:     s.opts.AllowChannels,
+				Mode:         s.opts.Mode,
+				Interval:     s.opts.Interval,
+				StarterRoles: set.StarterRoles,
+				StarterUsers: set.StarterUsers,
 			}
-			notes = append(notes, "reset to the values this process started with")
+			notes = append(notes, "reset to the values this process started with, keeping who "+
+				"may start games")
 		}
-		switch channel {
+		if a.allow.id != "" {
+			set.grant(a.allow, true)
+			notes = append(notes, "granted "+a.allow.String()+" the right to start word games")
+		}
+		if a.deny.id != "" {
+			// After allow, so passing the same target to both is a revoke rather than whichever
+			// the option order happened to be.
+			set.grant(a.deny, false)
+			notes = append(notes, "revoked "+a.deny.String())
+		}
+		switch a.channel {
 		case channelBind:
 			if !slices.Contains(set.Channels, i.ChannelID) {
 				set.Channels = append(set.Channels, i.ChannelID)
@@ -522,16 +564,16 @@ func (s *Service) handleConfig(i *discordgo.Interaction) {
 		// offers those two choices: an interaction payload is user input at a trust boundary, and
 		// an unrecognized mode is neither activity nor interval, so puzzles would simply stop
 		// starting with nothing to say why.
-		switch Mode(mode) {
+		switch Mode(a.mode) {
 		case ModeActivity, ModeInterval:
-			set.Mode = Mode(mode)
-			notes = append(notes, "mode is "+mode)
+			set.Mode = Mode(a.mode)
+			notes = append(notes, "mode is "+a.mode)
 		case "":
 		default:
-			notes = append(notes, "ignored an unknown mode "+strconv.Quote(mode))
+			notes = append(notes, "ignored an unknown mode "+strconv.Quote(a.mode))
 		}
-		if minutes > 0 {
-			set.Interval = clampInterval(time.Duration(minutes) * time.Minute)
+		if a.minutes > 0 {
+			set.Interval = clampInterval(time.Duration(a.minutes) * time.Minute)
 			notes = append(notes, "interval is "+set.Interval.String())
 		}
 	})
@@ -550,29 +592,77 @@ func clampInterval(d time.Duration) time.Duration {
 	return min(max(d, minInterval), maxInterval)
 }
 
-// configArgs reads the four optional options.
+// configArgs is one invocation of /wordgame-config.
 //
-// All four are optional and any combination is legal, because they are independent dials rather
-// than alternatives: "bind here and switch to interval every 20 minutes" is one intention and
-// should be one command.
-func configArgs(i *discordgo.Interaction) (channel, mode string, minutes int, reset bool) {
+// A struct rather than a return list, because it is six values now and a caller passing an
+// adjacent pair of strings in the wrong order is exactly what Requester is a struct to avoid.
+// Comparable on purpose: handleConfig tests it against its zero value to recognize the
+// no-options form, which is how an operator asks what the bot is currently doing.
+type configArgs struct {
+	channel string
+	mode    string
+	minutes int
+	reset   bool
+
+	allow mention
+	deny  mention
+}
+
+// readConfig reads the optional options.
+//
+// All of them are optional and any combination is legal, because they are independent dials
+// rather than alternatives: "bind here, switch to interval every 20 minutes and let the mods
+// start puzzles" is one intention and should be one command.
+func readConfig(i *discordgo.Interaction) configArgs {
+	var a configArgs
 	if i == nil {
-		return "", "", 0, false
+		return a
 	}
-	for _, opt := range i.ApplicationCommandData().Options {
+	data := i.ApplicationCommandData()
+	for _, opt := range data.Options {
 		if opt == nil {
 			continue
 		}
 		switch opt.Name {
 		case optChannel:
-			channel = opt.StringValue()
+			a.channel = opt.StringValue()
 		case optMode:
-			mode = opt.StringValue()
+			a.mode = opt.StringValue()
 		case optInterval:
-			minutes = int(opt.IntValue())
+			a.minutes = int(opt.IntValue())
 		case optReset:
-			reset = opt.BoolValue()
+			a.reset = opt.BoolValue()
+		case optAllow:
+			a.allow = mentionOf(opt, data.Resolved)
+		case optDeny:
+			a.deny = mentionOf(opt, data.Resolved)
 		}
 	}
-	return channel, mode, minutes, reset
+	return a
+}
+
+// mentionOf reads a mentionable option: the snowflake, and which of the two things it names.
+//
+// The ID comes off opt.Value with a comma-ok rather than through discordgo's typed accessors,
+// which PANIC when the payload's option type is not the one they expect. That is two
+// independent fields off the wire having to agree, which is the shape componentID exists for,
+// and an interaction payload is input at a trust boundary like any other.
+//
+// Whether it is a role is read from Discord's own RESOLVED data and never guessed, because
+// role and user snowflakes come from the same space. An unresolvable target is dropped rather
+// than assumed to be a user: a grant filed under the wrong kind would sit in the settings
+// looking correct and never match anybody.
+func mentionOf(opt *discordgo.ApplicationCommandInteractionDataOption,
+	res *discordgo.ApplicationCommandInteractionDataResolved) mention {
+	id, ok := opt.Value.(string)
+	if !ok || id == "" || res == nil {
+		return mention{}
+	}
+	switch {
+	case res.Roles[id] != nil:
+		return mention{id: id, isRole: true}
+	case res.Users[id] != nil:
+		return mention{id: id}
+	}
+	return mention{}
 }
