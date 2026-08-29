@@ -1,6 +1,7 @@
 package games
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -950,5 +951,71 @@ func TestARefusedBoardIsNotRetriedAsPlainText(t *testing.T) {
 	}
 	if got := guard.posts(); len(got) != 0 {
 		t.Errorf("a refused embed fell back to a plain message: %v", got)
+	}
+}
+
+// ---------------------------------------------------------------- M33: granted starters
+
+// TestGrantedRolesAndMembersMayStartGames. The grant list widens who may START a game and must
+// not widen who may CONFIGURE one: if it did, the first grant would be a route to guild
+// administration, because whoever holds it could then grant it onwards, revoke the admins or
+// rebind the channels.
+func TestGrantedRolesAndMembersMayStartGames(t *testing.T) {
+	opts := enabled()
+	opts.AdminUserID = "" // nobody is the bootstrap admin, so only grants can say yes
+	s, _, _, _ := fixture(t, opts)
+
+	role := Requester{UserID: snowflake(600), Roles: []string{snowflake(900)}}
+	member := Requester{UserID: snowflake(601)}
+
+	if s.MayStart(testGuild, role) || s.MayStart(testGuild, member) {
+		t.Fatal("somebody could start a game before anything was granted; the list must fail closed")
+	}
+
+	s.update(testGuild, func(set *settings) {
+		set.grant(mention{id: snowflake(900), isRole: true}, true)
+		set.grant(mention{id: snowflake(601)}, true)
+	})
+
+	if !s.MayStart(testGuild, role) {
+		t.Error("a granted role was refused")
+	}
+	if !s.MayStart(testGuild, member) {
+		t.Error("a granted member was refused")
+	}
+	// The role was granted, not the person, so the same holder in another guild is a stranger.
+	if s.MayStart(otherGuild, role) {
+		t.Error("a grant in one guild carried into another; grants are per guild like the corpus")
+	}
+	// The whole point of MayStart being a second function.
+	if s.Authorized(role) || s.Authorized(member) {
+		t.Error("a grant to start games also authorized /wordgame-config, which is a route to " +
+			"guild administration")
+	}
+
+	s.update(testGuild, func(set *settings) {
+		set.grant(mention{id: snowflake(900), isRole: true}, false)
+	})
+	if s.MayStart(testGuild, role) {
+		t.Error("a revoked role could still start games")
+	}
+	if !s.MayStart(testGuild, member) {
+		t.Error("revoking a role revoked a member as well; the two lists are separate")
+	}
+
+	// Reset writes the environment's values back, and the environment says nothing about who
+	// may start a game. Clearing the grants here would be a silent mass revocation in the
+	// command an operator reaches for to make an .env edit take effect.
+	set := s.update(testGuild, func(set *settings) {
+		*set = settings{
+			Channels:     s.opts.AllowChannels,
+			Mode:         s.opts.Mode,
+			Interval:     s.opts.Interval,
+			StarterRoles: set.StarterRoles,
+			StarterUsers: set.StarterUsers,
+		}
+	})
+	if !slices.Contains(set.StarterUsers, snowflake(601)) {
+		t.Error("a reset revoked the grants")
 	}
 }
