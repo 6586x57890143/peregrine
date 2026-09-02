@@ -240,3 +240,68 @@ func TestTheReportNeedsNothingButFiles(t *testing.T) {
 		t.Errorf("the outcome is missing:\n%s", out.String())
 	}
 }
+
+// The too-short advisory used to fire on a single silent reply, so a healthy bot tripped a
+// line reading "a rate this high" at 0.7%. An advisory that fires when nothing is wrong is
+// one an operator stops reading, and it is then absent for the young corpus it was written
+// for, which is the only situation it was ever meant to describe.
+//
+// Both directions in one test, because a threshold that never fires is exactly as useless as
+// one that always does.
+func TestTheTooShortAdvisoryNeedsARateRatherThanASingleCase(t *testing.T) {
+	report := func(t *testing.T, tooShort, produced int) string {
+		t.Helper()
+		clock := newClock()
+		dir := t.TempDir()
+		w := mustWriter(t, Options{Dir: dir, Now: clock.now})
+		for i := 0; i < tooShort; i++ {
+			if err := w.Write(Sample{
+				Kind: KindSample, At: clock.now(), Version: "v1", Trigger: "reply",
+				Outcome: "too-short", Sent: false,
+			}); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+		}
+		for i := 0; i < produced; i++ {
+			if err := w.Write(Sample{
+				Kind: KindSample, At: clock.now(), Version: "v1", Trigger: "reply",
+				Reply: "the queue is doomed", Words: 4, Outcome: "produced", Sent: true,
+			}); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+		}
+		if err := w.Flush(); err != nil {
+			t.Fatalf("Flush: %v", err)
+		}
+		var out strings.Builder
+		if err := Report(dir, &out); err != nil {
+			t.Fatalf("Report: %v", err)
+		}
+		return out.String()
+	}
+
+	const advisory = "PEREGRINE_MIN_DISTINCT_AUTHORS is refusing continuations"
+
+	// The shape of the real archive this came from: 2 in 299, on a corpus of a hundred
+	// thousand messages, with nothing wrong.
+	t.Run("quiet on a healthy archive", func(t *testing.T) {
+		got := report(t, 2, 297)
+		if strings.Contains(got, advisory) {
+			t.Errorf("the advisory fired at %.1f%%, under the %.0f%% threshold:\n%s",
+				pct(2, 299), tooShortAdvisory, got)
+		}
+		// The outcome itself must still be counted and printed. Silencing the advisory is
+		// not the same as hiding the number it was advising about.
+		if !strings.Contains(got, "too-short") {
+			t.Errorf("the too-short outcome vanished from the report:\n%s", got)
+		}
+	})
+
+	// A young corpus, where the gate really is the reason the bot is quiet.
+	t.Run("fires on a young corpus", func(t *testing.T) {
+		got := report(t, 40, 60)
+		if !strings.Contains(got, advisory) {
+			t.Errorf("the advisory stayed quiet at 40%%, which is what it exists for:\n%s", got)
+		}
+	})
+}
