@@ -22,7 +22,7 @@ func TestTheReportReadsWhatTheWriterWrote(t *testing.T) {
 		{
 			Kind: KindSample, At: clock.now(), ID: "m1", Version: "v1", Trigger: "reply",
 			Reply: "greg is cooked honestly", Words: 4, Outcome: "produced", Sent: true, TookMS: 30,
-			Trace: &Trace{SeedTier: "name", Steps: 4, MinOrder: 2, CandidatesX100: 350},
+			Trace: &Trace{SeedTier: "name", Steps: 4, MinOrder: 1, MaxOrder: 3, CandidatesX100: 350},
 		},
 		{
 			Kind: KindSample, At: clock.now(), ID: "m2", Version: "v1", Trigger: "autopost",
@@ -78,6 +78,11 @@ func TestTheReportReadsWhatTheWriterWrote(t *testing.T) {
 		"by seed tier",
 		// The gate refusing output is reported without any of the text it refused.
 		"emit gate refused 4",
+		// The longest context that offered anything, which is the only number in here
+		// that can say whether PEREGRINE_MAX_NGRAM is buying output or write volume.
+		// The sample above backed off to one word AND used a three-word context, which
+		// is the pair MinOrder alone cannot express.
+		"longest context that offered an admitted candidate",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("report does not mention %q", want)
