@@ -26,6 +26,15 @@ import (
 // two things the fixture cannot answer at all: whether anybody reacted, and whether the
 // author-diversity gate is ending sentences.
 
+// tooShortAdvisory is the percentage of attempts that must end under the length floor
+// before the report says the author-diversity gate is the likely cause.
+//
+// Five, because a mature corpus sits near zero (the 2026-09-02 archive was 0.7% over 299
+// attempts) and a corpus too young to have two authors on anything sits far above it. The
+// exact line is a judgement rather than a measurement; what is measured is that the old
+// value of "any at all" fires on a healthy bot.
+const tooShortAdvisory = 5.0
+
 // Report reads every export file under path and writes a summary to w.
 //
 // path may be a directory or a single file, because both are things an operator ends up
@@ -346,7 +355,13 @@ func (a *aggregate) write(w io.Writer, files []string) {
 	// The number SPEC.md section 10 is really about. On a young corpus this is the
 	// author-diversity gate doing its job, and the operator's fix is more people rather than
 	// a lower threshold; on a mature one it is a tuning problem.
-	if tooShort := a.byOutcome["too-short"]; tooShort > 0 {
+	//
+	// GATED ON A SHARE RATHER THAN ON `> 0`, which is what it used to be. A line reading
+	// "a rate this high" fired on a single silent reply, so the 2026-09-02 archive tripped
+	// it at 0.7% (2 attempts in 299) on a corpus of a hundred thousand messages. An
+	// advisory that fires when nothing is wrong is an advisory an operator learns to skip,
+	// and then it is not there for the young corpus it was written for.
+	if tooShort := a.byOutcome["too-short"]; pct(tooShort, a.samples) >= tooShortAdvisory {
 		p("  a too-short rate this high usually means PEREGRINE_MIN_DISTINCT_AUTHORS is " +
 			"refusing continuations only one person has said")
 	}
