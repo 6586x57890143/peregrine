@@ -140,7 +140,7 @@ func (g *Generator) Next(s *Step) (string, error) {
 		s.Trace.deadEnd(true, refused)
 		return "", nil
 	}
-	s.Trace.step(m.minCtxWords, len(cands), refused)
+	s.Trace.step(m.minCtxWords, cands, refused)
 
 	assoc := g.loadAssoc(s)
 	for i := range cands {

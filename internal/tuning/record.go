@@ -147,6 +147,14 @@ type Trace struct {
 	// is the number that settles it against real text.
 	MinOrder int `json:"min_order,omitempty"`
 
+	// MaxOrder is the longest context that supplied a candidate the gate admitted. It is
+	// what decides whether PEREGRINE_MAX_NGRAM is buying output or only write volume:
+	// MinOrder is the shortest context ANY step fell back to, so it reports 1 for a
+	// sentence whose first word came from a three-word context, and an archive of 299
+	// generations could therefore say "median context 1 word" while saying nothing at all
+	// about whether the top orders ever fired.
+	MaxOrder int `json:"max_order,omitempty"`
+
 	// Candidates is the mean size of the candidate set after the gate, times 100 so the
 	// wire format carries no float. A set of one is a deterministic step however hot the
 	// sampler is, which is most of what made the old engine feel canned.

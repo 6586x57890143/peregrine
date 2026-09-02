@@ -31,6 +31,7 @@ func flatten(t *markov.Trace) *tuning.Trace {
 		GateRefused: t.GateRefused,
 		Starved:     t.Starved,
 		MinOrder:    t.MinOrder,
+		MaxOrder:    t.MaxOrder,
 		// Scaled to an integer so the wire format carries no float, which keeps a hand-read
 		// line legible and a diff between two archives exact.
 		CandidatesX100: int(t.MeanCandidates() * 100),

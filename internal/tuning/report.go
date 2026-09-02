@@ -120,6 +120,7 @@ type aggregate struct {
 	deadEnds      int
 	starved       int
 	minOrders     []int
+	maxOrders     map[int]int
 	candidates    []float64
 
 	reacted     int
@@ -262,6 +263,12 @@ func (a *aggregate) addSample(rec Sample) {
 	}
 	a.deadEnds += tr.DeadEnds
 	a.starved += tr.Starved
+	if tr.MaxOrder > 0 {
+		if a.maxOrders == nil {
+			a.maxOrders = map[int]int{}
+		}
+		a.maxOrders[tr.MaxOrder]++
+	}
 	if tr.MinOrder > 0 {
 		a.minOrders = append(a.minOrders, tr.MinOrder)
 	}
@@ -413,6 +420,28 @@ func (a *aggregate) write(w io.Writer, files []string) {
 		sort.Ints(a.minOrders)
 		p("  the backoff reached a median context of %d word(s), p10 %d",
 			percentileInt(a.minOrders, 0.5), percentileInt(a.minOrders, 0.1))
+	}
+	// The longest context that offered anything, which is the PEREGRINE_MAX_NGRAM
+	// question. The line above is the shortest context any step fell back to, and it
+	// reads as "the backoff always bottoms out at one word" on every archive, which says
+	// nothing about whether the top orders contributed. An order that never appears here
+	// is an order whose n-grams are being written and never read.
+	if len(a.maxOrders) > 0 {
+		orders := make([]int, 0, len(a.maxOrders))
+		for o := range a.maxOrders {
+			orders = append(orders, o)
+		}
+		sort.Ints(orders)
+		total := 0
+		for _, o := range orders {
+			total += a.maxOrders[o]
+		}
+		p("  longest context that offered an admitted candidate, per attempt:")
+		for _, o := range orders {
+			p("    %d word(s)  %5d  %5.1f%%", o, a.maxOrders[o], pct(a.maxOrders[o], total))
+		}
+		p("    an order absent here is one PEREGRINE_MAX_NGRAM is paying to write and " +
+			"never reading")
 	}
 	if len(a.candidates) > 0 {
 		p("  mean post-gate candidate set: %.1f (a set of 1 is a deterministic step however "+
