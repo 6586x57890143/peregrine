@@ -26,6 +26,15 @@ import (
 // two things the fixture cannot answer at all: whether anybody reacted, and whether the
 // author-diversity gate is ending sentences.
 
+// tooShortAdvisory is the percentage of attempts that must end under the length floor
+// before the report says the author-diversity gate is the likely cause.
+//
+// Five, because a mature corpus sits near zero (the 2026-09-02 archive was 0.7% over 299
+// attempts) and a corpus too young to have two authors on anything sits far above it. The
+// exact line is a judgement rather than a measurement; what is measured is that the old
+// value of "any at all" fires on a healthy bot.
+const tooShortAdvisory = 5.0
+
 // Report reads every export file under path and writes a summary to w.
 //
 // path may be a directory or a single file, because both are things an operator ends up
@@ -111,6 +120,7 @@ type aggregate struct {
 	deadEnds      int
 	starved       int
 	minOrders     []int
+	maxOrders     map[int]int
 	candidates    []float64
 
 	reacted     int
@@ -253,6 +263,12 @@ func (a *aggregate) addSample(rec Sample) {
 	}
 	a.deadEnds += tr.DeadEnds
 	a.starved += tr.Starved
+	if tr.MaxOrder > 0 {
+		if a.maxOrders == nil {
+			a.maxOrders = map[int]int{}
+		}
+		a.maxOrders[tr.MaxOrder]++
+	}
 	if tr.MinOrder > 0 {
 		a.minOrders = append(a.minOrders, tr.MinOrder)
 	}
@@ -346,7 +362,13 @@ func (a *aggregate) write(w io.Writer, files []string) {
 	// The number SPEC.md section 10 is really about. On a young corpus this is the
 	// author-diversity gate doing its job, and the operator's fix is more people rather than
 	// a lower threshold; on a mature one it is a tuning problem.
-	if tooShort := a.byOutcome["too-short"]; tooShort > 0 {
+	//
+	// GATED ON A SHARE RATHER THAN ON `> 0`, which is what it used to be. A line reading
+	// "a rate this high" fired on a single silent reply, so the 2026-09-02 archive tripped
+	// it at 0.7% (2 attempts in 299) on a corpus of a hundred thousand messages. An
+	// advisory that fires when nothing is wrong is an advisory an operator learns to skip,
+	// and then it is not there for the young corpus it was written for.
+	if tooShort := a.byOutcome["too-short"]; pct(tooShort, a.samples) >= tooShortAdvisory {
 		p("  a too-short rate this high usually means PEREGRINE_MIN_DISTINCT_AUTHORS is " +
 			"refusing continuations only one person has said")
 	}
@@ -398,6 +420,28 @@ func (a *aggregate) write(w io.Writer, files []string) {
 		sort.Ints(a.minOrders)
 		p("  the backoff reached a median context of %d word(s), p10 %d",
 			percentileInt(a.minOrders, 0.5), percentileInt(a.minOrders, 0.1))
+	}
+	// The longest context that offered anything, which is the PEREGRINE_MAX_NGRAM
+	// question. The line above is the shortest context any step fell back to, and it
+	// reads as "the backoff always bottoms out at one word" on every archive, which says
+	// nothing about whether the top orders contributed. An order that never appears here
+	// is an order whose n-grams are being written and never read.
+	if len(a.maxOrders) > 0 {
+		orders := make([]int, 0, len(a.maxOrders))
+		for o := range a.maxOrders {
+			orders = append(orders, o)
+		}
+		sort.Ints(orders)
+		total := 0
+		for _, o := range orders {
+			total += a.maxOrders[o]
+		}
+		p("  longest context that offered an admitted candidate, per attempt:")
+		for _, o := range orders {
+			p("    %d word(s)  %5d  %5.1f%%", o, a.maxOrders[o], pct(a.maxOrders[o], total))
+		}
+		p("    an order absent here is one PEREGRINE_MAX_NGRAM is paying to write and " +
+			"never reading")
 	}
 	if len(a.candidates) > 0 {
 		p("  mean post-gate candidate set: %.1f (a set of 1 is a deterministic step however "+

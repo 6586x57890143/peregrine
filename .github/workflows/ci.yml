@@ -149,6 +149,23 @@ jobs:
     needs: push-image
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # ONE DEPLOY AT A TIME, BECAUSE THERE IS ONE HOST. Three merges landed on
+    # main within three minutes on 2026-08-29 and their deploys ran in parallel
+    # against the same Docker daemon: one `docker compose pull` raced another
+    # run's `docker image prune` and died with `lease does not exist: not
+    # found`. The group name is a constant rather than the usual
+    # workflow-plus-ref, because what has to be serialised is access to the VPS
+    # and not the branch that is asking for it.
+    #
+    # cancel-in-progress is FALSE on purpose. This script stops the container
+    # and rewrites the host's record of what is deployed, so cancelling it
+    # halfway is how the host ends up in a state no file describes. A queued
+    # run that gets superseded by a newer one has not started the script at
+    # all, which is the safe direction: the newest commit is the one anybody
+    # wanted deployed anyway.
+    concurrency:
+      group: deploy-vps
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v7
 
@@ -217,21 +234,28 @@ jobs:
             # so without that step every write into them fails.
             mkdir -p backups tuning
 
-            # Record the tag being deployed before deploying it, and keep the
-            # one it replaces. Rolling back is then reading a file, not digging
-            # through GHCR or CI logs to work out what was running.
-            if [ -f deployed-tag.env ]; then
-              cp deployed-tag.env previous-tag.env
-            fi
-            echo "PEREGRINE_IMAGE_TAG=$IMAGE_TAG" > deployed-tag.env
-
-            set -a
-            . ./deployed-tag.env
-            set +a
+            export PEREGRINE_IMAGE_TAG="$IMAGE_TAG"
 
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             docker compose -f docker-compose.prod.yml pull
             docker compose -f docker-compose.prod.yml up -d --remove-orphans
+
+            # THE TAG FILES ARE WRITTEN ONLY AFTER THE CONTAINER IS ACTUALLY
+            # RUNNING THE TAG. They used to be written first, on the reasoning
+            # that a record of the attempt is better than no record, and on
+            # 2026-08-29 that produced the failure it was meant to prevent: the
+            # pull died with `lease does not exist`, so `deployed-tag.env` named
+            # a SHA whose image was never on the host, `previous-tag.env` named
+            # the SHA that was still running, and the rollback recipe in
+            # README.md became a silent no-op. A file that says what IS running
+            # is worth more than a file that says what somebody meant to run,
+            # because the only moment anybody reads it is the moment they need
+            # to go back to a version that definitely exists. `set -e` above is
+            # what makes this an unwritten file rather than a wrong one.
+            if [ -f deployed-tag.env ]; then
+              cp deployed-tag.env previous-tag.env
+            fi
+            echo "PEREGRINE_IMAGE_TAG=$IMAGE_TAG" > deployed-tag.env
             # Prune dangling layers only. A bare `docker image prune -f` on a
             # host that has just retagged images can remove the previous
             # release, which is the one thing a rollback needs to still exist.

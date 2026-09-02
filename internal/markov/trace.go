@@ -67,6 +67,25 @@ type Trace struct {
 	// instead of leaving it a guess.
 	MinOrder int
 
+	// MaxOrder is the LONGEST context that supplied a candidate the gate admitted, over
+	// every step of the walk.
+	//
+	// It is the number that settles what MinOrder cannot. MinOrder is the shortest context
+	// any single step fell back to, so a sentence that used a three-word context for its
+	// first word and a one-word context for its fifth records 1, and the 2026-09-02 archive
+	// therefore reported "median context 1 word, p10 1" for 299 generations without saying
+	// whether the top orders had ever contributed at all. The corpus report says the higher
+	// orders are 98% dead AFTER the author-diversity gate, but that is counted over every
+	// prefix in the corpus rather than over the prefixes a walk actually visits, which are
+	// the frequent ones and therefore the ones most likely to have several authors.
+	//
+	// So neither number can answer the question PEREGRINE_MAX_NGRAM turns on: whether
+	// lowering it would change any output, or only stop writing n-grams nothing reads. This
+	// one can. It is the ceiling of what was OFFERED rather than of what was chosen, which
+	// is the conservative direction: it can only make a high order look more useful than it
+	// is, never less, so an order this never reports is an order that never mattered.
+	MaxOrder int
+
 	// candidateTotal and candidateSteps are the running mean of the post-gate candidate set
 	// size. Unexported because the useful form is the mean, which MeanCandidates returns: a
 	// consumer reading a sum and a count would be a consumer that can compute the wrong
@@ -96,20 +115,29 @@ func (t *Trace) seed(tier seedTier, key string) {
 
 // step records one call to Next that produced a token.
 //
-// order is the shortest context enumerated, eligible is the candidate count after the
+// order is the shortest context enumerated, cands is the candidate set that survived the
 // author-diversity gate, and refused is how many it removed.
-func (t *Trace) step(order, eligible, refused int) {
+//
+// The candidates arrive as a slice rather than as a count so that the walk over them for
+// MaxOrder happens behind this method's nil check, which is what keeps tracing-off to one
+// branch per step with no work and no allocation.
+func (t *Trace) step(order int, cands []candidate, refused int) {
 	if t == nil {
 		return
 	}
 	t.Steps++
 	t.GateRefused += refused
-	if eligible > 0 {
-		t.candidateTotal += eligible
+	if len(cands) > 0 {
+		t.candidateTotal += len(cands)
 		t.candidateSteps++
 	}
 	if order > 0 && (t.MinOrder == 0 || order < t.MinOrder) {
 		t.MinOrder = order
+	}
+	for _, c := range cands {
+		if c.order > t.MaxOrder {
+			t.MaxOrder = c.order
+		}
 	}
 }
 

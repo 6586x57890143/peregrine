@@ -189,8 +189,8 @@ func TestMeanCandidatesAveragesAndSurvivesAnEmptyTrace(t *testing.T) {
 		t.Errorf("MeanCandidates on a nil trace = %v, want 0", got)
 	}
 
-	tr.step(2, 4, 0)
-	tr.step(2, 6, 1)
+	tr.step(2, make([]candidate, 4), 0)
+	tr.step(2, make([]candidate, 6), 1)
 	if got := tr.MeanCandidates(); got != 5 {
 		t.Errorf("MeanCandidates = %v after sets of 4 and 6, want 5", got)
 	}
@@ -214,4 +214,44 @@ func TestEverySeedTierIsNamed(t *testing.T) {
 		}
 		seen[name] = true
 	}
+}
+
+// MaxOrder is the number MinOrder cannot supply. MinOrder is the shortest context any single
+// step fell back to, so a walk that used a three-word context for one word and a one-word
+// context for another records 1 and says nothing about the three: the 2026-09-02 archive
+// reported "median context 1 word, p10 1" over 299 generations while leaving open whether
+// PEREGRINE_MAX_NGRAM was buying any output at all.
+//
+// It is the ceiling of what the gate ADMITTED, not of what the sampler chose, which is the
+// conservative direction: an order can look more useful here than it was, never less, so an
+// order that never appears is an order that never mattered.
+func TestMaxOrderRecordsTheLongestContextThatOfferedAnything(t *testing.T) {
+	var tr Trace
+
+	// One step whose surviving candidates came from a one and a two word context, then one
+	// whose best was a single word. The walk's MinOrder is 1 both times; its MaxOrder is 2.
+	tr.step(1, []candidate{{token: "a", order: 1}, {token: "b", order: 2}}, 0)
+	tr.step(1, []candidate{{token: "c", order: 1}}, 3)
+
+	if tr.MinOrder != 1 {
+		t.Errorf("MinOrder = %d, want 1: both steps enumerated down to a one-word context",
+			tr.MinOrder)
+	}
+	if tr.MaxOrder != 2 {
+		t.Errorf("MaxOrder = %d, want 2: a two-word context supplied an admitted candidate, "+
+			"which is exactly what MinOrder cannot report", tr.MaxOrder)
+	}
+
+	// A refused candidate is not an offered one. The gate runs before step is called, so a
+	// high order that only ever supplied candidates the gate deleted must not show up here:
+	// that would report an order as load-bearing when it produces nothing.
+	var gated Trace
+	gated.step(1, []candidate{{token: "a", order: 1}}, 7)
+	if gated.MaxOrder != 1 {
+		t.Errorf("MaxOrder = %d, want 1: the 7 refused candidates are not evidence that any "+
+			"order above the surviving one offers anything", gated.MaxOrder)
+	}
+
+	var nilTrace *Trace
+	nilTrace.step(3, []candidate{{token: "a", order: 3}}, 0) // must not panic
 }
