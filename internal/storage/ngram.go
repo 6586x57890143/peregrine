@@ -256,12 +256,20 @@ func (w *Writer) LearnNgram(prefix, next, authorID string) error {
 			if err := putPresence(authB, aKey); err != nil {
 				return err
 			}
+			if err := w.addKeyCount(bucketNgramAuth, 1); err != nil {
+				return err
+			}
 			authors++
 		}
 	}
 
 	if err := ngramB.Put(key, encodeNgram(count+1, authors)); err != nil {
 		return err
+	}
+	if firstSighting {
+		if err := w.addKeyCount(bucketNgram, 1); err != nil {
+			return err
+		}
 	}
 
 	// kn_succ: N1+(prefix .), incremented only when this successor is new to this
@@ -353,6 +361,9 @@ func (w *Writer) PurgeAuthor(authorID string) (int, error) {
 		}
 		removed++
 	}
+	if err := w.addKeyCount(bucketNgramAuth, -int64(removed)); err != nil {
+		return removed, err
+	}
 	return removed, nil
 }
 
@@ -368,8 +379,18 @@ func (w *Writer) DeleteNgram(prefix, next string) error {
 	if err != nil {
 		return err
 	}
-	if err := w.bucket(bucketNgram).Delete(key); err != nil {
+	ngramB := w.bucket(bucketNgram)
+	// Asked before the Delete rather than inferred from it: bbolt's Delete is a silent
+	// no-op on a key that is not there and returns nil either way, so decrementing
+	// unconditionally would drift the counter down on every repeated clean pass.
+	existed := ngramB.Get(key) != nil
+	if err := ngramB.Delete(key); err != nil {
 		return err
+	}
+	if existed {
+		if err := w.addKeyCount(bucketNgram, -1); err != nil {
+			return err
+		}
 	}
 
 	// Drop this continuation's author presence entries.
@@ -384,6 +405,9 @@ func (w *Writer) DeleteNgram(prefix, next string) error {
 		if err := authB.Delete(k); err != nil {
 			return err
 		}
+	}
+	if err := w.addKeyCount(bucketNgramAuth, -int64(len(victims))); err != nil {
+		return err
 	}
 
 	preKey, err := pairKey(next, prefix)
