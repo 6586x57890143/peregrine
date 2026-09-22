@@ -75,6 +75,24 @@ const (
 	metaMessagesLearned = "count:messages_learned"
 	metaTopicTotal      = "count:topic_total"
 
+	// The key counts behind the status line. One per bucket that Reader.Status used to
+	// answer with Bucket.Stats().KeyN.
+	//
+	// Stats() walks every page in the bucket, and Status calls it on six buckets at once,
+	// so on a real corpus the status ticker held a read transaction open for 26 seconds
+	// every five minutes. That is finding 11 again, but the cost is not just the walk:
+	// bbolt is copy-on-write and cannot reclaim a page while any transaction that might
+	// still see it is open, so a read transaction of that length makes the WRITER
+	// allocate fresh pages instead of reusing freed ones. The file grows, the next walk
+	// has more pages to cross, and the window widens. The status line was reporting
+	// corpus growth and causing some of it (SPEC.md section 8, finding 58).
+	metaNgramCount     = "count:ngram"
+	metaNgramAuthCount = "count:ngram_auth"
+	metaTopicKeys      = "count:topic_keys"
+	metaTopicWordCount = "count:topic_word"
+	metaNameTopicCount = "count:name_topic"
+	metaNameCount      = "count:name"
+
 	// metaRepairPrefix names one repair job's completion marker, as
 	// "repair:<job name>". Per job rather than one shared key, because two repairs finish
 	// at different times and a shared marker would let one declare the other done.
@@ -86,6 +104,22 @@ const (
 	// this is a prefix and not a single key.
 	metaRepairPrefix = "repair:"
 )
+
+// keyCounters names the counter that tracks each walked bucket's key count.
+//
+// A map rather than a parameter at every call site, because addAssoc serves both
+// association buckets and takes the bucket by name: the counter has to be derivable
+// from the bucket or that one function would need a second argument threaded through
+// four wrappers. A bucket missing from here simply has no counter, which is what the
+// buckets Status does not report want.
+var keyCounters = map[string]string{
+	bucketNgram:     metaNgramCount,
+	bucketNgramAuth: metaNgramAuthCount,
+	bucketTopic:     metaTopicKeys,
+	bucketTopicWord: metaTopicWordCount,
+	bucketNameTopic: metaNameTopicCount,
+	bucketName:      metaNameCount,
+}
 
 // RepairState is how far one repair job has got.
 //
@@ -278,7 +312,10 @@ func (s *Store) initialize() error {
 				ErrSchemaMismatch, decodeUint64(stored), SchemaVersion)
 		}
 
-		return backfillTopicTotal(tx)
+		if err := backfillTopicTotal(tx); err != nil {
+			return err
+		}
+		return backfillKeyCounts(tx)
 	})
 }
 
@@ -346,6 +383,37 @@ func backfillTopicTotal(tx *bbolt.Tx) error {
 		total += decodeUint64(v)
 	}
 	return meta.Put([]byte(metaTopicTotal), encodeUint64(total))
+}
+
+// backfillKeyCounts derives the per-bucket key counters once, for a corpus written
+// before they existed.
+//
+// This is the one place Bucket.Stats() is still the right tool: it pays the walk on a
+// single startup so the status ticker never pays it again. On the production corpus
+// that is about thirty seconds once, against twenty-six seconds every five minutes.
+//
+// The condition is "counter absent, bucket populated", matching backfillTopicTotal.
+// An empty bucket deliberately leaves its key absent rather than storing a zero: a
+// genuinely empty corpus must not be walked on every startup, and the first insert
+// creates the counter through addKeyCount anyway.
+func backfillKeyCounts(tx *bbolt.Tx) error {
+	meta := tx.Bucket([]byte(bucketMeta))
+	for bucket, counter := range keyCounters {
+		if meta.Get([]byte(counter)) != nil {
+			continue
+		}
+		b := tx.Bucket([]byte(bucket))
+		if b == nil {
+			continue
+		}
+		if k, _ := b.Cursor().First(); k == nil {
+			continue
+		}
+		if err := meta.Put([]byte(counter), encodeUint64(uint64(b.Stats().KeyN))); err != nil {
+			return fmt.Errorf("backfill %s: %w", counter, err)
+		}
+	}
+	return nil
 }
 
 // populated reports whether any bucket holds a key, which is how a new file is told
@@ -483,6 +551,18 @@ func (r *Reader) counter(key string) uint64 {
 
 func (w *Writer) setCounter(key string, n uint64) error {
 	return w.bucket(bucketMeta).Put([]byte(key), encodeUint64(n))
+}
+
+// addKeyCount moves the key counter for a bucket, if that bucket has one.
+//
+// Silent about a bucket with no counter, because most buckets do not have one and
+// making this an error would mean every caller checking a condition it cannot act on.
+func (w *Writer) addKeyCount(bucket string, delta int64) error {
+	key, ok := keyCounters[bucket]
+	if !ok {
+		return nil
+	}
+	return w.addCounter(key, delta)
 }
 
 func (w *Writer) addCounter(key string, delta int64) error {
