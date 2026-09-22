@@ -631,6 +631,34 @@ Then `internal/plugins/{chat,aggro,images,games,autopost}`, each a `core.Service
 
 **The report carries deltas as well as totals.** A lifetime count of 40,000 rejections says nothing about whether it is happening now, which is the only question worth asking of a counter on a ticker. A nonzero delta additionally gets its own record at a level that carries, naming what to do about it; the routine line gets skimmed.
 
+**`Reader.Status` is nine counter lookups and must never go back to walking.** Six of its
+fields came from `Bucket.Stats().KeyN` until M34, which walks every page in the bucket. Finding
+11 had already moved that call off the per-message path and onto a ticker, and that was treated
+as the fix; on the production corpus the walk reached **26 seconds, every five minutes**. The
+cost that mattered was not the walk. bbolt is copy-on-write and cannot reclaim a page while a
+transaction that might still see it is open, so a read transaction of that length stopped the
+writer reusing freed pages for about 9% of every hour: the file grew, the next walk had more
+pages to cross, and the window widened. The status line was measuring corpus growth and causing
+some of it, and it showed up as a 1m34s reply to a message that landed inside the window
+(`SPEC.md` finding 58). **Moving an expensive read off the hot path is not the same as making
+it cheap** - ask what it costs the writer, not only how often it runs.
+
+The counters are maintained at the write sites, which all had the answer already: `LearnNgram`
+computes `firstSighting` and branches on `isPresent`, `addAssoc` and `IncTopic` read the old
+value to add to it, and the deletes collect their victims into a slice. `addKeyCount` is keyed
+by bucket through `keyCounters`, because `addAssoc` serves both association buckets and takes
+its bucket by name. `backfillKeyCounts` seeds an existing corpus with one walk on one startup,
+the way `backfillTopicTotal` does, and deliberately leaves an empty bucket's counter absent so
+a fresh corpus is not walked on every boot.
+
+**`TestStatusCountersMatchAWalk` compares the counters against a real walk of the same file**,
+after inserts, repeat writes, deletes of keys that are not there, and a purge. That is the
+point: a counter consistent with itself can be consistently wrong, and only the thing it
+replaced can say otherwise. It was built by mutation testing, and that was not ceremony - two
+of the five deliberately broken versions passed the first fixture. The fixture writes every key
+**twice** and gives one edge **three distinct authors**, because those are the two shapes where
+a counter incremented on the wrong line still agrees with the walk.
+
 **The latency probe reads `Session.HeartbeatLatency()`.** It used to make a `User("@me")` REST call every two minutes purely to time it, which is asking the network for something the library already measures: finding 17's shape in a different feature. It also measured the wrong thing, since a slow REST endpoint and a struggling gateway connection are different problems.
 
 **Shutdown reports once more, before the wait.** That final line is where an operator reading a container's last output finds out whether the queue had been full, and putting it before the wait means a stuck loop cannot cost it.

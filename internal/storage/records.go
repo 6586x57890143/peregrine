@@ -126,8 +126,14 @@ func (w *Writer) IncTopic(word string) error {
 		return nil
 	}
 	b := w.bucket(bucketTopic)
-	if err := b.Put([]byte(word), encodeUint64(decodeUint64(b.Get([]byte(word)))+1)); err != nil {
+	existing := b.Get([]byte(word))
+	if err := b.Put([]byte(word), encodeUint64(decodeUint64(existing)+1)); err != nil {
 		return err
+	}
+	if existing == nil {
+		if err := w.addKeyCount(bucketTopic, 1); err != nil {
+			return err
+		}
 	}
 	return w.addCounter(metaTopicTotal, 1)
 }
@@ -232,8 +238,15 @@ func (w *Writer) addAssoc(bucket, a, b string, position float64) error {
 	if err != nil {
 		return err
 	}
-	count, posSum := decodeAssoc(bkt.Get(key))
-	return bkt.Put(key, encodeAssoc(count+1, posSum+position))
+	existing := bkt.Get(key)
+	count, posSum := decodeAssoc(existing)
+	if err := bkt.Put(key, encodeAssoc(count+1, posSum+position)); err != nil {
+		return err
+	}
+	if existing == nil {
+		return w.addKeyCount(bucket, 1)
+	}
+	return nil
 }
 
 func (r *Reader) assocsFor(bucket, a string) (map[string]corpus.TopicAssoc, error) {
@@ -306,7 +319,15 @@ func (w *Writer) PutName(key string, n corpus.Name) error {
 	if err != nil {
 		return err
 	}
-	return w.bucket(bucketName).Put([]byte(key), data)
+	b := w.bucket(bucketName)
+	existing := b.Get([]byte(key)) != nil
+	if err := b.Put([]byte(key), data); err != nil {
+		return err
+	}
+	if existing {
+		return nil
+	}
+	return w.addKeyCount(bucketName, 1)
 }
 
 // ForEachName visits every name record.
@@ -675,26 +696,33 @@ type Status struct {
 	Learned       uint64
 }
 
-// Status collects the counts.
+// Status collects the counts. Every field is a meta counter, so the whole thing is
+// nine key lookups and the read transaction it runs in lives for microseconds.
 //
-// Bucket.Stats() walks every page, so this is genuinely expensive and is called on a
-// ticker rather than per message. It used to be called once per message purely to
-// fill a log field (SPEC.md section 8, finding 11).
+// It was six Bucket.Stats() calls until M34, which walk every page in the bucket. The
+// cost was already known and was thought to be paid for by moving the call off the
+// per-message path and onto a ticker (finding 11). On the production corpus the walk
+// had reached 26 seconds, fired every five minutes, and the second-order cost turned
+// out to be the one that mattered: bbolt is copy-on-write, and it cannot reclaim a
+// page while a transaction that might still see it is open. bbolt's own README says
+// it plainly, "a long-running read transaction can make the database grow quickly".
+// So the writer allocated fresh pages instead of reusing freed ones for nine percent
+// of every hour, the file grew, and the next walk had more pages to cross. Moving an
+// expensive read off the hot path is not the same as making it cheap; this one was
+// feeding the thing it measured (SPEC.md section 8, finding 58).
+//
+// Counters cannot drift because bbolt transactions are atomic: the increment commits
+// with the insert that caused it or neither does. TestStatusCountersMatchAWalk is
+// what proves the increments are in the right places, since a counter that is merely
+// consistent with itself can still be consistently wrong.
 func (r *Reader) Status() Status {
-	keyN := func(name string) int {
-		b := r.bucket(name)
-		if b == nil {
-			return 0
-		}
-		return b.Stats().KeyN
-	}
 	return Status{
-		Ngrams:        keyN(bucketNgram),
-		AuthorEntries: keyN(bucketNgramAuth),
-		Topics:        keyN(bucketTopic),
-		TopicWords:    keyN(bucketTopicWord),
-		NameTopics:    keyN(bucketNameTopic),
-		Names:         keyN(bucketName),
+		Ngrams:        int(r.counter(metaNgramCount)),
+		AuthorEntries: int(r.counter(metaNgramAuthCount)),
+		Topics:        int(r.counter(metaTopicKeys)),
+		TopicWords:    int(r.counter(metaTopicWordCount)),
+		NameTopics:    int(r.counter(metaNameTopicCount)),
+		Names:         int(r.counter(metaNameCount)),
 		HistoryWindow: r.counter(metaHistoryCount),
 		ImageCache:    r.counter(metaImageCount),
 		Learned:       r.counter(metaMessagesLearned),
