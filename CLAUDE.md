@@ -532,10 +532,29 @@ deleted card fails forever. A press on a card this process no longer holds (afte
 an "ended" card with no buttons, so nothing needs a shutdown edit.
 
 **The card is a card**, the opposite of M28's call for puzzles: a match is asked for and played by
-pressing buttons on it. It moves to the bottom only at a round boundary and only once the channel
-has moved on from it, posting the new card before deleting the old (M25's order); never mid-turn,
-which would move a button from under somebody's thumb. **`MaxChannels` refuses a new match rather
-than evicting one**, the opposite of wordgame's cooldown map, because eviction deletes live gold.
+pressing buttons on it. Every embed part has one job (M35f): author is the brand, title the phase,
+description the emoji-tile board and whose turn it is, fields the letters left and one inline tile
+per player, footer the rules, image the wheel strip. **Every board tile is followed by a space**,
+because two regional indicators side by side render as a flag; `TestTheBoardIsEmojiTilesThatNeverFormFlags`
+fails if that goes. **A solved round pauses on a recap** (`wheel.Intermission`): the answer, who got
+it and the standings, until anyone playing presses next or `RecapPause` runs out. Before it, a
+solve replaced the board in the same instant and nobody saw the answer.
+
+**The strip is an image because an image sets an embed's width.** Without it the card changed
+shape with its board. `internal/wheelart` draws it from `wheel.Wedges()`, `tools/wheelart` writes
+the 25 PNGs to `assets/wheel`, and a test compares them PIXEL for pixel (not bytes: the encoder's
+compression may change between Go releases). They are served from the public repo's raw URL,
+`PEREGRINE_WHEEL_ASSET_URL`, so edits keep them without re-uploading anything; the default only
+resolves while the repo is public, and empty turns images off.
+
+**The card follows the conversation.** After `PEREGRINE_WHEEL_REPOST_AFTER` messages (default 6),
+at most once per 20 seconds, the sweep posts it again at the bottom, new card first and old one
+deleted second (M25's order). Any time, not only between rounds, so a press can land on the card
+just replaced: the action still applies, since the Turn token already decides whether it may, and
+the press is answered with `Guard.Acknowledge` (a deferred update that says nothing) because the
+message it came from is gone; the sweep repaints the live card a second later. **`MaxChannels`
+refuses a new match rather than evicting one**, the opposite of wordgame's cooldown map, because
+eviction deletes live gold.
 
 ### Names: one answer to what somebody is called, and the author is always one
 

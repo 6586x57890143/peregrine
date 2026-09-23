@@ -67,6 +67,7 @@ type Guard interface {
 	EditEmbed(channelID, messageID string, embed *discordgo.MessageEmbed,
 		components ...discordgo.MessageComponent) bool
 	RespondModal(i *discordgo.Interaction, customID, title string, inputs ...discordgo.TextInput) bool
+	Acknowledge(i *discordgo.Interaction) bool
 }
 
 // Counter is the activity the service reads: where it is busy, for interval mode, and how
@@ -130,6 +131,14 @@ type Options struct {
 	// Wheel turns on /wheel and /wallet, M35. Separate from Enabled because the wheel is a
 	// separate game: an operator who switched the scramble off has said nothing about it.
 	Wheel bool
+
+	// WheelRepostAfter is how many messages of conversation move the card to the bottom of
+	// the channel. Zero takes the default.
+	WheelRepostAfter int
+
+	// WheelAssetURL is where the wheel's banner images are served from, ending in a slash.
+	// Empty means the card has no image.
+	WheelAssetURL string
 
 	// PointsBase is what a puzzle solved with no hints showing is worth, and every delivered
 	// rung of the hint ladder takes one off that.

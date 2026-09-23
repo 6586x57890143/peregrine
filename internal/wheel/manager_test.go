@@ -56,16 +56,16 @@ func TestFullMatchScripted(t *testing.T) {
 	rec(f.do(Vowel, "o"))     // a: 1550
 	rec(f.spinTo(wBankrupt))  // a: 0; b's turn
 	rec(f.spinTo(w600))
-	rec(f.do(Consonant, "w"))       // b: 600
-	rec(f.do(Solve, "hello world")) // b banks 600; round 2 opens on b (seat 1)
+	rec(f.do(Consonant, "w"))   // b: 600
+	rec(f.solve("hello world")) // b banks 600; round 2 opens on b (seat 1)
 	rec(f.spinTo(w2500))
-	rec(f.do(Consonant, "g"))       // b: 2500
-	rec(f.do(Solve, "big if tree")) // wrong; a's turn
+	rec(f.do(Consonant, "g"))   // b: 2500
+	rec(f.solve("big if tree")) // wrong; a's turn
 	rec(f.spinTo(w600))
-	rec(f.do(Consonant, "b"))       // a: 600
-	rec(f.do(Solve, "big if true")) // a banks 600 and ties b; the earlier seat takes the bonus
+	rec(f.do(Consonant, "b"))   // a: 600
+	rec(f.solve("big if true")) // a banks 600 and ties b; the earlier seat takes the bonus
 	rec(f.do(Pick, "gdbo"))
-	u := f.do(Solve, "good job")
+	u := f.solve("good job")
 	rec(u)
 	t.Log("\n" + strings.Join(log, "\n"))
 
@@ -117,7 +117,7 @@ func playRandom(t *testing.T, seed uint64, check bool) *Result {
 		}
 	}
 	texts := []string{"", "l", "o", "e", "z", "a", "1", "gdbo", "cdmi", "hello world", "big if true", "good job", "the ball pit", "a boss fight", "nope"}
-	kindsAll := []ActionKind{Join, Leave, Start, Spin, Spin, Consonant, Consonant, Consonant, Vowel, Solve, Pick}
+	kindsAll := []ActionKind{Join, Leave, Start, Spin, Spin, Consonant, Consonant, Consonant, Vowel, Solve, Pick, Next}
 
 	var result *Result
 	prev, _ := m.Snapshot(testChannel)
@@ -206,6 +206,8 @@ func sensible(rng *rand.Rand, m *Manager, v View) Action {
 	switch v.Phase {
 	case Lobby:
 		a.Kind, a.UserID = Start, v.HostID
+	case Intermission:
+		a.Kind, a.UserID = Next, v.Players[rng.IntN(len(v.Players))].UserID
 	case BonusPick:
 		a.Kind, a.Text = Pick, []string{"gdbo", "cdmi", "hpwa", "fkyu"}[rng.IntN(4)]
 	case BonusSolve:
@@ -263,7 +265,7 @@ func checkInvariants(t *testing.T, seed uint64, step int, m *Manager, prev View,
 			fail("called not sorted and unique: %q", string(v.Called))
 		}
 	}
-	if u.Result == nil && v.Phase != Lobby {
+	if u.Result == nil && v.Phase != Lobby && v.Phase != Intermission {
 		phrase := m.matches[testChannel].puzzle.Phrase
 		called := map[rune]bool{}
 		for _, r := range v.Called {
@@ -378,7 +380,7 @@ func TestResultReturnedExactlyOnce(t *testing.T) {
 	f := newFixture(t, testOpts())
 	f.begin("a")
 	f.earn("l")
-	u := f.do(Solve, "hello world")
+	u := f.solve("hello world")
 	if u.Result != nil {
 		t.Fatal("the result arrived before the bonus")
 	}

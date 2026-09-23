@@ -188,6 +188,7 @@ func (r *wheelRig) playSolo() {
 	r.press(alice, actSpin)
 	r.typed(alice, actConsonant, "l")
 	r.typed(alice, actSolve, "Hello, world!")
+	r.press(alice, actNext) // past the recap
 	r.typed(alice, actPick, "h d w o")
 	r.typed(alice, actSolve, "hello world")
 }
@@ -402,41 +403,6 @@ func TestAWrongSolveIsNotEchoed(t *testing.T) {
 	}
 }
 
-// A new round moves the card to the bottom only once the channel has moved on from it, and
-// the new card goes up before the old one comes down.
-func TestARoundStartRepostsOnlyAfterTraffic(t *testing.T) {
-	for _, busy := range []bool{false, true} {
-		r := wheelFixture(t, wheel.Options{Rounds: 2}, "phrase|hello world", "thing|good job")
-		r.s.handleWheel(wheelCommand(alice, wheelCommandName))
-		r.press(alice, actStart)
-		first := r.view().MessageID
-		if busy {
-			r.counter.n = repostAfter
-		}
-		r.typed(alice, actSolve, r.solution())
-
-		cards := len(r.guard.posted()) - r.guard.updates
-		switch {
-		case !busy && (r.view().MessageID != first || len(r.guard.deleted()) != 0):
-			t.Fatal("a quiet channel had its card reposted")
-		case busy && (r.view().MessageID == first || cards != 2):
-			t.Fatalf("a busy channel kept its old card: %d cards", cards)
-		case busy && (len(r.guard.deleted()) != 1 || r.guard.deleted()[0] != first):
-			t.Fatalf("deleted %v, want the old card", r.guard.deleted())
-		}
-	}
-}
-
-// solution reads the live puzzle off the engine's own board once revealed, which a test can
-// only do by revealing it: the phrase is not in the view until the match is over. steady
-// draws the second puzzle for round one when there are two.
-func (r *wheelRig) solution() string {
-	if strings.Contains(r.view().Category, "thing") {
-		return "good job"
-	}
-	return "hello world"
-}
-
 func TestWheelComponentsDoNotReachTheBoardHandler(t *testing.T) {
 	r := wheelFixture(t, wheel.Options{})
 	r.s.handleWheel(wheelCommand(alice, wheelCommandName))
@@ -555,23 +521,6 @@ func TestAWheelIDRoundTripsAndRejectsForeignShapes(t *testing.T) {
 	for _, bad := range []string{"", "lb:local:1", "wof:spin", "wof:dance:1", "wof:spin:x", "wof:spin:1:2"} {
 		if _, _, ok := parseWheelID(bad); ok {
 			t.Errorf("%q parsed", bad)
-		}
-	}
-}
-
-// The board wraps at word boundaries into lines a phone shows without scrolling.
-func TestTheBoardWrapsAtWordBoundaries(t *testing.T) {
-	lines := wrapBoard("A RACCOON IN A TRENCH COAT")
-	// "A RACCOON IN" is exactly 12 cells counting a cell per word gap, so it shares a line.
-	want := []string{"A   R A C C O O N   I N", "A   T R E N C H   C O A T"}
-	if strings.Join(lines, "|") != strings.Join(want, "|") {
-		t.Fatalf("wrapped %q, want %q", lines, want)
-	}
-	// Letters plus word gaps fit in 13 cells, and a line renders at most 2 x 13 - 1 characters
-	// whatever the mix of words, because a word gap costs three characters and one cell.
-	for _, l := range wrapBoard("_____________ ____ ___ __ _ A B C D E F G H") {
-		if len(l) > 2*boardCells-1 {
-			t.Errorf("line %q is wider than a phone", l)
 		}
 	}
 }

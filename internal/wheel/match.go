@@ -13,6 +13,10 @@ type Phase int
 const (
 	Lobby Phase = iota
 	Round
+	// Intermission is the pause after a round is solved: the solved phrase, who solved it and the
+	// standings, before the next round or the bonus. Without it a solve replaced the board
+	// in the same instant, and nobody saw the answer or who got it.
+	Intermission
 	BonusPick
 	BonusSolve
 	Done
@@ -41,6 +45,7 @@ const (
 	Vowel
 	Solve
 	Pick // the bonus round's three consonants and a vowel
+	Next // ends an intermission early; any player still in the match may press it
 )
 
 // Action is one request from a player. Turn is the token the button or modal was built
@@ -126,6 +131,8 @@ type match struct {
 	pending *Wedge
 	wedge   int // index of the last wedge landed on, or -1
 
+	recap *Recap // set only in the Intermission phase
+
 	bonusPrize  int
 	bonusPlayed bool
 	bonusWon    bool
@@ -161,6 +168,15 @@ func (m *match) act(a Action, now time.Time) error {
 		return m.join(a)
 	case Leave:
 		return m.leave(a.UserID, now)
+	case Next:
+		if m.phase != Intermission {
+			return ErrWrongPhase
+		}
+		if i := m.find(a.UserID); i < 0 || m.players[i].left {
+			return ErrNotJoined
+		}
+		m.afterRecap(now)
+		return nil
 	case Start:
 		if m.phase != Lobby {
 			return ErrWrongPhase
@@ -462,15 +478,32 @@ func (m *match) solve(text string, now time.Time) error {
 	return nil
 }
 
-// win banks the current player's round and moves on. Everybody else's round bank is
-// dropped, which is the rule that makes solving early worth anything.
+// win banks the current player's round and pauses on a recap. Everybody else's round bank
+// is dropped, which is the rule that makes solving early worth anything.
+//
+// The token moves on entering the recap, so a press built against the solved round cannot
+// act on the next one.
 func (m *match) win(now time.Time) {
 	p := m.players[m.cur]
 	p.bank += p.round
 	m.emit(Event{Kind: Solved, UserID: p.id, Name: p.name, Text: m.puzzle.Phrase, Amount: p.round})
+	m.recap = &Recap{
+		Round: m.round, Category: m.puzzle.Category, Phrase: m.puzzle.Phrase,
+		SolverID: p.id, SolverName: p.name, Gold: p.round,
+	}
 	for _, q := range m.players {
 		q.round = 0
 	}
+	m.phase = Intermission
+	m.pending = nil
+	m.turn++
+	m.deadline = now.Add(m.opts.RecapPause)
+}
+
+// afterRecap ends the pause: the next round, or the bonus after the last one.
+func (m *match) afterRecap(now time.Time) {
+	m.recap = nil
+	m.phase = Round
 	m.nextRound(now)
 }
 
@@ -582,13 +615,17 @@ func (m *match) tick(now time.Time) bool {
 			m.end(Aborted, TooFewPlayers)
 		}
 		return true
-	case Round, BonusPick, BonusSolve:
+	case Round, Intermission, BonusPick, BonusSolve:
 		if now.Sub(m.startedAt) >= m.opts.MaxDuration {
 			m.end(Done, TimeLimit)
 			return true
 		}
 		if now.Before(m.deadline) {
 			return false
+		}
+		if m.phase == Intermission {
+			m.afterRecap(now)
+			return true
 		}
 		p := m.players[m.cur]
 		m.emit(Event{Kind: TimedOut, UserID: p.id, Name: p.name})
@@ -678,19 +715,20 @@ func (m *match) result() *Result {
 
 func (m *match) view() View {
 	v := View{
-		GuildID:   m.guildID,
-		ChannelID: m.channelID,
-		MessageID: m.messageID,
-		HostID:    m.hostID,
-		Version:   m.version,
-		Turn:      m.turn,
-		Phase:     m.phase,
-		Reason:    m.reason,
-		Round:     m.round,
-		Rounds:    m.opts.Rounds,
-		Deadline:  m.deadline,
-		LastWedge: m.wedge,
-		Last:      slices.Clone(m.last),
+		GuildID:    m.guildID,
+		ChannelID:  m.channelID,
+		MessageID:  m.messageID,
+		HostID:     m.hostID,
+		Version:    m.version,
+		Turn:       m.turn,
+		Phase:      m.phase,
+		Reason:     m.reason,
+		Round:      m.round,
+		Rounds:     m.opts.Rounds,
+		MaxPlayers: m.opts.MaxPlayers,
+		Deadline:   m.deadline,
+		LastWedge:  m.wedge,
+		Last:       slices.Clone(m.last),
 	}
 	for _, p := range m.players {
 		v.Players = append(v.Players, PlayerView{
@@ -702,13 +740,21 @@ func (m *match) view() View {
 	}
 	v.Category = m.puzzle.Category
 	v.Board = m.board()
+	if m.recap != nil {
+		r := *m.recap
+		v.Recap = &r
+		v.Board = m.puzzle.Phrase
+	}
 	for r := range m.called {
 		v.Called = append(v.Called, r)
 	}
 	slices.Sort(v.Called)
-	if !m.over() {
+	switch {
+	case m.phase == Intermission:
+		// Nobody's turn: the pause belongs to everybody.
+	case !m.over():
 		v.Current = m.players[m.cur].id
-	} else {
+	default:
 		v.BonusPrize = m.bonusPrize
 		v.Board = m.puzzle.Phrase
 	}

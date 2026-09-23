@@ -8,6 +8,7 @@ import (
 	"github.com/bwmarrin/discordgo"
 
 	"github.com/6586x57890143/peregrine/internal/wheel"
+	"github.com/6586x57890143/peregrine/internal/wheelart"
 	"github.com/6586x57890143/peregrine/internal/wordgame"
 )
 
@@ -19,157 +20,245 @@ import (
 // by pressing buttons on it for ten minutes. That is the leaderboard's category, a notice
 // people act on, and the box is what holds the buttons and the board together.
 //
-// Everything on it is rendered from a wheel.View, so this file is pure: no state, no I/O, and
-// the only user-controlled text on the card is nicknames, which the guard gates on every
-// repaint. A wrong solve is never quoted, and the engine does not even carry it, because one
+// Every part of an embed is used for one job: the author line is the brand, the title is the
+// phase, the description is the board and whose turn it is, the fields are the letters left
+// and one tile per player, the footer is the rules, and the image is the wheel strip. The strip
+// is also what pins the card's width, since an embed is otherwise only as wide as its widest
+// line and the card would change shape as the board did (see internal/wheelart).
+//
+// Everything is rendered from a wheel.View, so this file is pure: no state, no I/O, and the
+// only user-controlled text on the card is nicknames, which the guard gates on every repaint.
+// A wrong solve is never quoted, and the engine does not even carry it, because one
 // blocklisted guess would otherwise make every later repaint of the match fail the gate.
 
-// boardCells is the widest line of the board, in letter cells. It is the engine's
-// per-word limit, so a word never has to be split, and at two characters a cell it keeps
-// a line inside a phone screen without horizontal scrolling.
-const boardCells = 13
+// boardCells is the widest line of the board, in tiles, counting a tile for each word gap.
+// Eleven emoji tiles fit a phone's embed without the client wrapping mid-word.
+const boardCells = 11
 
 // Phase colours: the one thing on the card readable at a glance while scrolling.
 const (
 	colourLobby = 0x3498DB
 	colourPlay  = 0xF1C40F
+	colourRecap = 0x2ECC71
 	colourBonus = 0x9B59B6
 	colourOver  = 0x95A5A6
 )
 
-// wheelCard renders a view and the buttons under it. A finished match gets an EMPTY
-// component slice rather than nil, because both the edit and the interaction update omit or
-// null a nil one, and a finished card must lose its buttons.
-func wheelCard(v wheel.View) (*discordgo.MessageEmbed, []discordgo.MessageComponent) {
-	e := &discordgo.MessageEmbed{Color: colourPlay}
+const (
+	brand     = "🎡 WHEEL OF FORTUNE"
+	divider   = "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"
+	bar       = " ┃ "
+	wordGap   = "　" // ideographic space: a word break wider than a tile gap
+	tileGap   = " "
+	hidden    = "⬜"
+	alphabet1 = "ABCDEFGHIJKLM"
+	alphabet2 = "NOPQRSTUVWXYZ"
+)
+
+// wheelCard renders a view and the buttons under it. assets is the base URL of the strip
+// images, ending in a slash, or empty for no image. A finished match gets an EMPTY component
+// slice rather than nil, because both the edit and the interaction update omit or null a nil
+// one, and a finished card must lose its buttons.
+func wheelCard(v wheel.View, assets string) (*discordgo.MessageEmbed, []discordgo.MessageComponent) {
+	e := &discordgo.MessageEmbed{
+		Author: &discordgo.MessageEmbedAuthor{Name: brand},
+		Footer: &discordgo.MessageEmbedFooter{Text: rulesFooter()},
+	}
 	var b strings.Builder
 
 	switch v.Phase {
 	case wheel.Lobby:
-		e.Title = "🎡 wheel of fortune"
-		e.Color = colourLobby
-		fmt.Fprintf(&b, "%s\n", subtext("sign-ups close <t:"+strconv.FormatInt(v.Deadline.Unix(), 10)+":R>"))
-		fmt.Fprintf(&b, "press **join** to play%s%d rounds and a bonus", sep, v.Rounds)
+		e.Title, e.Color = "✦ SIGN-UPS OPEN ✦", colourLobby
+		fmt.Fprintf(&b, "Press **✋ join** to play%s**%s** + ⭐ bonus\n", bar, plural(v.Rounds, "round"))
+		fmt.Fprintf(&b, "⏳ starts %s, or when the 👑 host presses **▶️ start**", relative(v))
+		e.Fields = []*discordgo.MessageEmbedField{lobbyField(v)}
+
 	case wheel.Round, wheel.BonusPick, wheel.BonusSolve:
-		e.Title = fmt.Sprintf("🎡 round %d/%d", v.Round, v.Rounds)
+		e.Title, e.Color = fmt.Sprintf("ROUND %d ⁄ %d%s📜 %s", v.Round, v.Rounds, bar, upper(v.Category)), colourPlay
 		if v.Phase != wheel.Round {
-			e.Title, e.Color = "🎡 bonus round", colourBonus
+			e.Title, e.Color = fmt.Sprintf("⭐ BONUS ROUND%s%s", bar, upper(v.Category)), colourBonus
 		}
-		writeBoard(&b, v)
-		b.WriteString("\n" + turnLine(v))
+		b.WriteString(tiles(v.Board))
+		b.WriteString("\n" + divider + "\n")
+		b.WriteString(turnBlock(v))
+		writeEvent(&b, v.Last)
+		e.Fields = append([]*discordgo.MessageEmbedField{lettersField(v.Called)}, playerFields(v)...)
+
+	case wheel.Intermission:
+		r := v.Recap
+		e.Title, e.Color = fmt.Sprintf("✅ ROUND %d SOLVED%s📜 %s", r.Round, bar, upper(r.Category)), colourRecap
+		b.WriteString(tiles(r.Phrase))
+		b.WriteString("\n" + divider + "\n")
+		fmt.Fprintf(&b, "🎉 **%s** solved it and banks **%s** gold\n", name(r.SolverName, r.SolverID), commas(r.Gold))
+		next := fmt.Sprintf("round %d", r.Round+1)
+		if r.Round >= v.Rounds {
+			next = "the ⭐ bonus round"
+		}
+		fmt.Fprintf(&b, "-# ⏭️ %s starts %s, or press **next**", next, relative(v))
+		e.Fields = []*discordgo.MessageEmbedField{standingsField(v)}
+
 	default:
-		e.Title, e.Color = "🎡 game over", colourOver
-		writeBoard(&b, v)
+		e.Title, e.Color = endTitle(v), colourOver
+		if v.Board != "" {
+			b.WriteString(tiles(v.Board))
+			b.WriteString("\n" + divider + "\n")
+		}
+		if line := endLine(v); line != "" {
+			b.WriteString(line + "\n")
+		}
+		writeEvent(&b, v.Last)
+		e.Fields = []*discordgo.MessageEmbedField{standingsField(v)}
+		e.Footer.Text = "thanks for playing" + bar + "/wheel to play again"
 	}
-	if line := eventLine(v.Last); line != "" {
-		b.WriteString("\n" + subtext(line))
+
+	e.Description = strings.TrimRight(b.String(), "\n")
+	if assets != "" {
+		e.Image = &discordgo.MessageEmbedImage{URL: assets + stripFor(v)}
 	}
-	e.Description = b.String()
-	e.Fields = []*discordgo.MessageEmbedField{{Name: "players", Value: playerList(v)}}
 	return e, wheelButtons(v)
 }
 
-// writeBoard puts the category over the board, and the called letters under it.
-func writeBoard(b *strings.Builder, v wheel.View) {
-	fmt.Fprintf(b, "%s\n```\n%s\n```", subtext(strings.ToLower(v.Category)), strings.Join(wrapBoard(v.Board), "\n"))
-	if len(v.Called) > 0 && v.Phase != wheel.Done && v.Phase != wheel.Aborted {
-		letters := make([]string, len(v.Called))
-		for i, r := range v.Called {
-			letters[i] = string(r)
-		}
-		b.WriteString("\n" + subtext("called: "+strings.Join(letters, " ")))
-	}
-}
-
-// wrapBoard lays the phrase out as cells, a space between letters and three between words,
-// wrapped at word boundaries so no line is wider than boardCells.
-func wrapBoard(board string) []string {
+// tiles renders the board as emoji tiles, wrapped at word boundaries. A letter is a regional
+// indicator and a hidden letter a white tile. Every tile is followed by a space, which is also
+// what stops two regional indicators side by side from rendering as a flag.
+func tiles(board string) string {
 	var lines []string
 	var cur []string
 	width := 0
 	for _, w := range strings.Fields(board) {
 		n := len([]rune(w))
 		if width > 0 && width+1+n > boardCells {
-			lines = append(lines, strings.Join(cur, "   "))
+			lines = append(lines, strings.Join(cur, wordGap))
 			cur, width = nil, 0
 		}
 		if width > 0 {
 			width++
 		}
 		width += n
-		cur = append(cur, strings.Join(strings.Split(w, ""), " "))
+		t := make([]string, 0, n)
+		for _, r := range w {
+			t = append(t, tile(r))
+		}
+		cur = append(cur, strings.Join(t, tileGap))
 	}
 	if len(cur) > 0 {
-		lines = append(lines, strings.Join(cur, "   "))
+		lines = append(lines, strings.Join(cur, wordGap))
 	}
-	return lines
+	return strings.Join(lines, "\n")
 }
 
-// turnLine says whose turn it is, what they can do, and until when. The deadline is a Discord
-// relative timestamp, so the client counts it down and no edit is spent on a clock.
-func turnLine(v wheel.View) string {
-	name := "somebody"
+func tile(r rune) string {
+	switch {
+	case r == '_':
+		return hidden
+	case r >= 'A' && r <= 'Z':
+		return string(rune(0x1F1E6 + (r - 'A')))
+	case r >= '0' && r <= '9':
+		return string(r) + "️⃣" // keycap
+	case r == '!':
+		return "❗"
+	case r == '?':
+		return "❓"
+	}
+	return "**" + string(r) + "**"
+}
+
+// turnBlock is whose turn it is, until when, and what they can do.
+func turnBlock(v wheel.View) string {
+	who := "somebody"
 	for _, p := range v.Players {
 		if p.UserID == v.Current {
-			name = displayName(p)
+			who = displayName(p)
 		}
 	}
-	var do string
+	head := fmt.Sprintf("❯ **%s** to play%s⏳ %s\n", who, bar, relative(v))
 	switch {
 	case v.Phase == wheel.BonusPick:
-		do = "pick 3 consonants and a vowel"
+		return head + "⭐ pick **3 consonants** and **1 vowel**, R S T L N E are free"
 	case v.Phase == wheel.BonusSolve:
-		do = "one guess at the bonus"
+		return head + "⭐ **one guess** at the bonus puzzle"
 	case v.Pending != nil:
-		do = fmt.Sprintf("%s on the wheel, call a consonant", commas(v.Pending.Value))
+		return head + fmt.Sprintf("🎯 **%s** on the wheel%scall a **consonant**", commas(v.Pending.Value), bar)
 	case !v.CanSpin:
-		do = "no consonants left: buy a vowel or solve"
-	default:
-		do = "spin, buy a vowel, or solve"
+		return head + "🔤 consonants are gone" + bar + "**buy a vowel** or **solve**"
 	}
-	return fmt.Sprintf("▸ **%s**%s%s%s<t:%d:R>", name, sep, do, sep, v.Deadline.Unix())
+	return head + "🎡 **spin**" + bar + "🅰️ **buy a vowel**" + bar + "💡 **solve**"
 }
 
-// playerList is one line per seat. In a match it is the round bank and the match bank, and
-// the one whose turn it is carries the marker.
-func playerList(v wheel.View) string {
-	if v.Phase == wheel.Done || v.Phase == wheel.Aborted {
-		return finalStandings(v)
+func writeEvent(b *strings.Builder, evs []wheel.Event) {
+	if line := eventLine(evs); line != "" {
+		if b.Len() > 0 && !strings.HasSuffix(b.String(), "\n") {
+			b.WriteByte('\n')
+		}
+		b.WriteString("-# 💬 " + line)
 	}
+}
+
+// lettersField is the alphabet with the called letters dotted out, so what is left to call
+// reads at a glance. In a code span, so the two rows line up.
+func lettersField(called []rune) *discordgo.MessageEmbedField {
+	gone := map[rune]bool{}
+	for _, r := range called {
+		gone[r] = true
+	}
+	row := func(letters string) string {
+		out := make([]string, 0, len(letters))
+		for _, r := range letters {
+			if gone[r] {
+				out = append(out, "·")
+			} else {
+				out = append(out, string(r))
+			}
+		}
+		return "`" + strings.Join(out, " ") + "`"
+	}
+	return &discordgo.MessageEmbedField{Name: "🔤 LETTERS LEFT", Value: row(alphabet1) + "\n" + row(alphabet2)}
+}
+
+// playerFields is one inline field per seat, which Discord lays out three to a row on a
+// desktop: a scoreboard grid rather than a list.
+func playerFields(v wheel.View) []*discordgo.MessageEmbedField {
+	out := make([]*discordgo.MessageEmbedField, 0, len(v.Players))
+	for _, p := range v.Players {
+		f := &discordgo.MessageEmbedField{Inline: true}
+		switch {
+		case p.Left:
+			f.Name = "🚪 " + displayName(p)
+			f.Value = fmt.Sprintf("🏦 %s\n*left*", commas(p.Bank))
+		default:
+			f.Name = displayName(p)
+			if p.UserID == v.Current {
+				f.Name = "▶ " + f.Name
+			}
+			f.Value = fmt.Sprintf("💰 **%s**\n🏦 %s", commas(p.Round), commas(p.Bank))
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
+func lobbyField(v wheel.View) *discordgo.MessageEmbedField {
 	var b strings.Builder
 	for _, p := range v.Players {
-		name := displayName(p)
-		switch {
-		case v.Phase == wheel.Lobby:
-			fmt.Fprintf(&b, "**%s**", name)
-			if p.UserID == v.HostID {
-				b.WriteString(sep + "host")
-			}
-		case p.Left:
-			fmt.Fprintf(&b, "~~%s~~%s%s banked", name, sep, commas(p.Bank))
-		default:
-			// An ideographic space holds the column where the marker would be, because an
-			// embed trims leading ASCII whitespace.
-			marker := "　"
-			if p.UserID == v.Current {
-				marker = "▸"
-			}
-			fmt.Fprintf(&b, "%s **%s**%s%s this round%s%s banked", marker, name, sep, commas(p.Round), sep, commas(p.Bank))
+		b.WriteString("• **" + displayName(p) + "**")
+		if p.UserID == v.HostID {
+			b.WriteString(" 👑")
 		}
 		b.WriteByte('\n')
 	}
-	return strings.TrimRight(b.String(), "\n")
+	return &discordgo.MessageEmbedField{
+		Name:  fmt.Sprintf("👥 PLAYERS %d ⁄ %d", len(v.Players), v.MaxPlayers),
+		Value: strings.TrimRight(b.String(), "\n"),
+	}
 }
 
-// finalStandings ranks the players by what they banked, which is what gets paid.
-func finalStandings(v wheel.View) string {
-	ps := append([]wheel.PlayerView(nil), v.Players...)
-	// A stable insertion sort: at most ten seats, and ties keep seat order, which is the
-	// engine's own tie-break for the winner.
-	for i := 1; i < len(ps); i++ {
-		for j := i; j > 0 && ps[j].Bank > ps[j-1].Bank; j-- {
-			ps[j], ps[j-1] = ps[j-1], ps[j]
-		}
+// standingsField ranks the players by what they banked, which is what gets paid, with a bar
+// against the leader.
+func standingsField(v wheel.View) *discordgo.MessageEmbedField {
+	ps := ranked(v.Players)
+	top := 0
+	if len(ps) > 0 {
+		top = ps[0].Bank
 	}
 	var b strings.Builder
 	for i, p := range ps {
@@ -177,16 +266,86 @@ func finalStandings(v wheel.View) string {
 		if i < len(medals) && p.Bank > 0 {
 			rank = medals[i]
 		}
-		fmt.Fprintf(&b, "%s **%s**%s%s gold\n", rank, displayName(p), sep, commas(p.Bank))
+		fmt.Fprintf(&b, "%s **%s**%s%s %s\n", rank, displayName(p), sep, meter(p.Bank, top), commas(p.Bank))
 	}
-	return strings.TrimRight(b.String(), "\n")
+	return &discordgo.MessageEmbedField{Name: "🏆 STANDINGS", Value: strings.TrimRight(b.String(), "\n")}
 }
 
-func displayName(p wheel.PlayerView) string {
-	if p.Name == "" {
-		return wordgame.TruncateRunes(p.UserID, nameWidth)
+// ranked orders seats by bank, ties in seat order, which is the engine's own tie-break for
+// the winner. An insertion sort: at most ten seats, and it is stable.
+func ranked(players []wheel.PlayerView) []wheel.PlayerView {
+	ps := append([]wheel.PlayerView(nil), players...)
+	for i := 1; i < len(ps); i++ {
+		for j := i; j > 0 && ps[j].Bank > ps[j-1].Bank; j-- {
+			ps[j], ps[j-1] = ps[j-1], ps[j]
+		}
 	}
-	return wordgame.TruncateRunes(p.Name, nameWidth)
+	return ps
+}
+
+// meter is a six-segment bar of n against the leader's top.
+func meter(n, top int) string {
+	const width = 6
+	full := 0
+	if top > 0 {
+		full = (n*width + top - 1) / top
+	}
+	return strings.Repeat("▰", full) + strings.Repeat("▱", width-full)
+}
+
+// endTitle crowns the winner by the engine's rule: the top bank still playing, ties to the
+// earlier seat, and nobody when nothing was banked.
+func endTitle(v wheel.View) string {
+	if v.Phase == wheel.Done {
+		for _, p := range ranked(v.Players) {
+			if !p.Left && p.Bank > 0 {
+				return "🏆 " + upper(displayName(p)) + " WINS"
+			}
+		}
+	}
+	return "GAME OVER"
+}
+
+// endLine says how the match ended, when it was not simply played out.
+func endLine(v wheel.View) string {
+	if v.Phase == wheel.Aborted || v.Reason != wheel.Completed {
+		if r := endReason(v.Reason); r != "" {
+			return "🛑 " + r
+		}
+	}
+	return ""
+}
+
+// stripFor is the banner file for a view: the landed wedge lit under a spin, plain otherwise.
+func stripFor(v wheel.View) string {
+	if v.LastWedge >= 0 && (v.Phase == wheel.Round) {
+		for _, e := range v.Last {
+			if e.Kind == wheel.Spun {
+				return wheelart.Name(v.LastWedge)
+			}
+		}
+	}
+	return wheelart.Plain
+}
+
+func rulesFooter() string {
+	return fmt.Sprintf("🅰️ vowels %d%s💥 BANKRUPT x2%s⏭️ LOSE A TURN x1%s⭐ bonus up to 25k",
+		wheel.VowelCost, bar, bar, bar)
+}
+
+func relative(v wheel.View) string {
+	return "<t:" + strconv.FormatInt(v.Deadline.Unix(), 10) + ":R>"
+}
+
+func upper(s string) string { return strings.ToUpper(s) }
+
+func displayName(p wheel.PlayerView) string { return name(p.Name, p.UserID) }
+
+func name(n, id string) string {
+	if n == "" {
+		n = id
+	}
+	return wordgame.TruncateRunes(n, nameWidth)
 }
 
 // eventLine says what the last change did, from the engine's structured events. Structured
@@ -194,50 +353,48 @@ func displayName(p wheel.PlayerView) string {
 func eventLine(evs []wheel.Event) string {
 	var parts []string
 	for _, e := range evs {
-		name := "**" + wordgame.TruncateRunes(e.Name, nameWidth) + "**"
+		who := "**" + name(e.Name, e.UserID) + "**"
 		var s string
 		switch e.Kind {
 		case wheel.Joined:
-			s = name + " joined"
+			s = who + " joined"
 		case wheel.Left:
-			s = name + " left"
+			s = who + " left"
 		case wheel.Spun:
 			switch e.Wedge.Kind {
 			case wheel.Bankrupt:
-				s = name + " hit BANKRUPT"
+				s = who + " hit 💥 **BANKRUPT**"
 			case wheel.LoseTurn:
-				s = name + " lost a turn"
+				s = who + " landed on ⏭️ **LOSE A TURN**"
 			default:
-				s = name + " spun " + commas(e.Amount)
+				s = who + " spun **" + commas(e.Amount) + "**"
 			}
 		case wheel.LetterHit:
 			if e.Amount < 0 {
-				s = fmt.Sprintf("%s bought %s (%d)", name, letterName(e.Letter), e.Count)
+				s = fmt.Sprintf("%s bought %s (x%d)", who, letterName(e.Letter), e.Count)
 			} else {
-				s = fmt.Sprintf("%s found %s (+%s)", name, plural(e.Count, string(e.Letter)), commas(e.Amount))
+				s = fmt.Sprintf("%s found **%d %c** (+%s)", who, e.Count, e.Letter, commas(e.Amount))
 			}
 		case wheel.LetterMiss:
-			s = fmt.Sprintf("%s called %c: none there", name, e.Letter)
+			s = fmt.Sprintf("%s called **%c**: none there", who, e.Letter)
 		case wheel.LetterRepeat:
-			s = fmt.Sprintf("%s called %c again", name, e.Letter)
+			s = fmt.Sprintf("%s called **%c** again", who, e.Letter)
 		case wheel.Solved:
-			s = fmt.Sprintf("%s solved it (+%s)", name, commas(e.Amount))
+			s = fmt.Sprintf("%s solved **%s** (+%s)", who, e.Text, commas(e.Amount))
 		case wheel.WrongSolve:
-			s = name + " guessed wrong"
+			s = who + " guessed wrong"
 		case wheel.TimedOut:
-			s = name + " ran out of time"
+			s = who + " ran out of time"
 		case wheel.StruckOut:
-			s = name + " is out for idling"
+			s = who + " is out for idling"
 		case wheel.BonusStart:
-			s = name + " plays the bonus round"
+			s = who + " plays the ⭐ bonus round"
 		case wheel.BonusPicked:
-			s = name + " picked " + strings.Join(strings.Split(e.Text, ""), " ")
+			s = who + " picked **" + strings.Join(strings.Split(e.Text, ""), " ") + "**"
 		case wheel.BonusWon:
-			s = fmt.Sprintf("%s won the bonus: +%s", name, commas(e.Amount))
+			s = fmt.Sprintf("%s won the bonus: **+%s**", who, commas(e.Amount))
 		case wheel.BonusLost:
-			s = fmt.Sprintf("the bonus was %s gold", commas(e.Amount))
-		case wheel.Ended:
-			s = endReason(e.Reason)
+			s = fmt.Sprintf("%s missed the bonus, worth **%s**", who, commas(e.Amount))
 		}
 		if s != "" {
 			parts = append(parts, s)
@@ -248,9 +405,9 @@ func eventLine(evs []wheel.Event) string {
 
 func letterName(r rune) string {
 	if strings.ContainsRune("AEIOU", r) {
-		return "an " + string(r)
+		return "an **" + string(r) + "**"
 	}
-	return "a " + string(r)
+	return "a **" + string(r) + "**"
 }
 
 func endReason(r wheel.Reason) string {
@@ -267,36 +424,49 @@ func endReason(r wheel.Reason) string {
 
 // wheelButtons are the controls for the phase. Every id carries the turn token, so a press
 // aimed at a turn that has since moved on is refused rather than applied to the next one.
-// Labels are this repository's constants, which is why the guard does not gate them.
+// Labels and their emoji are this repository's constants, which is why the guard does not
+// gate them.
 func wheelButtons(v wheel.View) []discordgo.MessageComponent {
-	btn := func(label, action string, style discordgo.ButtonStyle, disabled bool) discordgo.MessageComponent {
-		return discordgo.Button{Label: label, Style: style, CustomID: wheelID(action, v.Turn), Disabled: disabled}
+	btn := func(emoji, label, action string, style discordgo.ButtonStyle, disabled bool) discordgo.MessageComponent {
+		return discordgo.Button{
+			Label: label, Style: style, CustomID: wheelID(action, v.Turn), Disabled: disabled,
+			Emoji: &discordgo.ComponentEmoji{Name: emoji},
+		}
 	}
 	var row []discordgo.MessageComponent
 	switch v.Phase {
 	case wheel.Lobby:
 		row = []discordgo.MessageComponent{
-			btn("join", actJoin, discordgo.PrimaryButton, false),
-			btn("leave", actLeave, discordgo.SecondaryButton, false),
-			btn("start", actStart, discordgo.SuccessButton, false),
+			btn("✋", "join", actJoin, discordgo.PrimaryButton, false),
+			btn("▶️", "start", actStart, discordgo.SuccessButton, false),
+			btn("🚪", "leave", actLeave, discordgo.SecondaryButton, false),
 		}
 	case wheel.Round:
 		row = []discordgo.MessageComponent{
-			btn("spin", actSpin, discordgo.PrimaryButton, !v.CanSpin),
-			btn("consonant", actConsonant, discordgo.PrimaryButton, v.Pending == nil),
-			btn("buy a vowel", actVowel, discordgo.SecondaryButton, v.Pending != nil || !v.CanVowel),
-			btn("solve", actSolve, discordgo.SuccessButton, v.Pending != nil),
-			btn("leave", actLeave, discordgo.DangerButton, false),
+			btn("🎡", "spin", actSpin, discordgo.PrimaryButton, !v.CanSpin),
+			btn("🔤", "consonant", actConsonant, discordgo.PrimaryButton, v.Pending == nil),
+			btn("🅰️", "vowel", actVowel, discordgo.SecondaryButton, v.Pending != nil || !v.CanVowel),
+			btn("💡", "solve", actSolve, discordgo.SuccessButton, v.Pending != nil),
+			btn("🚪", "leave", actLeave, discordgo.DangerButton, false),
+		}
+	case wheel.Intermission:
+		label := "next round"
+		if v.Recap != nil && v.Recap.Round >= v.Rounds {
+			label = "to the bonus"
+		}
+		row = []discordgo.MessageComponent{
+			btn("⏭️", label, actNext, discordgo.SuccessButton, false),
+			btn("🚪", "leave", actLeave, discordgo.SecondaryButton, false),
 		}
 	case wheel.BonusPick:
 		row = []discordgo.MessageComponent{
-			btn("pick letters", actPick, discordgo.PrimaryButton, false),
-			btn("leave", actLeave, discordgo.DangerButton, false),
+			btn("⭐", "pick letters", actPick, discordgo.PrimaryButton, false),
+			btn("🚪", "leave", actLeave, discordgo.DangerButton, false),
 		}
 	case wheel.BonusSolve:
 		row = []discordgo.MessageComponent{
-			btn("solve", actSolve, discordgo.SuccessButton, false),
-			btn("leave", actLeave, discordgo.DangerButton, false),
+			btn("💡", "solve", actSolve, discordgo.SuccessButton, false),
+			btn("🚪", "leave", actLeave, discordgo.DangerButton, false),
 		}
 	default:
 		return []discordgo.MessageComponent{}
@@ -304,13 +474,14 @@ func wheelButtons(v wheel.View) []discordgo.MessageComponent {
 	return []discordgo.MessageComponent{discordgo.ActionsRow{Components: row}}
 }
 
-// endedCard replaces the buttons of a match this process no longer holds: one that finished,
-// or one that was live when the bot restarted. The dead buttons heal on first touch, so a
-// restart needs no shutdown edit.
+// endedCard replaces the buttons of a card for a match this process no longer holds: one that
+// finished, or one that was live when the bot restarted. The dead buttons heal on first touch,
+// so a restart needs no shutdown edit.
 func endedCard() (*discordgo.MessageEmbed, []discordgo.MessageComponent) {
 	return &discordgo.MessageEmbed{
-		Title:       "🎡 wheel of fortune",
-		Description: "this game has ended. /wheel starts a new one",
+		Author:      &discordgo.MessageEmbedAuthor{Name: brand},
+		Title:       "GAME OVER",
+		Description: "this game has ended" + bar + "**/wheel** starts a new one",
 		Color:       colourOver,
 	}, []discordgo.MessageComponent{}
 }
