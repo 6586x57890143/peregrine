@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
+
+	"github.com/6586x57890143/peregrine/internal/wordgame"
 )
 
 // M32: the paginated local and global board.
@@ -281,5 +283,76 @@ func TestAPressOnAnotherApplicationsComponentIsIgnored(t *testing.T) {
 	}
 	if guard.updates != 0 {
 		t.Errorf("updated a message for a component that was not ours")
+	}
+}
+
+// M35: the wheel's gold column.
+
+// The column appears once somebody has gold, which is also what keeps the rollout invisible
+// until a wheel match has paid out.
+func TestTheGoldColumnAppearsOnlyWhenSomebodyHasGold(t *testing.T) {
+	s, guard, _, _ := fixture(t, enabled())
+	s.members = &countingMembers{seen: map[string]int{}}
+	s.board(testGuild).AddWin(snowflake(700), "here", time.Second, 5)
+
+	s.postLeaderboard(testGuild, "c1", snowflake(700))
+	if fields := guard.posted()[0].Fields; len(fields) != 2 {
+		t.Fatalf("a board with no gold has %d columns, want 2", len(fields))
+	}
+
+	s.board(testGuild).AddGold(snowflake(701), "rich", 5600)
+	s.postLeaderboard(testGuild, "c1", snowflake(700))
+	fields := guard.posted()[1].Fields
+	if len(fields) != 3 || fields[2].Name != "wheel · gold" || !fields[2].Inline {
+		t.Fatalf("fields %+v", fields)
+	}
+	// Three columns narrow every name, because three 16-rune names side by side wrap.
+	narrow := wordgame.TruncateRunes("user-"+snowflake(701), nameWidthNarrow)
+	if !strings.Contains(fields[2].Value, "**"+narrow+"**") || !strings.Contains(fields[2].Value, "5,600") {
+		t.Errorf("gold column:\n%s", fields[2].Value)
+	}
+	// The viewer has no gold, and the column says so rather than leaving them out.
+	if !strings.Contains(fields[2].Value, "no gold this week") {
+		t.Errorf("the viewer's missing row is not explained:\n%s", fields[2].Value)
+	}
+	// A gold-only player is not on the scramble board.
+	if strings.Contains(fields[0].Value, "user-"+snowflake(701)) {
+		t.Errorf("a gold-only player is ranked for scramble points:\n%s", fields[0].Value)
+	}
+}
+
+func TestAGlobalBoardSumsGold(t *testing.T) {
+	s, guard, _, _ := fixture(t, enabled())
+	s.members = &countingMembers{seen: map[string]int{}}
+
+	who := snowflake(700)
+	s.board(testGuild).AddGold(who, "p", 1000)
+	s.board(otherGuild).AddGold(who, "p", 2500)
+
+	s.handleLeaderboard(boardInteraction(who, testGuild, scopeGlobal))
+	fields := guard.posted()[0].Fields
+	if len(fields) != 3 || !strings.Contains(fields[2].Value, "3,500") {
+		t.Fatalf("gold column %+v", fields)
+	}
+	s.handleLeaderboard(boardInteraction(who, testGuild, scopeLocal))
+	if local := guard.posted()[1].Fields; !strings.Contains(local[2].Value, "1,000") {
+		t.Errorf("the local board counted another server's gold:\n%s", local[2].Value)
+	}
+}
+
+// One pair of buttons pages every column, so the count is the longest of the three. A gold
+// column longer than the others must still be reachable.
+func TestPagesCoverTheLongestOfThreeColumns(t *testing.T) {
+	s, guard, _, _ := fixture(t, enabled())
+	s.members = &countingMembers{seen: map[string]int{}}
+	for i := range 25 {
+		s.board(testGuild).AddGold(snowflake(5000+i), "p", 100*(i+1))
+	}
+	s.postLeaderboard(testGuild, "c1", snowflake(700))
+	if !strings.Contains(guard.posted()[0].Description, "page 1/3") {
+		t.Errorf("subtext %q", guard.posted()[0].Description)
+	}
+	if row := guard.lastComponents(); len(row) != 1 {
+		t.Fatalf("a three-page gold column carried %d button rows", len(row))
 	}
 }
