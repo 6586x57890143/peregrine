@@ -343,6 +343,44 @@ func (g *Guard) Edit(channelID, messageID, content string) bool {
 	return true
 }
 
+// EditEmbed replaces the embed and components of a message the bot already sent.
+//
+// This is how a live game card is repainted when nobody pressed anything, a turn timing out
+// being the usual case; UpdateEmbed covers a repaint caused by a press and cannot be called on
+// a timer. Gated exactly like Edit and SendEmbed, over every text field, because the card is
+// rebuilt from nicknames and an edit can introduce text the original did not have. The pause
+// switch applies because a repaint is the bot visibly speaking.
+//
+// The components are ALWAYS sent, as a pointer to a slice that may be empty. discordgo carries
+// omitempty on the pointer, so a nil pointer would leave whatever buttons the message had,
+// which on a finished game is a row of buttons that can only ever fail. An empty slice marshals
+// as "components":[] and clears them.
+func (g *Guard) EditEmbed(channelID, messageID string, embed *discordgo.MessageEmbed,
+	components ...discordgo.MessageComponent) bool {
+	if embed == nil {
+		return false
+	}
+	if !g.permit(channelID, embedText(embed), "edit-embed") {
+		return false
+	}
+
+	embeds := []*discordgo.MessageEmbed{embed}
+	if components == nil {
+		components = []discordgo.MessageComponent{}
+	}
+	if _, err := g.session.ChannelMessageEditComplex(&discordgo.MessageEdit{
+		Channel:         channelID,
+		ID:              messageID,
+		Embeds:          &embeds,
+		Components:      &components,
+		AllowedMentions: allowedMentions(),
+	}); err != nil {
+		g.log.Error("discord embed edit failed", "channel", channelID, "message", messageID, "err", err)
+		return false
+	}
+	return true
+}
+
 // Delete removes a message.
 //
 // NOT gated on content, because there is no content: deleting says nothing and cannot
@@ -522,6 +560,41 @@ func (g *Guard) UpdateEmbed(i *discordgo.Interaction, embed *discordgo.MessageEm
 		// Error rather than Info, matching Respond: somebody pressed a button and Discord gives
 		// an interaction three seconds before showing them a failure of its own.
 		g.log.Error("discord component response failed", "channel", i.ChannelID, "err", err)
+		return false
+	}
+	return true
+}
+
+// RespondModal answers a press by opening a form, one text input per row.
+//
+// It goes through permit like every other response, and the gate is the least of why. The
+// title and labels are this repository's constants, so CheckEmit cannot fail on them; what the
+// call actually gets is the pause switch and the ignore list. A modal opened during a pause
+// collects an answer whose result can never be shown, since the response to the submit would be
+// refused, so refusing at the modal is the honest place to say no.
+func (g *Guard) RespondModal(i *discordgo.Interaction, customID, title string,
+	inputs ...discordgo.TextInput) bool {
+	if i == nil || len(inputs) == 0 {
+		return false
+	}
+	if !g.permit(i.ChannelID, title, "respond-modal") {
+		return false
+	}
+
+	rows := make([]discordgo.MessageComponent, len(inputs))
+	for k, in := range inputs {
+		rows[k] = discordgo.ActionsRow{Components: []discordgo.MessageComponent{in}}
+	}
+	if err := g.session.InteractionRespond(i, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseModal,
+		Data: &discordgo.InteractionResponseData{
+			CustomID:   customID,
+			Title:      title,
+			Components: rows,
+		},
+	}); err != nil {
+		// Error, matching Respond: somebody pressed a button and nothing opened.
+		g.log.Error("discord modal response failed", "channel", i.ChannelID, "err", err)
 		return false
 	}
 	return true
