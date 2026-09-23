@@ -200,6 +200,8 @@ func registerServices(
 	gamesSvc := games.New(corpora, guard, manager, wheels, tracker, resolver, members, games.Options{
 		Enabled:             cfg.EnableWordGames,
 		Wheel:               cfg.EnableWheel,
+		WheelRepostAfter:    cfg.WheelRepostAfter,
+		WheelAssetURL:       cfg.WheelAssetURL,
 		Mode:                games.Mode(cfg.WordGameMode),
 		Interval:            cfg.WordGameInterval,
 		LeaderboardTick:     cfg.LeaderboardTick,

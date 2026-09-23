@@ -67,6 +67,11 @@ var wedges = []Wedge{
 	{Gold, 650}, {Gold, 500}, {Gold, 900}, {Gold, 300}, {Gold, 400}, {Gold, 450},
 }
 
+// Wedges returns the wheel in order, a copy, for anything that draws it. internal/wheelart
+// paints its banner from this rather than from its own list, so the picture cannot disagree
+// with the wheel the engine spins.
+func Wedges() []Wedge { return append([]Wedge(nil), wedges...) }
+
 // bonusPrizes is the envelope the bonus round draws from, uniformly.
 var bonusPrizes = []int{5000, 7500, 10000, 12500, 15000, 25000}
 

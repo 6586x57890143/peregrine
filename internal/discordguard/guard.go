@@ -600,6 +600,27 @@ func (g *Guard) RespondModal(i *discordgo.Interaction, customID, title string,
 	return true
 }
 
+// Acknowledge answers a press without changing anything on screen: a deferred message
+// update, which tells Discord the press was handled so it shows the presser no failure.
+//
+// It is the answer for a press on a card that has since been reposted. The action still
+// applies, and the live card is repainted by the sweep; replacing the old message, which is
+// already deleted, would fail. NOT content-gated, because it carries no text, and NOT
+// pause-gated, because it says nothing, which is Delete's category. The ignore list applies,
+// because an operator's "not in there" covers every call.
+func (g *Guard) Acknowledge(i *discordgo.Interaction) bool {
+	if i == nil || g.ignored(i.ChannelID, "acknowledge") {
+		return false
+	}
+	if err := g.session.InteractionRespond(i, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredMessageUpdate,
+	}); err != nil {
+		g.log.Error("discord acknowledge failed", "channel", i.ChannelID, "err", err)
+		return false
+	}
+	return true
+}
+
 // RegisterCommands replaces the bot's application commands with exactly this set.
 //
 // # Not content-gated, and not pause-gated
