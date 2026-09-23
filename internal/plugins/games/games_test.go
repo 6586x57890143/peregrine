@@ -48,6 +48,7 @@ type fakeGuard struct {
 	modals      []modal
 	refuseEmbed bool
 	refuseEdit  bool
+	acks        int
 }
 
 type cardEdit struct {
@@ -69,6 +70,16 @@ func (g *fakeGuard) EditEmbed(channelID, messageID string, embed *discordgo.Mess
 		return false
 	}
 	g.cardEdits = append(g.cardEdits, cardEdit{channelID, messageID, embed, components})
+	return true
+}
+
+func (g *fakeGuard) Acknowledge(*discordgo.Interaction) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.refuse {
+		return false
+	}
+	g.acks++
 	return true
 }
 

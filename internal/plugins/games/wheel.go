@@ -53,6 +53,7 @@ const (
 	actVowel     = "vowel"
 	actSolve     = "solve"
 	actPick      = "pick"
+	actNext      = "next"
 
 	// wheelInputID is the one text input every wheel modal has.
 	wheelInputID = "t"
@@ -61,6 +62,7 @@ const (
 var wheelActions = map[string]wheel.ActionKind{
 	actJoin: wheel.Join, actLeave: wheel.Leave, actStart: wheel.Start, actSpin: wheel.Spin,
 	actConsonant: wheel.Consonant, actVowel: wheel.Vowel, actSolve: wheel.Solve, actPick: wheel.Pick,
+	actNext: wheel.Next,
 }
 
 const (
@@ -77,11 +79,16 @@ const (
 	// tick is one map lookup.
 	wheelSweepTick = time.Second
 
-	// repostAfter is how many messages the channel must have seen since the card went up
-	// before a new round moves it to the bottom. Below that the card is still on screen and
-	// an edit is what people see; above it, an edit to a card twenty messages up is invisible,
-	// which is the reasoning that turned word-game hints into reposts (M25).
-	repostAfter = 5
+	// defaultRepostAfter is how many messages of conversation since the card went up move it
+	// to the bottom of the channel. Below that the card is still on screen and an edit is
+	// what people see; above it, an edit to a card a screen up is invisible, which is the
+	// reasoning that turned word-game hints into reposts (M25).
+	defaultRepostAfter = 6
+
+	// repostCooldown is the least time between two posts of one card, whatever the channel is
+	// doing. A flooded channel would otherwise have the card deleted and reposted every
+	// second, which is noise and a rate-limit problem rather than visibility.
+	repostCooldown = 20 * time.Second
 
 	// maxPaintFailures is how many consecutive failed repaints abandon a match. More than
 	// one, because a transient failure must not throw away a match with gold on it; not many,
@@ -255,7 +262,7 @@ func (s *Service) handleWheel(i *discordgo.Interaction) {
 
 // postWheel sends a card for a view and records it as the match's message.
 func (s *Service) postWheel(v wheel.View) bool {
-	embed, comps := wheelCard(v)
+	embed, comps := wheelCard(v, s.opts.WheelAssetURL)
 	msg, ok := s.guard.SendEmbed(v.ChannelID, embed, comps...)
 	if !ok || msg == nil {
 		return false
@@ -284,7 +291,7 @@ func (s *Service) handleWheelButton(i *discordgo.Interaction) {
 	}
 
 	v, live := s.wheels.Snapshot(i.ChannelID)
-	if !live || (i.Message != nil && v.MessageID != "" && i.Message.ID != v.MessageID) {
+	if !live {
 		// A card this process no longer holds: the match ended, or the bot restarted with it
 		// live. Replacing it heals the dead buttons on first touch, so a restart needs no
 		// shutdown edit.
@@ -313,7 +320,7 @@ func (s *Service) handleWheelButton(i *discordgo.Interaction) {
 		}
 		return
 	}
-	s.applyWheel(i, wheel.Action{Kind: kind, UserID: userID, Name: name, Turn: turn})
+	s.applyWheel(i, wheel.Action{Kind: kind, UserID: userID, Name: name, Turn: turn}, v)
 }
 
 // wheelModal is the form for an action that needs typing. The lengths are a courtesy so the
@@ -345,55 +352,83 @@ func (s *Service) handleWheelModal(i *discordgo.Interaction) {
 		return
 	}
 	userID, name := interactionPlayer(i)
-	s.applyWheel(i, wheel.Action{Kind: kind, UserID: userID, Name: name, Turn: turn, Text: text})
+	v, live := s.wheels.Snapshot(i.ChannelID)
+	if !live {
+		s.refuseWheel(i, wheel.ErrNoMatch)
+		return
+	}
+	s.applyWheel(i, wheel.Action{Kind: kind, UserID: userID, Name: name, Turn: turn, Text: text}, v)
 }
 
 // applyWheel acts and answers the press with the repaint.
-func (s *Service) applyWheel(i *discordgo.Interaction, a wheel.Action) {
+//
+// A press can land on a card that has since been reposted: the old message is deleted, or about
+// to be, while somebody's thumb was on it. The action still counts, because the turn token
+// already says whether it may; what cannot happen is repainting a message that is gone. So that
+// press is acknowledged without a change and the match is left stale, and the sweep repaints
+// the live card within a second.
+func (s *Service) applyWheel(i *discordgo.Interaction, a wheel.Action, before wheel.View) {
 	u, err := s.wheels.Act(i.ChannelID, a)
 	if err != nil {
 		s.refuseWheel(i, err)
 		return
 	}
-	embed, comps := wheelCard(u.View)
-	// Painted only on success. A refused update leaves the match stale, and the sweep
-	// repaints it within a second, which is the whole recovery path.
-	if s.guard.UpdateEmbed(i, embed, comps...) && u.Result == nil {
+	embed, comps := wheelCard(u.View, s.opts.WheelAssetURL)
+	switch {
+	case i.Message != nil && before.MessageID != "" && i.Message.ID != before.MessageID:
+		s.guard.Acknowledge(i)
+		if u.Result != nil {
+			// The match is gone from the manager, so the sweep cannot see it to repaint.
+			s.guard.EditEmbed(i.ChannelID, before.MessageID, embed, comps...)
+		}
+	case s.guard.UpdateEmbed(i, embed, comps...) && u.Result == nil:
+		// Painted only on success. A refused update leaves the match stale, and the sweep
+		// repaints it within a second, which is the whole recovery path.
 		s.wheels.Painted(i.ChannelID, u.View.Version)
 	}
 	s.afterWheel(u)
 }
 
-// afterWheel is what an update means beyond its repaint: a payout, or a new round that may
-// need the card moved to where people are looking.
+// afterWheel is what an update means beyond its repaint: a payout.
 func (s *Service) afterWheel(u wheel.Update) {
 	if u.Result != nil {
 		s.finishWheel(u)
-		return
-	}
-	for _, e := range u.Events {
-		if e.Kind == wheel.RoundStart || e.Kind == wheel.BonusStart {
-			s.maybeRepost(u.View)
-			return
-		}
 	}
 }
 
-// maybeRepost moves the card to the bottom of a busy channel at a round boundary.
+// repostChatty moves every card the channel has talked past back to the bottom.
 //
-// Only at a round boundary: never mid-turn, because it would move the buttons from under the
-// thumb of somebody about to press one. And the new card goes up BEFORE the old one comes
-// down, the M25 order, so a refused send leaves the old card in place rather than none.
-func (s *Service) maybeRepost(v wheel.View) {
-	s.mu.Lock()
-	posted, ok := s.wheelPostedAt[v.ChannelID]
-	s.mu.Unlock()
-	if !ok || s.counter == nil || s.counter.Count(v.ChannelID, time.Since(posted)) < repostAfter {
+// Any time rather than only at a round boundary, because a card a screen up is a game nobody
+// is playing. A press already in flight on the old card still counts (see applyWheel). The new
+// card goes up BEFORE the old one comes down, the M25 order, so a refused send leaves the old
+// card in place rather than none.
+func (s *Service) repostChatty() {
+	if s.counter == nil {
 		return
 	}
-	old := v.MessageID
-	if s.postWheel(v) {
-		s.guard.Delete(v.ChannelID, old)
+	after := s.opts.WheelRepostAfter
+	if after <= 0 {
+		after = defaultRepostAfter
+	}
+	s.mu.Lock()
+	posted := make(map[string]time.Time, len(s.wheelPostedAt))
+	for ch, at := range s.wheelPostedAt {
+		posted[ch] = at
+	}
+	s.mu.Unlock()
+
+	for ch, at := range posted {
+		since := time.Since(at)
+		if since < repostCooldown || s.counter.Count(ch, since) < after {
+			continue
+		}
+		v, ok := s.wheels.Snapshot(ch)
+		if !ok || v.MessageID == "" {
+			continue
+		}
+		if s.postWheel(v) {
+			s.guard.Delete(ch, v.MessageID)
+		}
 	}
 }
 
@@ -521,7 +556,7 @@ func (s *Service) wheelSweep() {
 	for _, u := range s.wheels.Tick() {
 		if u.Result != nil {
 			if u.View.MessageID != "" {
-				embed, comps := wheelCard(u.View)
+				embed, comps := wheelCard(u.View, s.opts.WheelAssetURL)
 				s.guard.EditEmbed(u.View.ChannelID, u.View.MessageID, embed, comps...)
 			}
 			s.finishWheel(u)
@@ -529,9 +564,10 @@ func (s *Service) wheelSweep() {
 		}
 		s.afterWheel(u)
 	}
+	s.repostChatty()
 
 	for _, v := range s.wheels.Stale() {
-		embed, comps := wheelCard(v)
+		embed, comps := wheelCard(v, s.opts.WheelAssetURL)
 		if s.guard.EditEmbed(v.ChannelID, v.MessageID, embed, comps...) {
 			s.wheels.Painted(v.ChannelID, v.Version)
 			s.mu.Lock()

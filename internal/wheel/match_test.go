@@ -128,7 +128,7 @@ func TestSeatsShuffledOnceAndOpeningSeatRotatesPerRound(t *testing.T) {
 	if v := f.view(); v.Current != "c" || v.Players[0].UserID != "c" {
 		t.Fatalf("round 1 opens on %s, seats %+v", v.Current, v.Players)
 	}
-	f.do(Solve, "hello world")
+	f.solve("hello world")
 	if v := f.view(); v.Round != 2 || v.Current != "b" {
 		t.Fatalf("round %d opens on %s", v.Round, v.Current)
 	}
@@ -226,7 +226,7 @@ func TestBankruptZeroesRoundBankNotMatchBank(t *testing.T) {
 	f := newFixture(t, opts, "phrase|hello world", "thing|good job", "place|big if true")
 	f.begin("a")
 	f.earn("l")
-	f.do(Solve, "hello world")
+	f.solve("hello world")
 	f.earn("d")
 	u := f.spinTo(wBankrupt)
 	p := seat(u.View, "a")
@@ -336,7 +336,7 @@ func TestCorrectSolveBanksSolverAndDiscardsOthers(t *testing.T) {
 	f.spinTo(w600)
 	f.do(Consonant, "z") // a misses; b's turn
 	f.earn("h")
-	u := f.do(Solve, "Hello, World!")
+	u := f.solve("Hello, World!")
 	a, b := seat(u.View, "a"), seat(u.View, "b")
 	if b.Bank != 600 || a.Bank != 0 || a.Round != 0 || b.Round != 0 {
 		t.Fatalf("a %+v b %+v", a, b)
@@ -352,7 +352,7 @@ func TestCorrectSolveBanksSolverAndDiscardsOthers(t *testing.T) {
 func TestWrongSolvePasses(t *testing.T) {
 	f := newFixture(t, testOpts())
 	f.begin("a", "b")
-	u := f.do(Solve, "goodbye world")
+	u := f.solve("goodbye world")
 	if u.Events[0].Kind != WrongSolve || u.Events[0].Text != "" || u.View.Current != "b" {
 		t.Fatalf("events %+v current %s", u.Events, u.View.Current)
 	}
@@ -420,15 +420,15 @@ func TestLeaverKeepsBankedGoldButCannotWin(t *testing.T) {
 	f := newFixture(t, opts, "phrase|hello world", "phrase|big if true", "thing|good job")
 	f.begin("a", "b")
 	f.earn("l")
-	f.do(Solve, "hello world") // a banks 1800; round 2 opens on b
+	f.solve("hello world") // a banks 1800; round 2 opens on b
 	f.ok(Action{Kind: Leave, UserID: "a"})
 	f.earn("g")
-	f.do(Solve, "big if true") // b banks 600; the bonus goes to b, not to a
+	f.solve("big if true") // b banks 600; the bonus goes to b, not to a
 	if v := f.view(); v.Phase != BonusPick || v.Current != "b" {
 		t.Fatalf("phase %v current %s", v.Phase, v.Current)
 	}
 	f.do(Pick, "c d m a")
-	u := f.do(Solve, "wrong")
+	u := f.solve("wrong")
 	r := u.Result
 	if r == nil || r.Winner != "b" {
 		t.Fatalf("result %+v", r)
@@ -445,7 +445,7 @@ func TestEveryoneLeavesAbortsAndPaysMatchBanks(t *testing.T) {
 	f := newFixture(t, opts, "phrase|hello world", "phrase|big if true", "thing|good job")
 	f.begin("a", "b")
 	f.earn("l")
-	f.do(Solve, "hello world")
+	f.solve("hello world")
 	f.ok(Action{Kind: Leave, UserID: "b"})
 	u := f.ok(Action{Kind: Leave, UserID: "a"})
 	r := u.Result
@@ -529,7 +529,7 @@ func TestSoloMatchPlaysThroughToBonus(t *testing.T) {
 		t.Fatalf("lose a turn in a solo match: current %s turn %d->%d", u.View.Current, turn, u.View.Turn)
 	}
 	f.earn("l")
-	u = f.do(Solve, "hello world")
+	u = f.solve("hello world")
 	if u.View.Phase != BonusPick || !has(u.Events, BonusStart) {
 		t.Fatalf("phase %v events %v", u.View.Phase, kinds(u.Events))
 	}
@@ -543,9 +543,9 @@ func TestBonusGoesToTopMatchBankTieBySeat(t *testing.T) {
 	f := newFixture(t, opts, "phrase|hello world", "thing|hello world", "thing|good job")
 	f.begin("a", "b")
 	f.earn("l")
-	f.do(Solve, "hello world") // a: 1800
+	f.solve("hello world") // a: 1800
 	f.earn("l")
-	u := f.do(Solve, "hello world") // b: 1800
+	u := f.solve("hello world") // b: 1800
 	if u.View.Phase != BonusPick || u.View.Current != "a" {
 		t.Fatalf("bonus went to %s in phase %v", u.View.Current, u.View.Phase)
 	}
@@ -554,7 +554,7 @@ func TestBonusGoesToTopMatchBankTieBySeat(t *testing.T) {
 func TestNoBonusAndNoWinnerWhenNobodyBanked(t *testing.T) {
 	f := newFixture(t, testOpts())
 	f.begin("a")
-	u := f.do(Solve, "hello world")
+	u := f.solve("hello world")
 	r := u.Result
 	if r == nil || r.Outcome != Done || r.BonusPlayed || r.Winner != "" || len(r.Awards) != 0 {
 		t.Fatalf("result %+v", r)
@@ -567,7 +567,7 @@ func bonus(t *testing.T) *fixture {
 	f := newFixture(t, testOpts())
 	f.begin("a")
 	f.earn("l")
-	f.do(Solve, "hello world")
+	f.solve("hello world")
 	return f
 }
 
@@ -599,7 +599,7 @@ func TestBonusPickValidation(t *testing.T) {
 func TestBonusCorrectAddsPrize(t *testing.T) {
 	f := bonus(t)
 	f.do(Pick, "gdbo")
-	u := f.do(Solve, "good job")
+	u := f.solve("good job")
 	r := u.Result
 	if r == nil || !r.BonusWon || r.BonusPrize != bonusPrizes[0] || r.Awards[0].Gold != 1800+bonusPrizes[0] || r.Winner != "a" {
 		t.Fatalf("result %+v", r)
@@ -609,7 +609,7 @@ func TestBonusCorrectAddsPrize(t *testing.T) {
 func TestBonusWrongNoPrize(t *testing.T) {
 	f := bonus(t)
 	f.do(Pick, "gdbo")
-	r := f.do(Solve, "good jam").Result
+	r := f.solve("good jam").Result
 	if r == nil || !r.BonusPlayed || r.BonusWon || r.Awards[0].Gold != 1800 {
 		t.Fatalf("result %+v", r)
 	}
@@ -639,7 +639,7 @@ func TestOnlyBonusPlayerMayAct(t *testing.T) {
 	f := newFixture(t, opts)
 	f.begin("a", "b")
 	f.earn("l")
-	f.do(Solve, "hello world")
+	f.solve("hello world")
 	v := f.view()
 	if _, err := f.m.Act(testChannel, Action{Kind: Pick, UserID: "b", Turn: v.Turn, Text: "gdbo"}); !errors.Is(err, ErrNotYourTurn) {
 		t.Fatalf("err = %v", err)
@@ -661,7 +661,7 @@ func TestBonusPrizeHiddenUntilDone(t *testing.T) {
 	if f.view().BonusPrize != 0 {
 		t.Fatal("the prize shows before the solve")
 	}
-	u := f.do(Solve, "good job")
+	u := f.solve("good job")
 	if u.View.BonusPrize == 0 || u.View.Board != "GOOD JOB" {
 		t.Fatalf("final view %+v", u.View)
 	}
@@ -676,5 +676,97 @@ func TestCalledIsSortedAndUnique(t *testing.T) {
 	v := f.view()
 	if !slices.IsSorted(v.Called) || string(v.Called) != "HLO" {
 		t.Fatalf("called %q", string(v.Called))
+	}
+}
+
+// --- intermission ---
+
+// A solve used to replace the board in the same instant, so nobody saw the answer or who got
+// it. The recap holds both, and the board shows the whole phrase.
+func TestASolvePausesOnARecap(t *testing.T) {
+	opts := testOpts()
+	opts.Rounds = 2
+	f := newFixture(t, opts, "phrase|hello world", "thing|good job", "place|big if true")
+	f.begin("a", "b")
+	f.earn("l")
+	turn := f.view().Turn
+	u := f.do(Solve, "hello world")
+	v := u.View
+	if v.Phase != Intermission || v.Current != "" || v.Turn == turn {
+		t.Fatalf("phase %v current %q turn %d->%d", v.Phase, v.Current, turn, v.Turn)
+	}
+	want := Recap{Round: 1, Category: "phrase", Phrase: "HELLO WORLD", SolverID: "a", SolverName: "a", Gold: 1800}
+	if v.Recap == nil || *v.Recap != want || v.Board != "HELLO WORLD" {
+		t.Fatalf("recap %+v board %q", v.Recap, v.Board)
+	}
+	if !v.Deadline.Equal(f.now.Add(8 * time.Second)) {
+		t.Fatalf("recap ends %v", v.Deadline)
+	}
+	if _, err := f.m.Act(testChannel, Action{Kind: Spin, UserID: "b", Turn: v.Turn}); !errors.Is(err, ErrWrongPhase) {
+		t.Fatalf("spinning during a recap: %v", err)
+	}
+}
+
+func TestTheRecapEndsOnItsOwn(t *testing.T) {
+	opts := testOpts()
+	opts.Rounds = 2
+	opts.RecapPause = 5 * time.Second
+	f := newFixture(t, opts, "phrase|hello world", "thing|good job", "place|big if true")
+	f.begin("a")
+	f.do(Solve, "hello world")
+	f.advance(4 * time.Second)
+	if len(f.m.Tick()) != 0 {
+		t.Fatal("the recap ended early")
+	}
+	f.advance(time.Second)
+	us := f.m.Tick()
+	if len(us) != 1 || us[0].View.Phase != Round || us[0].View.Round != 2 || !has(us[0].Events, RoundStart) || us[0].View.Recap != nil {
+		t.Fatalf("updates %+v", us)
+	}
+}
+
+// Anyone still playing may skip the pause; somebody watching, or somebody who left, may not.
+func TestAnyPlayerMayEndTheRecapButNotAStranger(t *testing.T) {
+	opts := testOpts()
+	opts.Rounds = 2
+	f := newFixture(t, opts, "phrase|hello world", "thing|good job", "place|big if true")
+	f.begin("a", "b", "c")
+	f.ok(Action{Kind: Leave, UserID: "c"})
+	f.do(Solve, "hello world")
+	for _, who := range []string{"zed", "c"} {
+		if _, err := f.m.Act(testChannel, Action{Kind: Next, UserID: who}); !errors.Is(err, ErrNotJoined) {
+			t.Fatalf("%s: %v", who, err)
+		}
+	}
+	u := f.ok(Action{Kind: Next, UserID: "b"})
+	if u.View.Phase != Round || u.View.Round != 2 {
+		t.Fatalf("view %+v", u.View)
+	}
+	if _, err := f.m.Act(testChannel, Action{Kind: Next, UserID: "b"}); !errors.Is(err, ErrWrongPhase) {
+		t.Fatalf("a second press after the recap: %v", err)
+	}
+}
+
+func TestTheLastRecapLeadsToTheBonus(t *testing.T) {
+	f := newFixture(t, testOpts())
+	f.begin("a")
+	f.earn("l")
+	if u := f.do(Solve, "hello world"); u.View.Phase != Intermission || u.View.Recap.Round != 1 {
+		t.Fatalf("the last round skipped its recap: %+v", u.View)
+	}
+	if u := f.ok(Action{Kind: Next, UserID: "a"}); u.View.Phase != BonusPick {
+		t.Fatalf("phase %v", u.View.Phase)
+	}
+}
+
+func TestTheTimeLimitStillAppliesDuringARecap(t *testing.T) {
+	f := newFixture(t, testOpts())
+	f.begin("a")
+	f.earn("l")
+	f.do(Solve, "hello world")
+	f.advance(testOpts().MaxDuration)
+	us := f.m.Tick()
+	if len(us) != 1 || us[0].Result == nil || us[0].Result.Reason != TimeLimit || us[0].Result.Awards[0].Gold != 1800 {
+		t.Fatalf("updates %+v", us)
 	}
 }

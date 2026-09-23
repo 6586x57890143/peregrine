@@ -154,6 +154,20 @@ func (f *fixture) ok(a Action) Update {
 	return u
 }
 
+// solve performs a solve and, when it lands, presses through the intermission, so a test
+// about what comes after a round reads as one step. Its events are the solve's and the next
+// round's together.
+func (f *fixture) solve(text string) Update {
+	f.t.Helper()
+	u := f.do(Solve, text)
+	if u.View.Phase != Intermission {
+		return u
+	}
+	n := f.ok(Action{Kind: Next, UserID: u.View.Recap.SolverID})
+	n.Events = append(u.Events, n.Events...)
+	return n
+}
+
 // spinTo scripts the next spin and performs it.
 func (f *fixture) spinTo(wedge int) Update {
 	f.t.Helper()
