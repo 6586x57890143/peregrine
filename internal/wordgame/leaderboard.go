@@ -68,6 +68,16 @@ type Entry struct {
 	// it CANNOT do is rank correctly, since every entry would read zero; games.Init converts
 	// one on load. See BackfillPoints.
 	Points int `json:"points,omitempty"`
+
+	// Gold is what this player banked this week from wheel matches (M35). A separate column
+	// rather than more Points, because the two games pay on scales nobody could reconcile: a
+	// scramble solve is worth a handful of points and a wheel round is worth thousands of
+	// gold. Summing them would make the board a wheel board with a rounding error.
+	//
+	// omitempty for the rule every field after Wins follows. An entry can carry Gold with
+	// zero Wins, which is why Scores, Fastest and BackfillPoints all read their own field and
+	// never assume a row means somebody solved a scramble.
+	Gold int `json:"gold,omitempty"`
 }
 
 // wireLeaderboard is the persisted shape.
@@ -159,6 +169,40 @@ func (l *Leaderboard) AddWin(userID, username string, solveTime time.Duration, p
 
 	l.scores[userID] = e
 	l.lastWinner = userID
+}
+
+// AddGold records gold banked in a wheel match.
+//
+// It touches Gold and the name and nothing else. In particular it does not move lastWinner:
+// a streak is consecutive SCRAMBLE wins, and a wheel payout landing between two of them must
+// not break a run that nobody else interrupted. Zero or less records nothing, so an entry is
+// never created for a player who earned nothing.
+func (l *Leaderboard) AddGold(userID, username string, gold int) {
+	if gold <= 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	e := l.scores[userID]
+	e.UserID = userID
+	e.Username = username
+	e.Gold += gold
+	l.scores[userID] = e
+}
+
+// Golds returns each player's gold this week by user ID, the wheel's column.
+func (l *Leaderboard) Golds() map[string]int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	out := map[string]int{}
+	for id, e := range l.scores {
+		if e.Gold > 0 {
+			out[id] = e.Gold
+		}
+	}
+	return out
 }
 
 // Fastest returns the quickest solve this week, and whether there was one.

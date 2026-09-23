@@ -1213,3 +1213,71 @@ func TestTheEleventhSlotFollowsThePage(t *testing.T) {
 		t.Error("the viewer is not in page two's rows either, so they vanished entirely")
 	}
 }
+
+// A wheel payout between two scramble wins must not break the run: gold is a different game,
+// and nobody else took a puzzle in between.
+func TestGoldDoesNotTouchPointsOrStreak(t *testing.T) {
+	l := NewLeaderboard(time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC))
+	l.AddWin("u1", "alice", time.Second, 3)
+	l.AddGold("u1", "alice", 5000)
+	l.AddGold("u2", "bob", 700)
+	l.AddWin("u1", "alice", time.Second, 3)
+
+	e, ok := l.Streak()
+	if !ok || e.UserID != "u1" || e.Streak != 2 || e.Points != 6 || e.Wins != 2 || e.Gold != 5000 {
+		t.Fatalf("streak %+v ok %v", e, ok)
+	}
+	if scores := l.Scores(); scores["u2"] != 0 {
+		t.Errorf("a gold-only player has %d scramble points", scores["u2"])
+	}
+	if golds := l.Golds(); golds["u1"] != 5000 || golds["u2"] != 700 || len(golds) != 2 {
+		t.Errorf("golds %v", golds)
+	}
+	if b := Rank(l.Scores(), "", 10, 1); b.Players != 1 {
+		t.Errorf("a gold-only player is ranked on the scramble board: %+v", b)
+	}
+	if l.BackfillPoints(10) != 0 {
+		t.Error("backfill converted a gold-only entry into scramble points")
+	}
+	l.AddGold("u3", "carol", 0)
+	l.AddGold("u3", "carol", -5)
+	if _, ok := l.Golds()["u3"]; ok {
+		t.Error("an entry was created for a player who earned nothing")
+	}
+}
+
+func TestGoldResetsWithTheWeek(t *testing.T) {
+	now := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+	l := NewLeaderboard(now)
+	l.AddGold("u1", "alice", 5000)
+	if !l.MaybeReset(now.AddDate(0, 0, 7)) {
+		t.Fatal("no reset")
+	}
+	if len(l.Golds()) != 0 {
+		t.Fatalf("gold survived the weekly reset: %v", l.Golds())
+	}
+}
+
+// A board saved before gold existed loads with none, and gold survives a round trip.
+func TestAPreGoldBoardStillLoads(t *testing.T) {
+	old := `{"week_start":"2026-09-21T00:00:00Z","scores":{"u9":{"user_id":"u9","username":"carol","wins":2,"points":8}}}`
+	var l Leaderboard
+	if err := json.Unmarshal([]byte(old), &l); err != nil {
+		t.Fatal(err)
+	}
+	if len(l.Golds()) != 0 || l.Scores()["u9"] != 8 {
+		t.Fatalf("golds %v scores %v", l.Golds(), l.Scores())
+	}
+	l.AddGold("u9", "carol", 1200)
+	raw, err := json.Marshal(&l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Leaderboard
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.Golds()["u9"] != 1200 || back.Scores()["u9"] != 8 {
+		t.Fatalf("round trip: golds %v scores %v", back.Golds(), back.Scores())
+	}
+}

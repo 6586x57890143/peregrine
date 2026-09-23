@@ -86,9 +86,11 @@ func parseButtonID(customID string) (scope, int, bool) {
 // numbers of corpora and the renderer must not be able to tell which: ONE renderer is what
 // stops the two scopes drifting into two layouts.
 type tally struct {
-	// wins is word-game points by user ID, and chat is message counts by user ID.
+	// wins is word-game points by user ID, chat is message counts by user ID, and gold is
+	// what the wheel paid out this week by user ID.
 	wins map[string]int
 	chat map[string]int
+	gold map[string]int
 
 	// fastest and streak are the week's records, nil when nobody qualifies. Merged across
 	// guilds for a global board: the fastest solve anywhere is a real fact about the week,
@@ -107,7 +109,7 @@ type tally struct {
 // one, which is the same asymmetry maybeReset makes: one unreachable server must not empty
 // everybody else's board, and a viewer asking about their own server has to be told.
 func (s *Service) gather(sc scope, guildID string) (tally, error) {
-	t := tally{wins: map[string]int{}, chat: map[string]int{}}
+	t := tally{wins: map[string]int{}, chat: map[string]int{}, gold: map[string]int{}}
 
 	guilds := []string{guildID}
 	if sc == scopeGlobal {
@@ -143,6 +145,9 @@ func (s *Service) gather(sc scope, guildID string) (tally, error) {
 		for id, count := range chatScores {
 			t.chat[id] += count
 		}
+		for id, gold := range board.Golds() {
+			t.gold[id] += gold
+		}
 		if e, ok := board.Fastest(); ok && (t.fastest == nil || e.FastestMS < t.fastest.FastestMS) {
 			t.fastest = &e
 		}
@@ -173,26 +178,28 @@ func (s *Service) render(t tally, guildID, viewerID string, sc scope, page int) 
 	// as members, so each of them would fall through to a REST call.
 	wins := wordgame.Rank(t.wins, viewerID, leaderboardRows, page)
 	chat := wordgame.Rank(t.chat, viewerID, leaderboardRows, page)
+	gold := wordgame.Rank(t.gold, viewerID, leaderboardRows, page)
 
-	// Memoized across BOTH boards, so somebody on the word-game board and the chat board costs
+	// Memoized across EVERY board, so somebody on the word-game board and the chat board costs
 	// one lookup rather than two.
 	resolve := memoize(func(userID string) string {
 		return names.Display(s.session, s.members, guildID, userID)
 	})
 	wins = wins.WithNames(resolve)
 	chat = chat.WithNames(resolve)
+	gold = gold.WithNames(resolve)
 
 	// The records go through the SAME memoized resolver, so a record held by somebody already
 	// on a board costs nothing extra.
 	footer := leaderboardFooter(t, wins, chat, resolve)
 	nextReset := corpus.StartOfWeekUTC(time.Now()).AddDate(0, 0, 7)
 
-	// One page number drives both columns, and pages is whichever board is longer. Two
+	// One page number drives every column, and pages is whichever board is longest. Two
 	// independent page counters under one pair of buttons would be a control that means
 	// different things on the left and the right of the same card.
-	pages := max(wins.Pages, chat.Pages)
+	pages := max(wins.Pages, chat.Pages, gold.Pages)
 
-	return leaderboardEmbed(wins, chat, nextReset, footer, sc, t.guilds, page, pages),
+	return leaderboardEmbed(wins, chat, gold, nextReset, footer, sc, t.guilds, page, pages),
 		boardButtons(sc, page, pages)
 }
 

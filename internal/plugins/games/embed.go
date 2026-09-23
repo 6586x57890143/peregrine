@@ -53,7 +53,7 @@ var medals = []string{"🥇", "🥈", "🥉"}
 // answers "where am I in it", which is navigation. A reader who scrolls past this card later
 // has to be able to tell a global board from a local one without pressing anything, because
 // the two rank the same people against different fields.
-func leaderboardEmbed(wins, chat wordgame.Board, nextReset time.Time, footer string,
+func leaderboardEmbed(wins, chat, gold wordgame.Board, nextReset time.Time, footer string,
 	sc scope, guilds, page, pages int) *discordgo.MessageEmbed {
 
 	title := "weekly leaderboard"
@@ -73,7 +73,17 @@ func leaderboardEmbed(wins, chat wordgame.Board, nextReset time.Time, footer str
 		sub = fmt.Sprintf("page %d/%d%sresets <t:%d:R>", page, pages, sep, nextReset.Unix())
 	}
 
-	return &discordgo.MessageEmbed{
+	// The gold column exists only once somebody has gold, which is also how the M35 rollout
+	// stays invisible until a wheel match has paid out: a third column of "nobody yet" on
+	// every board, for a game most servers have not played, is furniture. With three inline
+	// columns the names are cut shorter, because three 16-rune names side by side wrap on a
+	// desktop and the wrap is what makes a column unreadable.
+	width := nameWidth
+	if gold.Players > 0 {
+		width = nameWidthNarrow
+	}
+
+	e := &discordgo.MessageEmbed{
 		Title:       title,
 		Description: subtext(sub),
 		Color:       0xF1C40F,
@@ -85,7 +95,7 @@ func leaderboardEmbed(wins, chat wordgame.Board, nextReset time.Time, footer str
 				// that they are comparable, and a column of points labelled "wins" invites the
 				// worse reading that somebody with 12 has won twelve games.
 				Name:  "scramble · points",
-				Value: renderBoard(wins, "points"),
+				Value: renderBoard(wins, "points", width),
 				// Inline, so the two boards sit side by side on a desktop and stack on a
 				// phone. That is the whole reason this is a field pair rather than one long
 				// description, and M27 deliberately did NOT restyle it away: what it replaced
@@ -95,26 +105,40 @@ func leaderboardEmbed(wins, chat wordgame.Board, nextReset time.Time, footer str
 			},
 			{
 				Name:   "chat · messages",
-				Value:  renderBoard(chat, "messages"),
+				Value:  renderBoard(chat, "messages", width),
 				Inline: true,
 			},
 		},
 		Footer: &discordgo.MessageEmbedFooter{Text: footer},
 	}
+	if gold.Players > 0 {
+		e.Fields = append(e.Fields, &discordgo.MessageEmbedField{
+			Name:   "wheel · gold",
+			Value:  renderBoard(gold, "gold", width),
+			Inline: true,
+		})
+	}
+	return e
 }
+
+// Name widths on a board, in runes. Narrow is for three columns side by side.
+const (
+	nameWidth       = 16
+	nameWidthNarrow = 12
+)
 
 // renderBoard turns one ranked board into an embed field value.
 //
 // unit names what the numbers are, because the two boards count different things and a column
 // of bare integers under one heading invites the reading that they are comparable.
-func renderBoard(b wordgame.Board, unit string) string {
+func renderBoard(b wordgame.Board, unit string, width int) string {
 	if len(b.Top) == 0 {
 		return "_nobody yet_"
 	}
 
 	var sb strings.Builder
 	for _, row := range b.Top {
-		sb.WriteString(line(row))
+		sb.WriteString(line(row, width))
 		sb.WriteByte('\n')
 	}
 
@@ -124,7 +148,7 @@ func renderBoard(b wordgame.Board, unit string) string {
 	switch {
 	case b.You != nil:
 		sb.WriteString("　\n") // an ideographic space: a blank line an embed field will not trim
-		sb.WriteString(line(*b.You))
+		sb.WriteString(line(*b.You, width))
 		sb.WriteByte('\n')
 	case b.Unranked:
 		// Said rather than omitted. A missing row is indistinguishable from a bug, and "you
@@ -140,7 +164,7 @@ func renderBoard(b wordgame.Board, unit string) string {
 // The medals stay for the top three. They are instantly readable and they are the one place on
 // either card where an emoji earns the space it takes; everything below gets a code chip, which
 // is what lines the names up in a proportional font.
-func line(r wordgame.Row) string {
+func line(r wordgame.Row, width int) string {
 	rank := fmt.Sprintf("`%2d`", r.Rank)
 	if r.Rank >= 1 && r.Rank <= len(medals) {
 		rank = medals[r.Rank-1]
@@ -155,14 +179,14 @@ func line(r wordgame.Row) string {
 	// Runes rather than bytes, because a nickname is full of emoji and accented characters and
 	// byte slicing splits them into a replacement glyph (M0).
 	return fmt.Sprintf("%s **%s**%s%s",
-		rank, wordgame.TruncateRunes(name, 16), sep, commas(r.Score))
+		rank, wordgame.TruncateRunes(name, width), sep, commas(r.Score))
 }
 
 // leaderboardFooter is the one-line summary under both boards.
 //
 // The records go here rather than in a field of their own, because they are about the week
-// rather than about a player and a third column would push the two boards into stacking on a
-// desktop. Each part is omitted when it has nothing to say: an empty week says the counts and
+// rather than about a player, and the one third column the card can afford belongs to the
+// wheel's gold. Each part is omitted when it has nothing to say: an empty week says the counts and
 // stops, rather than printing "fastest: nobody".
 func leaderboardFooter(t tally, wins, chat wordgame.Board, names func(string) string) string {
 	parts := []string{fmt.Sprintf("%s playing, %s talking",
