@@ -106,7 +106,7 @@ const (
 // the slash form only when games are on would have made the two disagree. The other direction is
 // the knob-wired-to-nothing shape: a /wordgame visible in every client for a feature that is off
 // is a command whose only possible answer is a refusal.
-func definitions(wordGames bool) []*discordgo.ApplicationCommand {
+func definitions(wordGames, wheelOn bool) []*discordgo.ApplicationCommand {
 	defs := []*discordgo.ApplicationCommand{{
 		Name:        boardCommandName,
 		Description: "Show this week's leaderboard",
@@ -126,6 +126,18 @@ func definitions(wordGames bool) []*discordgo.ApplicationCommand {
 			},
 		},
 	}}
+	// The wheel's two commands, filtered for the reason /wordgame is: a /wheel in every client
+	// for a feature that is off, or whose puzzles failed to load, is a command whose only
+	// answer is a refusal.
+	if wheelOn {
+		defs = append(defs, &discordgo.ApplicationCommand{
+			Name:        wheelCommandName,
+			Description: "Open a Wheel of Fortune lobby in this channel",
+		}, &discordgo.ApplicationCommand{
+			Name:        walletCommandName,
+			Description: "Your lifetime gold in this server, and this week's",
+		})
+	}
 	if !wordGames {
 		return defs
 	}
@@ -225,7 +237,7 @@ func (s *Service) registerCommands() {
 			"command still works.")
 		return
 	}
-	s.guard.RegisterCommands(s.session.State.User.ID, definitions(s.opts.Enabled))
+	s.guard.RegisterCommands(s.session.State.User.ID, definitions(s.opts.Enabled, s.wheelOn()))
 }
 
 // onInteraction is the gateway handler, registered in Init.
@@ -255,18 +267,29 @@ func (s *Service) onInteraction(_ *discordgo.Session, ic *discordgo.InteractionC
 			handle = s.handleConfig
 		case boardCommandName:
 			handle = s.handleLeaderboard
+		case wheelCommandName:
+			handle = s.handleWheel
+		case walletCommandName:
+			handle = s.handleWallet
 		default:
 			return
 		}
 	case discordgo.InteractionMessageComponent:
-		// M32's buttons. This used to return, because nothing registered a component; the
-		// handler itself checks the custom_id prefix, so a press on somebody else's message is
-		// still ignored rather than answered with the wrong thing.
+		// M32's buttons and M35's. Routed on the custom_id prefix, and each handler checks its
+		// own prefix again, so a press on somebody else's message is ignored rather than
+		// answered with the wrong thing.
 		name = componentID(ic.Interaction)
 		handle = s.handleBoardButton
+		if strings.HasPrefix(name, wheelPrefix+":") {
+			handle = s.handleWheelButton
+		}
+	case discordgo.InteractionModalSubmit:
+		// Only the wheel opens forms, and its handler ignores an id that is not its own.
+		name, _ = modalText(ic.Interaction)
+		handle = s.handleWheelModal
 	default:
-		// Modals and autocomplete are not registered, so anything else is either another
-		// application's event or a shape this build does not know.
+		// Autocomplete is not registered, so anything else is either another application's
+		// event or a shape this build does not know.
 		return
 	}
 

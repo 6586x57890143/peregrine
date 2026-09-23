@@ -33,6 +33,7 @@ import (
 	"github.com/6586x57890143/peregrine/internal/core"
 	"github.com/6586x57890143/peregrine/internal/names"
 	"github.com/6586x57890143/peregrine/internal/storage"
+	"github.com/6586x57890143/peregrine/internal/wheel"
 	"github.com/6586x57890143/peregrine/internal/wordgame"
 )
 
@@ -60,6 +61,20 @@ type Guard interface {
 		ephemeral bool, components ...discordgo.MessageComponent) bool
 	UpdateEmbed(i *discordgo.Interaction, embed *discordgo.MessageEmbed,
 		components ...discordgo.MessageComponent) bool
+
+	// The wheel's half, M35. EditEmbed repaints a card nobody pressed, which is how a turn
+	// timing out reaches it; RespondModal opens the form a letter or a solve is typed into.
+	EditEmbed(channelID, messageID string, embed *discordgo.MessageEmbed,
+		components ...discordgo.MessageComponent) bool
+	RespondModal(i *discordgo.Interaction, customID, title string, inputs ...discordgo.TextInput) bool
+}
+
+// Counter is the activity the service reads: where it is busy, for interval mode, and how
+// busy one channel has been, for moving a wheel card to where people are looking.
+// *activity.Tracker satisfies it.
+type Counter interface {
+	channels.Counter
+	Count(channelID string, window time.Duration) int
 }
 
 // Mode selects how puzzles start.
@@ -112,6 +127,10 @@ type Options struct {
 	// AdminUserID may run !wordgame. Empty refuses everyone who is not a guild administrator.
 	AdminUserID string
 
+	// Wheel turns on /wheel and /wallet, M35. Separate from Enabled because the wheel is a
+	// separate game: an operator who switched the scramble off has said nothing about it.
+	Wheel bool
+
 	// PointsBase is what a puzzle solved with no hints showing is worth, and every delivered
 	// rung of the hint ladder takes one off that.
 	//
@@ -130,7 +149,8 @@ type Service struct {
 	corpora  *storage.Set
 	guard    Guard
 	manager  *wordgame.Manager
-	counter  channels.Counter
+	wheels   *wheel.Manager
+	counter  Counter
 	resolver channels.Resolver
 	opts     Options
 
@@ -156,16 +176,25 @@ type Service struct {
 	// gateway to be testable would be the shape internal/wordgame exists to avoid.
 	session    *discordgo.Session
 	dispatcher *core.Dispatcher
+
+	// The wheel's per-channel bookkeeping, under mu, both bounded by the live matches because
+	// every exit from a match goes through finishWheel or the abandon path, which delete both.
+	// wheelPostedAt is when the current card went up, for the repost decision; wheelPaintFails
+	// counts consecutive failed repaints.
+	wheelPostedAt   map[string]time.Time
+	wheelPaintFails map[string]int
 }
 
 // New builds the service.
-func New(corpora *storage.Set, guard Guard, manager *wordgame.Manager,
-	counter channels.Counter, resolver channels.Resolver, members names.Session,
+func New(corpora *storage.Set, guard Guard, manager *wordgame.Manager, wheels *wheel.Manager,
+	counter Counter, resolver channels.Resolver, members names.Session,
 	opts Options) *Service {
 	return &Service{
-		corpora: corpora, guard: guard, manager: manager,
+		corpora: corpora, guard: guard, manager: manager, wheels: wheels,
 		counter: counter, resolver: resolver, members: members, opts: opts,
-		guilds: map[string]*guildState{},
+		guilds:          map[string]*guildState{},
+		wheelPostedAt:   map[string]time.Time{},
+		wheelPaintFails: map[string]int{},
 	}
 }
 
@@ -226,6 +255,14 @@ func (s *Service) Start(ctx context.Context) error {
 				s.sweep()
 				s.maybeInterval()
 			},
+		})
+	}
+
+	if s.wheelOn() {
+		loops = append(loops, core.Loop{
+			Name:  "wheel-sweep",
+			Every: wheelSweepTick,
+			Fn:    func(context.Context) { s.wheelSweep() },
 		})
 	}
 
