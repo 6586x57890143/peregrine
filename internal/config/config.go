@@ -227,6 +227,19 @@ type Config struct {
 	WordGameGauntletMax       int           // PEREGRINE_WORDGAME_GAUNTLET_MAX
 	WordGameGauntletGap       time.Duration // PEREGRINE_WORDGAME_GAUNTLET_GAP
 
+	// The wheel, M35: a Wheel of Fortune match somebody opens with /wheel. On by default
+	// for the reason word games are: it posts nothing unprompted, and a command that only
+	// exists when an operator remembered a flag is a feature nobody finds.
+	EnableWheel      bool          // PEREGRINE_ENABLE_WHEEL
+	WheelPuzzles     string        // PEREGRINE_WHEEL_PUZZLES
+	WheelLobby       time.Duration // PEREGRINE_WHEEL_LOBBY
+	WheelMinPlayers  int           // PEREGRINE_WHEEL_MIN_PLAYERS
+	WheelMaxPlayers  int           // PEREGRINE_WHEEL_MAX_PLAYERS
+	WheelRounds      int           // PEREGRINE_WHEEL_ROUNDS
+	WheelTurnTimeout time.Duration // PEREGRINE_WHEEL_TURN_TIMEOUT
+	WheelIdleStrikes int           // PEREGRINE_WHEEL_IDLE_STRIKES
+	WheelMaxDuration time.Duration // PEREGRINE_WHEEL_MAX_DURATION
+
 	// Corpus snapshots. Off by default, because there is no safe guess for a path and
 	// writing megabytes somewhere the operator did not choose is worse than not backing up.
 	//
@@ -560,6 +573,20 @@ func Load() (*Config, error) {
 		WordGameGauntletMax: l.intVal("PEREGRINE_WORDGAME_GAUNTLET_MAX", 10, 1, 50),
 		WordGameGauntletGap: l.dur("PEREGRINE_WORDGAME_GAUNTLET_GAP", 5*time.Second, 0, 5*time.Minute),
 
+		EnableWheel:  l.boolVal("PEREGRINE_ENABLE_WHEEL", true),
+		WheelPuzzles: l.str("PEREGRINE_WHEEL_PUZZLES", ""),
+		WheelLobby:   l.dur("PEREGRINE_WHEEL_LOBBY", time.Minute, 15*time.Second, 10*time.Minute),
+		// One by default, so a single person can play: a lobby that needs a second player in a
+		// quiet channel is a game that mostly does not start. Set two to stop solo play.
+		WheelMinPlayers: l.intVal("PEREGRINE_WHEEL_MIN_PLAYERS", 1, 1, 10),
+		WheelMaxPlayers: l.intVal("PEREGRINE_WHEEL_MAX_PLAYERS", 6, 1, 10),
+		WheelRounds:     l.intVal("PEREGRINE_WHEEL_ROUNDS", 3, 1, 5),
+		// Long enough to open a form and type an answer on a phone. The floor sits well above
+		// the wheel's one-second sweep, which is the resolution of a timeout.
+		WheelTurnTimeout: l.dur("PEREGRINE_WHEEL_TURN_TIMEOUT", 45*time.Second, 10*time.Second, 5*time.Minute),
+		WheelIdleStrikes: l.intVal("PEREGRINE_WHEEL_IDLE_STRIKES", 2, 1, 5),
+		WheelMaxDuration: l.dur("PEREGRINE_WHEEL_MAX_DURATION", 30*time.Minute, 5*time.Minute, 3*time.Hour),
+
 		BackupDir:  l.str("PEREGRINE_BACKUP_DIR", ""),
 		BackupTick: l.dur("PEREGRINE_BACKUP_TICK", 24*time.Hour, time.Minute, 30*24*time.Hour),
 		BackupKeep: l.intVal("PEREGRINE_BACKUP_KEEP", 7, 1, 1000),
@@ -647,6 +674,21 @@ func Load() (*Config, error) {
 				"all but the last rung, and the later hints cost nothing. Set the base above the "+
 				"rung count",
 			cfg.WordGamePointsBase, cfg.WordGameHintLevels))
+	}
+
+	// A minimum above the maximum is a lobby that can never start: it fills, refuses the next
+	// person, and closes below the minimum. Named the same way as the pairs above.
+	if cfg.WheelMinPlayers > cfg.WheelMaxPlayers {
+		l.errs = append(l.errs, fmt.Errorf(
+			"PEREGRINE_WHEEL_MIN_PLAYERS=%d is above PEREGRINE_WHEEL_MAX_PLAYERS=%d, so a lobby "+
+				"can never have enough players to start", cfg.WheelMinPlayers, cfg.WheelMaxPlayers))
+	}
+	// A time limit a few turns long ends every match partway through its first round, so the
+	// game quietly never reaches a solve. Ten turns is a floor, not a recommendation.
+	if cfg.WheelMaxDuration < 10*cfg.WheelTurnTimeout {
+		l.errs = append(l.errs, fmt.Errorf(
+			"PEREGRINE_WHEEL_MAX_DURATION=%v is under ten turns of PEREGRINE_WHEEL_TURN_TIMEOUT=%v, "+
+				"so matches would be cut off before a round can finish", cfg.WheelMaxDuration, cfg.WheelTurnTimeout))
 	}
 
 	if len(l.errs) > 0 {

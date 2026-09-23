@@ -500,6 +500,43 @@ with zeroes rather than being refused, for the same reason the pre-M11 format is
 entry's number is stale from whenever that player last had one, and it requires two wins: a line
 that appeared after every single game would be noise rather than news.
 
+### The wheel: `internal/wheel` owns the match, `games` does the talking (M35)
+
+A Wheel of Fortune match someone opens with `/wheel`: a sign-up lobby, rounds of spin, call and
+solve, and a bonus round for the top bank. It is split like the scramble: `internal/wheel` has no
+I/O, one mutex, an injectable clock and `Source`, and returns a `View` for `wheel_embed.go` to
+render. Four engine properties are structural rather than remembered, and the integration relies
+on each:
+
+- **A `Result` is returned exactly once**, from the locked section that deletes the match. Gold is
+  paid from it by `persistResult`, so a double payout cannot be written.
+- **An error never changes anything.** Every refusal becomes a private reply from one
+  `wheelRefusals` table, and a test fails if an engine error has no row.
+- **Every turn action carries the Turn token**, in the button `custom_id` and the modal's. It moves
+  on every change of hand, round or phase, so a late click cannot land on the next turn, including
+  a solo player's own next turn after a timeout.
+- **A wrong solve's text is never carried.** The card is repainted from events, and one blocklisted
+  guess would otherwise fail every later repaint of the match at the emit gate.
+
+**It lives in `games`, not in a service of its own**, because the weekly board is games'
+in-memory `Leaderboard` and `saveBoard` overwrites the blob: anything else writing gold there
+would be overwritten by the next save. Gold goes on the board AND into the lifetime wallet
+(`BlobLeaderboard`, key `"wallet"`, a JSON map) in ONE transaction; the wallet is never cached, so
+nothing can overwrite it with a stale copy.
+
+**A press is answered with the repaint** (`Act` then `UpdateEmbed`, one REST call). Everything
+without a press, a timeout or the lobby closing, is the one-second `wheel-sweep`: `Tick`, then
+`Stale` then `EditEmbed`. `Painted` is last-ack-wins, so an out-of-order edit leaves the match
+stale and the next sweep heals it. Three consecutive failed repaints abandon the match, because a
+deleted card fails forever. A press on a card this process no longer holds (after a restart) gets
+an "ended" card with no buttons, so nothing needs a shutdown edit.
+
+**The card is a card**, the opposite of M28's call for puzzles: a match is asked for and played by
+pressing buttons on it. It moves to the bottom only at a round boundary and only once the channel
+has moved on from it, posting the new card before deleting the old (M25's order); never mid-turn,
+which would move a button from under somebody's thumb. **`MaxChannels` refuses a new match rather
+than evicting one**, the opposite of wordgame's cooldown map, because eviction deletes live gold.
+
 ### Names: one answer to what somebody is called, and the author is always one
 
 `names.Spellings` returns every name a person is addressed by, display form first: guild nickname, then `GlobalName`, then username. Three sites hand-built this before M14 and all three threw away `GlobalName`, which since usernames became lowercase handles is the name most people actually type. `names.Primary` is the nil-safe single-value form, and callers use it rather than indexing, because a nil `Author` has turned up in a fixture here before. **The display-first order is load-bearing**, not cosmetic: `Primary` and `Substitute` both take the first entry.
