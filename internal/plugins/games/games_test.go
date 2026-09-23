@@ -41,6 +41,45 @@ type fakeGuard struct {
 	// component responses: a press must REPLACE the board rather than post a second one.
 	components [][]discordgo.MessageComponent
 	updates    int
+
+	// The wheel's half, M35. refuseEmbed and refuseEdit refuse only those calls, so a test can
+	// have the card fail while the private answers still go out.
+	cardEdits   []cardEdit
+	modals      []modal
+	refuseEmbed bool
+	refuseEdit  bool
+}
+
+type cardEdit struct {
+	channelID, messageID string
+	embed                *discordgo.MessageEmbed
+	components           []discordgo.MessageComponent
+}
+
+type modal struct {
+	customID, title string
+	inputs          []discordgo.TextInput
+}
+
+func (g *fakeGuard) EditEmbed(channelID, messageID string, embed *discordgo.MessageEmbed,
+	components ...discordgo.MessageComponent) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.refuse || g.refuseEdit {
+		return false
+	}
+	g.cardEdits = append(g.cardEdits, cardEdit{channelID, messageID, embed, components})
+	return true
+}
+
+func (g *fakeGuard) RespondModal(_ *discordgo.Interaction, customID, title string, inputs ...discordgo.TextInput) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.refuse {
+		return false
+	}
+	g.modals = append(g.modals, modal{customID, title, inputs})
+	return true
 }
 
 func (g *fakeGuard) Edit(_, messageID, content string) bool {
@@ -70,7 +109,7 @@ func (g *fakeGuard) SendEmbed(_ string, embed *discordgo.MessageEmbed,
 	components ...discordgo.MessageComponent) (*discordgo.Message, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.refuse {
+	if g.refuse || g.refuseEmbed {
 		return nil, false
 	}
 	g.embeds = append(g.embeds, embed)
@@ -330,7 +369,7 @@ func fixtureWithTimeout(t *testing.T, opts Options, timeout time.Duration) (*Ser
 		"other": {ID: "other", Name: "memes", Text: true, GuildID: otherGuild},
 	}
 
-	s := New(dbtest.Set(t), guard, manager, tracker, chans, nil, opts)
+	s := New(dbtest.Set(t), guard, manager, nil, tracker, chans, nil, opts)
 	if err := s.Init(core.Deps{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
@@ -717,7 +756,7 @@ func TestTheSweepRepostsTheAnnouncementToDeliverAHint(t *testing.T) {
 		HintAfter: time.Millisecond,
 	})
 	guard := &fakeGuard{}
-	s := New(dbtest.Set(t), guard, manager, tracker, fakeChannels{}, nil, enabled())
+	s := New(dbtest.Set(t), guard, manager, nil, tracker, fakeChannels{}, nil, enabled())
 	if err := s.Init(core.Deps{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
