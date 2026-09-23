@@ -998,3 +998,35 @@ func TestAFailedModalIsReported(t *testing.T) {
 		t.Error("a failed modal reported success")
 	}
 }
+
+// The response for a press on a replaced card. Type 6 is the whole behaviour: it closes the
+// interaction without posting or editing anything.
+func TestAcknowledgeIsTypeSixAndSaysNothing(t *testing.T) {
+	f := &fakeSession{}
+	gate := &blockAll{}
+	g := newGuard(f, gate)
+	if g.Acknowledge(nil) {
+		t.Error("a nil interaction was answered")
+	}
+	if !g.Acknowledge(&discordgo.Interaction{ChannelID: "c1"}) {
+		t.Fatal("Acknowledge refused under a gate that refuses text: it carries none")
+	}
+	if gate.calls != 0 {
+		t.Error("the content gate was consulted for a response with no content")
+	}
+	if r := f.responses[0]; r.Type != discordgo.InteractionResponseDeferredMessageUpdate || r.Data != nil {
+		t.Fatalf("response %+v", r)
+	}
+	f.respondErr = errors.New("unknown interaction")
+	if g.Acknowledge(&discordgo.Interaction{ChannelID: "c1"}) {
+		t.Error("a failed acknowledge reported success")
+	}
+}
+
+func TestAcknowledgeRespectsTheIgnoreList(t *testing.T) {
+	f := &fakeSession{}
+	g := newGuard(f, allowAll{}, "c1")
+	if g.Acknowledge(&discordgo.Interaction{ChannelID: "c1"}) || len(f.responses) != 0 {
+		t.Error("acknowledged a press in an ignored channel")
+	}
+}

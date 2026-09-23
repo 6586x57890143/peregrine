@@ -14,9 +14,10 @@ type Options struct {
 	MaxDuration time.Duration // hard ceiling on a match, from the lobby closing
 	MinPlayers  int
 	MaxPlayers  int
-	Rounds      int // regular rounds before the bonus
-	IdleStrikes int // consecutive timeouts before a player is removed
-	MaxChannels int // concurrent matches; not configuration, like wordgame's
+	Rounds      int           // regular rounds before the bonus
+	IdleStrikes int           // consecutive timeouts before a player is removed
+	MaxChannels int           // concurrent matches; not configuration, like wordgame's
+	RecapPause  time.Duration // how long a solved round stays on screen before the next
 }
 
 func (o Options) withDefaults() Options {
@@ -33,6 +34,7 @@ func (o Options) withDefaults() Options {
 	def(&o.Lobby, 60*time.Second)
 	def(&o.TurnTimeout, 45*time.Second)
 	def(&o.MaxDuration, 30*time.Minute)
+	def(&o.RecapPause, 8*time.Second)
 	defInt(&o.MinPlayers, 1)
 	defInt(&o.MaxPlayers, 6)
 	defInt(&o.Rounds, 3)
@@ -53,6 +55,8 @@ type View struct {
 	Round   int
 	Rounds  int
 
+	MaxPlayers int // for the lobby's "2/6"
+
 	Category string
 	Board    string // the phrase with hidden letters as '_'; the whole phrase once over
 	Called   []rune // sorted
@@ -67,6 +71,16 @@ type View struct {
 	BonusPrize int // zero until the match is over, so the card cannot give it away
 
 	Last []Event // what the most recent change did, kept so a sweep repaint still says it
+
+	Recap *Recap // the round just solved, only in the Intermission phase
+}
+
+// Recap is a solved round: what the answer was, who got it and what it paid.
+type Recap struct {
+	Round                int
+	Category, Phrase     string
+	SolverID, SolverName string
+	Gold                 int
 }
 
 // PlayerView is one seat.

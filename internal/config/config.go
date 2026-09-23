@@ -239,6 +239,8 @@ type Config struct {
 	WheelTurnTimeout time.Duration // PEREGRINE_WHEEL_TURN_TIMEOUT
 	WheelIdleStrikes int           // PEREGRINE_WHEEL_IDLE_STRIKES
 	WheelMaxDuration time.Duration // PEREGRINE_WHEEL_MAX_DURATION
+	WheelRepostAfter int           // PEREGRINE_WHEEL_REPOST_AFTER
+	WheelAssetURL    string        // PEREGRINE_WHEEL_ASSET_URL
 
 	// Corpus snapshots. Off by default, because there is no safe guess for a path and
 	// writing megabytes somewhere the operator did not choose is worse than not backing up.
@@ -586,6 +588,13 @@ func Load() (*Config, error) {
 		WheelTurnTimeout: l.dur("PEREGRINE_WHEEL_TURN_TIMEOUT", 45*time.Second, 10*time.Second, 5*time.Minute),
 		WheelIdleStrikes: l.intVal("PEREGRINE_WHEEL_IDLE_STRIKES", 2, 1, 5),
 		WheelMaxDuration: l.dur("PEREGRINE_WHEEL_MAX_DURATION", 30*time.Minute, 5*time.Minute, 3*time.Hour),
+		// Messages of conversation that move the card back to the bottom of the channel, so a
+		// match being played is never a screen up.
+		WheelRepostAfter: l.intVal("PEREGRINE_WHEEL_REPOST_AFTER", 6, 3, 50),
+		// Where the card's banner images live. The default is this repository's raw URL, so
+		// it only resolves while the repository is public; empty turns the images off.
+		WheelAssetURL: l.str("PEREGRINE_WHEEL_ASSET_URL",
+			"https://raw.githubusercontent.com/6586x57890143/peregrine/main/assets/wheel/"),
 
 		BackupDir:  l.str("PEREGRINE_BACKUP_DIR", ""),
 		BackupTick: l.dur("PEREGRINE_BACKUP_TICK", 24*time.Hour, time.Minute, 30*24*time.Hour),
