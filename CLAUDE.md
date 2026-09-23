@@ -878,6 +878,13 @@ disagreed would be one command answering a question its twin refuses. The other 
 the knob-wired-to-nothing shape: a `/wordgame` visible in every client for a feature that is
 off is a command whose only possible answer is a refusal.
 
+**Gold is a third column, not more points (M35).** `Entry.Gold` is `omitempty` like every field
+after `Wins`, so an older board loads, and `AddGold` touches nothing but gold and the name: a wheel
+payout between two scramble wins must not break a streak nobody else interrupted. An entry can
+carry gold with zero wins, which is why `Scores`, `Fastest` and `BackfillPoints` each read their
+own field. The column renders only once somebody has gold, so the rollout is invisible until a
+match pays out, and three columns narrow names to 12 runes because three 16-rune names wrap.
+
 **`Guard.UpdateEmbed` is a send, and "the reader already had this open" exempts nothing.** It
 runs the same `CheckEmit` walk, pause switch, ignore list and explicit `AllowedMentions` as
 `SendEmbed`, because what goes INTO the message is a freshly built board full of nicknames. The
