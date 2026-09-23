@@ -27,6 +27,7 @@ import (
 	"github.com/6586x57890143/peregrine/internal/plugins/voicenote"
 	"github.com/6586x57890143/peregrine/internal/safety"
 	"github.com/6586x57890143/peregrine/internal/storage"
+	"github.com/6586x57890143/peregrine/internal/wheel"
 	"github.com/6586x57890143/peregrine/internal/wordgame"
 )
 
@@ -170,8 +171,35 @@ func registerServices(
 	// downwards. discordgo's GuildMember is an unconditional REST GET, which is why the wrapper
 	// exists at all, and a GLOBAL board makes it matter more, since it ranks people who are not
 	// in the caller's guild.
-	gamesSvc := games.New(corpora, guard, manager, tracker, resolver, members, games.Options{
+	// The wheel's puzzles, on the dictionary's rule: a list that will not load turns the wheel
+	// off and says so, rather than taking the bot down with it. A nil list gives a manager that
+	// reports unavailable, which also keeps /wheel and /wallet out of the command set.
+	var wheelPuzzles *wheel.Puzzles
+	if cfg.EnableWheel {
+		wheelPuzzles, err = wheel.LoadPuzzles(cfg.WheelPuzzles)
+		switch {
+		case err != nil:
+			log.Warn("wheel puzzles failed to load, the wheel is disabled", "err", err)
+		case wheelPuzzles.Rejected() > 0:
+			log.Warn("wheel puzzles loaded with malformed lines skipped",
+				"puzzles", wheelPuzzles.Len(), "rejected", wheelPuzzles.Rejected())
+		default:
+			log.Info("wheel puzzles loaded", "puzzles", wheelPuzzles.Len())
+		}
+	}
+	wheels := wheel.NewManager(wheelPuzzles, nil, wheel.Options{
+		Lobby:       cfg.WheelLobby,
+		TurnTimeout: cfg.WheelTurnTimeout,
+		MaxDuration: cfg.WheelMaxDuration,
+		MinPlayers:  cfg.WheelMinPlayers,
+		MaxPlayers:  cfg.WheelMaxPlayers,
+		Rounds:      cfg.WheelRounds,
+		IdleStrikes: cfg.WheelIdleStrikes,
+	})
+
+	gamesSvc := games.New(corpora, guard, manager, wheels, tracker, resolver, members, games.Options{
 		Enabled:             cfg.EnableWordGames,
+		Wheel:               cfg.EnableWheel,
 		Mode:                games.Mode(cfg.WordGameMode),
 		Interval:            cfg.WordGameInterval,
 		LeaderboardTick:     cfg.LeaderboardTick,

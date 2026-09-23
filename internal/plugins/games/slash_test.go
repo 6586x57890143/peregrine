@@ -277,7 +277,7 @@ func TestTheRegisteredCommandMatchesWhatTheHandlerReads(t *testing.T) {
 		boardCommandName:  {optScope},
 	}
 
-	defs := definitions(true)
+	defs := definitions(true, false)
 	if len(defs) != len(want) {
 		t.Fatalf("definitions() returned %d commands, want %d", len(defs), len(want))
 	}
@@ -311,7 +311,7 @@ func TestTheRegisteredCommandMatchesWhatTheHandlerReads(t *testing.T) {
 	// With word games off, the two commands that ARE the feature go away and the leaderboard
 	// stays. !leaderboard has never been gated on the flag, because its chat half reads the
 	// stats bucket, which is populated on every message.
-	off := definitions(false)
+	off := definitions(false, false)
 	if len(off) != 1 || off[0].Name != boardCommandName {
 		t.Errorf("with word games off the registered set is %v, want just /%s",
 			off, boardCommandName)
