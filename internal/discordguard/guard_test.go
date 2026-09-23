@@ -247,7 +247,7 @@ func TestEveryTextBearingCallConsultsTheGate(t *testing.T) {
 				t.Error("the gate was never consulted, so this call site is outside the " +
 					"chokepoint and A3 is not closed")
 			}
-			if len(f.sends)+len(f.edits)+len(f.reactions) != 0 {
+			if len(f.sends)+len(f.edits)+len(f.reactions)+len(f.responses) != 0 {
 				t.Error("something reached the session despite the refusal")
 			}
 		})
@@ -846,5 +846,155 @@ func TestAComponentResponseReplacesTheMessage(t *testing.T) {
 	}
 	if f.responses[0].Data.AllowedMentions == nil {
 		t.Error("the update carries no AllowedMentions, so Discord parses every mention in it")
+	}
+}
+
+// A live game card is repainted by the sweep with no press behind it, which is the one repaint
+// UpdateEmbed cannot do. It is a send in everything but name: nicknames go into it.
+func TestAnEmbedEditIsGatedOverEveryField(t *testing.T) {
+	f := &fakeSession{}
+	g := newGuard(f, blockMatching{bad: "exampleslur"})
+
+	embed := &discordgo.MessageEmbed{
+		Title:  "wheel",
+		Fields: []*discordgo.MessageEmbedField{{Name: "players", Value: "exampleslur 600"}},
+	}
+	if g.EditEmbed("c1", "m1", embed) {
+		t.Error("a nickname carrying a blocked word was painted onto the card")
+	}
+	if len(f.edits) != 0 {
+		t.Errorf("the refused edit reached Discord anyway: %v", f.edits)
+	}
+	if g.EditEmbed("c1", "m1", nil) {
+		t.Error("a nil embed was sent")
+	}
+}
+
+func TestAnEmbedEditSuppressesMentionsOnTheWire(t *testing.T) {
+	f := &fakeSession{}
+	g := newGuard(f, allowAll{})
+
+	if !g.EditEmbed("c1", "m1", &discordgo.MessageEmbed{Description: "now about <@123>"}) {
+		t.Fatal("EditEmbed reported failure")
+	}
+	raw, err := json.Marshal(f.edits[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"parse":[]`) {
+		t.Errorf("an embed edit must suppress mentions like a send: %s", raw)
+	}
+	if f.edits[0].ID != "m1" || f.edits[0].Channel != "c1" {
+		t.Errorf("edited %s/%s", f.edits[0].Channel, f.edits[0].ID)
+	}
+}
+
+// A finished game must lose its buttons. discordgo omits a nil components pointer, which
+// leaves the old buttons on a card where every press can only fail.
+func TestAnEmbedEditWithNoComponentsClearsTheButtons(t *testing.T) {
+	f := &fakeSession{}
+	g := newGuard(f, allowAll{})
+
+	if !g.EditEmbed("c1", "m1", &discordgo.MessageEmbed{Title: "wheel: game over"}) {
+		t.Fatal("EditEmbed reported failure")
+	}
+	raw, _ := json.Marshal(f.edits[0])
+	if !strings.Contains(string(raw), `"components":[]`) {
+		t.Errorf("an edit with no components left the old buttons in place: %s", raw)
+	}
+
+	row := discordgo.ActionsRow{Components: []discordgo.MessageComponent{
+		discordgo.Button{Label: "spin", CustomID: "wof:spin:1"},
+	}}
+	g.EditEmbed("c1", "m1", &discordgo.MessageEmbed{Title: "wheel"}, row)
+	if got := *f.edits[1].Components; len(got) != 1 {
+		t.Errorf("components = %v, want the one row", got)
+	}
+}
+
+func TestAnEmbedEditInAnIgnoredChannelIsRefused(t *testing.T) {
+	f := &fakeSession{}
+	g := newGuard(f, allowAll{}, "c1")
+
+	if g.EditEmbed("c1", "m1", &discordgo.MessageEmbed{Title: "wheel"}) {
+		t.Error("repainted a card in a channel the operator said not to post in")
+	}
+	if len(f.edits) != 0 {
+		t.Error("the edit reached Discord")
+	}
+}
+
+func TestAFailedEmbedEditIsReported(t *testing.T) {
+	f := &fakeSession{editErr: errors.New("unknown message")}
+	g := newGuard(f, allowAll{})
+
+	if g.EditEmbed("c1", "m1", &discordgo.MessageEmbed{Title: "wheel"}) {
+		t.Error("a failed edit reported success, so the caller would believe a deleted card is on screen")
+	}
+}
+
+// Under a pause the response to the submit would be refused, so opening the form would only
+// collect an answer that can never be shown.
+func TestAModalIsPauseGated(t *testing.T) {
+	f := &fakeSession{}
+	gate := &blockAll{}
+	g := newGuard(f, gate)
+
+	if g.RespondModal(&discordgo.Interaction{ChannelID: "c1"}, "wof:cons:3", "call a consonant",
+		discordgo.TextInput{CustomID: "t", Label: "letter"}) {
+		t.Error("a modal opened while the gate refused everything")
+	}
+	if gate.calls == 0 || len(f.responses) != 0 {
+		t.Errorf("gate calls %d, responses %d", gate.calls, len(f.responses))
+	}
+}
+
+func TestAModalInAnIgnoredChannelIsRefused(t *testing.T) {
+	f := &fakeSession{}
+	g := newGuard(f, allowAll{}, "c1")
+
+	if g.RespondModal(&discordgo.Interaction{ChannelID: "c1"}, "wof:cons:3", "call a consonant",
+		discordgo.TextInput{CustomID: "t", Label: "letter"}) {
+		t.Error("a modal opened in an ignored channel")
+	}
+}
+
+// The response type is the behaviour: anything but a modal posts a message instead of opening
+// a form. Every input sits in its own row, because Discord refuses a modal otherwise.
+func TestAModalIsTypeNine(t *testing.T) {
+	f := &fakeSession{}
+	g := newGuard(f, allowAll{})
+
+	if g.RespondModal(nil, "id", "title", discordgo.TextInput{CustomID: "t"}) {
+		t.Error("a nil interaction was answered")
+	}
+	if g.RespondModal(&discordgo.Interaction{ChannelID: "c1"}, "id", "title") {
+		t.Error("a modal with no inputs was opened")
+	}
+	ok := g.RespondModal(&discordgo.Interaction{ChannelID: "c1"}, "wof:solve:4", "solve the puzzle",
+		discordgo.TextInput{CustomID: "t", Label: "answer", MaxLength: 60},
+		discordgo.TextInput{CustomID: "u", Label: "second"})
+	if !ok || len(f.responses) != 1 {
+		t.Fatalf("ok %v responses %d", ok, len(f.responses))
+	}
+	r := f.responses[0]
+	if r.Type != discordgo.InteractionResponseModal || r.Data.CustomID != "wof:solve:4" || r.Data.Title != "solve the puzzle" {
+		t.Fatalf("response %+v", r)
+	}
+	if len(r.Data.Components) != 2 {
+		t.Fatalf("%d rows, want one per input", len(r.Data.Components))
+	}
+	for _, c := range r.Data.Components {
+		if row, ok := c.(discordgo.ActionsRow); !ok || len(row.Components) != 1 {
+			t.Fatalf("row %#v", c)
+		}
+	}
+}
+
+func TestAFailedModalIsReported(t *testing.T) {
+	f := &fakeSession{respondErr: errors.New("unknown interaction")}
+	g := newGuard(f, allowAll{})
+	if g.RespondModal(&discordgo.Interaction{ChannelID: "c1"}, "id", "title", discordgo.TextInput{CustomID: "t"}) {
+		t.Error("a failed modal reported success")
 	}
 }
