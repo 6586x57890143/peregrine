@@ -1,0 +1,146 @@
+# Wheel of Fortune puzzles: category|PHRASE, one per line.
+#
+# The loader uppercases the phrase and collapses spaces. Allowed in a phrase: letters A-Z,
+# digits, spaces and ' - & . , ! ? : (everything but letters is shown from the start).
+# A word may be at most 13 letters, a phrase at most 52 characters, because the board is
+# wrapped at word boundaries to fit a phone. TestEmbeddedPuzzlesAllValid fails on any line
+# the loader would skip, so a typo here is a test failure rather than a quieter game.
+
+phrase|touch grass
+phrase|it is what it is
+phrase|no thoughts head empty
+phrase|skill issue
+phrase|ratio and cope
+phrase|living rent free in my head
+phrase|main character energy
+phrase|this is fine
+phrase|big if true
+phrase|trust the process
+phrase|we do a little trolling
+phrase|down bad
+phrase|not the vibe
+phrase|built different
+phrase|let him cook
+phrase|caught in four k
+phrase|understood the assignment
+phrase|the audacity
+phrase|say less
+phrase|no cap
+phrase|go touch some grass
+phrase|read the room
+phrase|better late than never
+phrase|break a leg
+phrase|piece of cake
+phrase|hit the nail on the head
+phrase|once in a blue moon
+phrase|the ball is in your court
+phrase|bite the bullet
+phrase|costs an arm and a leg
+phrase|under the weather
+phrase|spill the beans
+phrase|let the cat out of the bag
+phrase|actions speak louder than words
+phrase|when pigs fly
+phrase|the early bird gets the worm
+phrase|barking up the wrong tree
+phrase|beat around the bush
+phrase|burning the midnight oil
+phrase|curiosity killed the cat
+phrase|every cloud has a silver lining
+phrase|a penny for your thoughts
+phrase|jump on the bandwagon
+phrase|go back to the drawing board
+phrase|throw in the towel
+phrase|the whole nine yards
+phrase|out of the frying pan
+phrase|you can't win them all
+phrase|don't count your chickens
+phrase|it takes two to tango
+thing|a rubber duck
+thing|the group chat
+thing|an unread notification
+thing|a cursed image
+thing|a mechanical keyboard
+thing|the loading screen
+thing|a participation trophy
+thing|an overdue library book
+thing|a haunted doll
+thing|the last slice of pizza
+thing|a traffic cone
+thing|a lava lamp
+thing|a fidget spinner
+thing|an emotional support water bottle
+thing|a reply guy
+thing|a broken phone charger
+thing|the snooze button
+thing|a whoopee cushion
+thing|a garden gnome
+thing|a pineapple on pizza
+place|the comment section
+place|the shadow realm
+place|the back of the fridge
+place|a group project meeting
+place|the self checkout
+place|the dentist's waiting room
+place|the discount aisle
+place|an airport at three a.m.
+place|the parking lot
+place|the ball pit
+place|a bouncy castle
+place|the deep end of the pool
+place|a cozy coffee shop
+place|the top of the leaderboard
+place|a secret underground lair
+food & drink|chicken nuggets
+food & drink|a bowl of instant ramen
+food & drink|gas station sushi
+food & drink|cold pizza for breakfast
+food & drink|an iced coffee
+food & drink|a family size bag of chips
+food & drink|peanut butter and jelly
+food & drink|a suspicious casserole
+food & drink|microwave popcorn
+food & drink|a grilled cheese sandwich
+food & drink|spicy chicken wings
+food & drink|a pumpkin spice latte
+food & drink|french fries and a milkshake
+food & drink|birthday cake frosting
+food & drink|energy drink at midnight
+what are you doing?|doomscrolling at two a.m.
+what are you doing?|arguing with strangers online
+what are you doing?|pretending to be busy
+what are you doing?|leaving someone on read
+what are you doing?|speedrunning a bad decision
+what are you doing?|typing and then deleting it
+what are you doing?|refreshing the page again
+what are you doing?|touching grass for once
+what are you doing?|rage quitting a video game
+what are you doing?|lurking in the chat
+event|a surprise birthday party
+event|the group photo
+event|a karaoke night
+event|a boss fight
+event|the season finale
+event|a server wide argument
+event|a power outage
+event|monday morning
+event|a family reunion
+event|a spelling bee
+before & after|pizza party animal
+before & after|couch potato chips
+before & after|hot dog house
+before & after|fire drill sergeant
+before & after|cheese board game
+before & after|ice cream cone head
+before & after|rain check mate
+before & after|pop quiz show
+character|the final boss
+character|a sleep deprived wizard
+character|the chosen one
+character|a very confused goose
+character|the mysterious stranger
+character|a raccoon in a trench coat
+character|the villain of the story
+character|a pigeon with a plan
+character|the sidekick
+character|a wizard who forgot his spells
