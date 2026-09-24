@@ -273,7 +273,7 @@ func TestTheRegisteredCommandMatchesWhatTheHandlerReads(t *testing.T) {
 	// name rather than by index so adding a command is a row here and not a rewrite.
 	want := map[string][]string{
 		commandName:       {optWord, optCount},
-		configCommandName: {optChannel, optMode, optInterval, optReset},
+		configCommandName: {optChannel, optGame, optMode, optInterval, optReset, optAllow, optDeny},
 		boardCommandName:  {optScope},
 	}
 

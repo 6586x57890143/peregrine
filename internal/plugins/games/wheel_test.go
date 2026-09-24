@@ -440,7 +440,7 @@ func TestWheelIsNotRegisteredWhenDisabledOrUnavailable(t *testing.T) {
 	if defs := definitions(false, false); has(defs, wheelCommandName) || has(defs, walletCommandName) {
 		t.Fatal("the wheel's commands were registered with the wheel off")
 	}
-	if defs := definitions(false, true); !has(defs, wheelCommandName) || !has(defs, walletCommandName) || !has(defs, boardCommandName) {
+	if defs := definitions(false, true); !has(defs, wheelCommandName) || !has(defs, walletCommandName) || !has(defs, boardCommandName) || !has(defs, configCommandName) {
 		t.Fatal("the wheel's commands are missing with the wheel on")
 	}
 

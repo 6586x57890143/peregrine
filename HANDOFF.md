@@ -67,7 +67,7 @@ The reasons worth keeping:
    startup error naming both.
 3. **`MIN_PLAYERS` defaults to 1, so solo play is allowed** and one person can farm gold, bounded
    by one match per channel and how long a match takes. Set it to 2 to require an opponent.
-4. **The wheel runs where word games may run.** `/wordgame-config`'s channel binding covers both.
+4. **The wheel has its own channel binding as of M36**: `/wordgame-config game:wheel channel:bind`. A settings blob stored before M36 inherits the scramble's list, so nothing loosens on upgrade.
 5. **Nothing to migrate.** `Entry.Gold` is `omitempty` and the wallet is a new key; no schema bump.
 
 ## What is NOT done, in priority order

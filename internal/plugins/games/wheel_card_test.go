@@ -35,8 +35,10 @@ func TestTheBoardIsEmojiTilesThatNeverFormFlags(t *testing.T) {
 	}
 }
 
-// Eleven tiles to a line, counting a tile for each word gap, so a phone never wraps a word.
-func TestTheBoardWrapsAtElevenTiles(t *testing.T) {
+// Eleven tiles to a line, counting a tile for each word gap, so a phone never wraps a word. And
+// EXACTLY eleven, padded with the backing tile, which is what makes the rows a wall rather than
+// ragged lines whose word gaps some clients render too narrow to see (M36).
+func TestTheBoardIsAWallElevenTilesWide(t *testing.T) {
 	lines := strings.Split(tiles("A RACCOON IN A TRENCH COAT"), "\n")
 	if len(lines) != 3 {
 		t.Fatalf("%d lines: %q", len(lines), lines)
@@ -48,8 +50,8 @@ func TestTheBoardWrapsAtElevenTiles(t *testing.T) {
 				cells++
 			}
 		}
-		if cells > boardCells {
-			t.Errorf("line %q is %d cells", l, cells)
+		if cells != boardCells {
+			t.Errorf("line %q is %d cells, want %d", l, cells, boardCells)
 		}
 	}
 }

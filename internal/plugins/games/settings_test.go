@@ -1,6 +1,7 @@
 package games
 
 import (
+	"github.com/6586x57890143/peregrine/internal/storage"
 	"strings"
 	"testing"
 	"time"
@@ -289,5 +290,59 @@ func TestAGuildsOwnBindStillRestrictsThatGuild(t *testing.T) {
 	}
 	if !s.allowed(otherGuild, "other") {
 		t.Error("binding a channel in this guild restricted another guild")
+	}
+}
+
+// TestEachGameHasItsOwnChannels is M36: binding the wheel says nothing about the scramble and
+// the reverse, and both lists take more than one channel.
+func TestEachGameHasItsOwnChannels(t *testing.T) {
+	s, guard, _, _ := fixture(t, enabled())
+
+	s.handleConfig(configInteraction("w1", strOpt(optChannel, channelBind), strOpt(optGame, gameWheel)))
+	s.handleConfig(configInteraction("w2", strOpt(optChannel, channelBind), strOpt(optGame, gameWheel)))
+	s.handleConfig(configInteraction("c1", strOpt(optChannel, channelBind)))
+
+	if !s.wheelAllowed(testGuild, "w1") || !s.wheelAllowed(testGuild, "w2") {
+		t.Errorf("the wheel is refused in a channel it was bound to: %v", guard.responded())
+	}
+	if s.wheelAllowed(testGuild, "c1") {
+		t.Error("binding the scramble also allowed the wheel there")
+	}
+	if !s.allowed(testGuild, "c1") || s.allowed(testGuild, "w1") {
+		t.Error("binding the wheel changed where the scramble may run")
+	}
+
+	s.handleConfig(configInteraction("w1", strOpt(optChannel, channelAnywhere), strOpt(optGame, gameWheel)))
+	if !s.wheelAllowed(testGuild, "c9") || s.allowed(testGuild, "c9") {
+		t.Error("allow anywhere for the wheel did not stay on the wheel")
+	}
+
+	// And an explicit "anywhere" survives a restart rather than being read as a pre-M36 blob
+	// and inheriting the scramble's list.
+	restarted := New(s.corpora, guard, s.manager, nil, s.counter, s.resolver, nil, enabled())
+	if !restarted.wheelAllowed(testGuild, "c9") {
+		t.Errorf("the wheel's anywhere did not survive a restart: %+v", restarted.snapshot(testGuild))
+	}
+}
+
+// TestAPreWheelBlobKeepsTheWheelWhereItWas. Until M36 the wheel ran where the scramble did, so
+// a stored blob with no wheel list must not loosen the wheel to anywhere on upgrade.
+func TestAPreWheelBlobKeepsTheWheelWhereItWas(t *testing.T) {
+	s, guard, _, _ := fixture(t, enabled())
+	store, err := s.corpora.For(testGuild)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Update(func(w *storage.Writer) error {
+		return w.PutBlob(storage.BlobConfig, settingsKey,
+			[]byte(`{"channels":["c1"],"mode":"activity","interval":600000000000}`))
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := New(s.corpora, guard, s.manager, nil, s.counter, s.resolver, nil, enabled())
+	if !restarted.wheelAllowed(testGuild, "c1") || restarted.wheelAllowed(testGuild, "c2") {
+		t.Errorf("an old blob's wheel list = %v, want the scramble's [c1]",
+			restarted.snapshot(testGuild).WheelChannels)
 	}
 }
