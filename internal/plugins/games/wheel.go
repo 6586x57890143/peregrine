@@ -230,8 +230,8 @@ func (s *Service) handleWheel(i *discordgo.Interaction) {
 		s.guard.Respond(i, "the wheel needs a server channel", true)
 		return
 	}
-	if !s.allowed(i.GuildID, i.ChannelID) {
-		s.guard.Respond(i, "games are restricted to another channel", true)
+	if !s.wheelAllowed(i.GuildID, i.ChannelID) {
+		s.guard.Respond(i, "the wheel is restricted to another channel", true)
 		return
 	}
 

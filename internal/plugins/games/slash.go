@@ -76,6 +76,7 @@ const (
 	optCount = "count"
 
 	optChannel  = "channel"
+	optGame     = "game"
 	optMode     = "mode"
 	optInterval = "interval"
 	optReset    = "reset"
@@ -92,6 +93,13 @@ const (
 	channelBind     = "bind"
 	channelUnbind   = "unbind"
 	channelAnywhere = "anywhere"
+)
+
+// The game option's values: which allowlist the channel verb edits. The scramble is the
+// default, so every /wordgame-config written before the wheel existed means what it meant.
+const (
+	gameScramble = "scramble"
+	gameWheel    = "wheel"
 )
 
 // definitions is what gets registered.
@@ -138,10 +146,17 @@ func definitions(wordGames, wheelOn bool) []*discordgo.ApplicationCommand {
 			Description: "Your lifetime gold in this server, and this week's",
 		})
 	}
+	if !wordGames && !wheelOn {
+		return defs
+	}
+	// The config command is registered for EITHER game, because it owns the wheel's channel
+	// binding too: gating it on word games alone would leave a wheel-only server with no way
+	// to say where the wheel may run.
+	defs = append(defs, configCommand())
 	if !wordGames {
 		return defs
 	}
-	return append(defs, []*discordgo.ApplicationCommand{{
+	return append(defs, &discordgo.ApplicationCommand{
 		Name:        commandName,
 		Description: "Start a word scramble puzzle",
 		Options: []*discordgo.ApplicationCommandOption{
@@ -163,19 +178,33 @@ func definitions(wordGames, wheelOn bool) []*discordgo.ApplicationCommand {
 				MaxValue: 50,
 			},
 		},
-	}, {
+	})
+}
+
+func configCommand() *discordgo.ApplicationCommand {
+	return &discordgo.ApplicationCommand{
 		Name:        configCommandName,
-		Description: "Show or change where and how word games run",
+		Description: "Show or change where and how games run",
 		Options: []*discordgo.ApplicationCommandOption{
 			{
 				Type:        discordgo.ApplicationCommandOptionString,
 				Name:        optChannel,
-				Description: "Bind games to this channel, unbind it, or allow anywhere",
+				Description: "Bind a game to this channel, unbind it, or allow anywhere",
 				Required:    false,
 				Choices: []*discordgo.ApplicationCommandOptionChoice{
 					{Name: "bind this channel", Value: channelBind},
 					{Name: "unbind this channel", Value: channelUnbind},
 					{Name: "allow anywhere", Value: channelAnywhere},
+				},
+			},
+			{
+				Type:        discordgo.ApplicationCommandOptionString,
+				Name:        optGame,
+				Description: "Which game the channel option applies to (default: word scramble)",
+				Required:    false,
+				Choices: []*discordgo.ApplicationCommandOptionChoice{
+					{Name: "word scramble", Value: gameScramble},
+					{Name: "wheel of fortune", Value: gameWheel},
 				},
 			},
 			{
@@ -222,7 +251,7 @@ func definitions(wordGames, wheelOn bool) []*discordgo.ApplicationCommand {
 				Required:    false,
 			},
 		},
-	}}...)
+	}
 }
 
 func ptr[T any](v T) *T { return &v }
@@ -524,7 +553,7 @@ func (s *Service) handleConfig(i *discordgo.Interaction) {
 		// No options is a read. The command with nothing filled in is how an operator asks what
 		// the bot is currently doing, which is the question the log line at startup answers once
 		// and then scrolls away.
-		s.guard.Respond(i, "word games: "+s.snapshot(i.GuildID).String(), true)
+		s.guard.Respond(i, "games: "+s.snapshot(i.GuildID).String(), true)
 		return
 	}
 
@@ -539,13 +568,9 @@ func (s *Service) handleConfig(i *discordgo.Interaction) {
 			// start a game: there is no value to write back, so the alternative is not a reset
 			// but a silent mass revocation, in the command an operator reaches for when they
 			// are trying to make an .env edit take effect.
-			*set = settings{
-				Channels:     s.opts.AllowChannels,
-				Mode:         s.opts.Mode,
-				Interval:     s.opts.Interval,
-				StarterRoles: set.StarterRoles,
-				StarterUsers: set.StarterUsers,
-			}
+			roles, users := set.StarterRoles, set.StarterUsers
+			*set = s.seed()
+			set.StarterRoles, set.StarterUsers = roles, users
 			notes = append(notes, "reset to the values this process started with, keeping who "+
 				"may start games")
 		}
@@ -559,29 +584,41 @@ func (s *Service) handleConfig(i *discordgo.Interaction) {
 			set.grant(a.deny, false)
 			notes = append(notes, "revoked "+a.deny.String())
 		}
+		// The game picks the list; the three verbs are the same for both. An unknown game is
+		// refused rather than defaulted, because binding the scramble when the operator meant
+		// the wheel is a change they did not ask for.
+		list, game := &set.Channels, "word games"
+		switch a.game {
+		case "", gameScramble:
+		case gameWheel:
+			list, game = &set.WheelChannels, "the wheel"
+		default:
+			notes = append(notes, "ignored an unknown game "+strconv.Quote(a.game))
+			a.channel = ""
+		}
 		switch a.channel {
 		case channelBind:
-			if !slices.Contains(set.Channels, i.ChannelID) {
-				set.Channels = append(set.Channels, i.ChannelID)
+			if !slices.Contains(*list, i.ChannelID) {
+				*list = append(*list, i.ChannelID)
 			}
-			notes = append(notes, "bound to this channel")
+			notes = append(notes, game+" bound to this channel")
 		case channelUnbind:
-			set.Channels = slices.DeleteFunc(set.Channels, func(id string) bool {
+			*list = slices.DeleteFunc(*list, func(id string) bool {
 				return id == i.ChannelID
 			})
 			// Said out loud, because an empty allowlist means ANYWHERE and unbinding the last
 			// channel therefore does the opposite of what "unbind" sounds like. An operator who
 			// tightened the list one channel at a time should not discover that by watching a
 			// puzzle appear somewhere else.
-			if len(set.Channels) == 0 {
+			if len(*list) == 0 {
 				notes = append(notes, "unbound this channel, and that was the last one, so "+
-					"games can now run anywhere")
+					game+" can now run anywhere")
 			} else {
-				notes = append(notes, "unbound this channel")
+				notes = append(notes, game+" unbound from this channel")
 			}
 		case channelAnywhere:
-			set.Channels = nil
-			notes = append(notes, "games can run anywhere")
+			*list = nil
+			notes = append(notes, game+" can run anywhere")
 		}
 		// Checked against the two known modes rather than trusted, even though Discord only
 		// offers those two choices: an interaction payload is user input at a trust boundary, and
@@ -606,7 +643,7 @@ func (s *Service) handleConfig(i *discordgo.Interaction) {
 	// The change AND the resulting state, because a diff alone leaves an operator guessing at
 	// what the other two dials are, and interval mode with an interval nobody has checked is the
 	// combination that surprises people.
-	s.guard.Respond(i, strings.Join(notes, ", ")+".\nword games: "+set.String(), true)
+	s.guard.Respond(i, strings.Join(notes, ", ")+".\ngames: "+set.String(), true)
 }
 
 // clampInterval keeps a requested period inside the bounds Discord's own option only asks
@@ -623,6 +660,7 @@ func clampInterval(d time.Duration) time.Duration {
 // no-options form, which is how an operator asks what the bot is currently doing.
 type configArgs struct {
 	channel string
+	game    string
 	mode    string
 	minutes int
 	reset   bool
@@ -649,6 +687,8 @@ func readConfig(i *discordgo.Interaction) configArgs {
 		switch opt.Name {
 		case optChannel:
 			a.channel = opt.StringValue()
+		case optGame:
+			a.game = opt.StringValue()
 		case optMode:
 			a.mode = opt.StringValue()
 		case optInterval:

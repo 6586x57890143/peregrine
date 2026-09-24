@@ -540,6 +540,19 @@ fails if that goes. **A solved round pauses on a recap** (`wheel.Intermission`):
 it and the standings, until anyone playing presses next or `RecapPause` runs out. Before it, a
 solve replaced the board in the same instant and nobody saw the answer.
 
+**The board is a wall, and the gaps are tiles (M36).** Every row is exactly `boardCells` wide,
+words centred and everything else the green backing tile, including each word gap. The gap used
+to be an ideographic space, which some clients rendered barely wider than the space between two
+letters, so a board of white tiles read as one long word. A tile is the same width everywhere.
+`TestTheBoardIsAWallElevenTilesWide` pins the width.
+
+**The wheel has its own channel list (M36)**, `WheelChannels` beside the scramble's `Channels`
+in the same settings blob, edited by `/wordgame-config game:wheel`. The config command is
+therefore registered when EITHER game is on. The field is deliberately not `omitempty`: a blob
+with no `wheelChannels` key predates the split and inherits the scramble's list, because the
+wheel used to run wherever the scramble could, so nothing loosens on upgrade. A present key,
+null included, is an operator's answer and is kept.
+
 **The strip is an image because an image sets an embed's width.** Without it the card changed
 shape with its board. `internal/wheelart` draws it from `wheel.Wedges()`, `tools/wheelart` writes
 the 25 PNGs to `assets/wheel`, and a test compares them PIXEL for pixel (not bytes: the encoder's
