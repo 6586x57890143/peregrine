@@ -2,6 +2,7 @@ package games
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -48,7 +49,7 @@ const (
 	brand     = "🎡 WHEEL OF FORTUNE"
 	divider   = "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"
 	bar       = " ┃ "
-	wordGap   = "　" // ideographic space: a word break wider than a tile gap
+	wordGap   = "🟩" // the board's backing: word breaks and the padding either side of a row
 	tileGap   = " "
 	hidden    = "⬜"
 	alphabet1 = "ABCDEFGHIJKLM"
@@ -118,31 +119,42 @@ func wheelCard(v wheel.View, assets string) (*discordgo.MessageEmbed, []discordg
 	return e, wheelButtons(v)
 }
 
-// tiles renders the board as emoji tiles, wrapped at word boundaries. A letter is a regional
-// indicator and a hidden letter a white tile. Every tile is followed by a space, which is also
-// what stops two regional indicators side by side from rendering as a flag.
+// tiles renders the board as the show's wall: every row is boardCells tiles wide, words sit
+// centred on it, and everything that is not a letter is a green backing tile. A letter is a
+// regional indicator and a hidden letter a white tile.
+//
+// The gaps are a TILE rather than whitespace (M36). A wide space was the word break before,
+// and on some clients it rendered barely wider than the gap between two letters, so a board of
+// white tiles read as one long word. A coloured tile is the same width on every client, and
+// padding each row to the full width is what makes the rows line up as a wall on a phone as
+// well as a desktop.
+//
+// Tiles are still joined with a space, which is what stops two regional indicators side by
+// side from rendering as a flag.
 func tiles(board string) string {
 	var lines []string
-	var cur []string
-	width := 0
+	var row []string
+	flush := func() {
+		pad := max(boardCells-len(row), 0)
+		cells := append(slices.Repeat([]string{wordGap}, pad/2), row...)
+		cells = append(cells, slices.Repeat([]string{wordGap}, pad-pad/2)...)
+		lines = append(lines, strings.Join(cells, tileGap))
+		row = nil
+	}
 	for _, w := range strings.Fields(board) {
 		n := len([]rune(w))
-		if width > 0 && width+1+n > boardCells {
-			lines = append(lines, strings.Join(cur, wordGap))
-			cur, width = nil, 0
+		if len(row) > 0 && len(row)+1+n > boardCells {
+			flush()
 		}
-		if width > 0 {
-			width++
+		if len(row) > 0 {
+			row = append(row, wordGap)
 		}
-		width += n
-		t := make([]string, 0, n)
 		for _, r := range w {
-			t = append(t, tile(r))
+			row = append(row, tile(r))
 		}
-		cur = append(cur, strings.Join(t, tileGap))
 	}
-	if len(cur) > 0 {
-		lines = append(lines, strings.Join(cur, wordGap))
+	if len(row) > 0 {
+		flush()
 	}
 	return strings.Join(lines, "\n")
 }
