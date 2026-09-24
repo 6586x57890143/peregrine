@@ -34,6 +34,17 @@ type settings struct {
 	// where games belong has not said no.
 	Channels []string `json:"channels"`
 
+	// WheelChannels is the wheel's own allowlist, with the same empty-means-anywhere reading.
+	// A separate list because a server wants the scramble in general chat and a ten-minute
+	// match somewhere it will not bury the conversation, and one list could only say both or
+	// neither.
+	//
+	// NOT omitempty, and that is load-bearing: until M36 the wheel read Channels, so a blob
+	// with no wheelChannels key at all is inherited from Channels on load, whereas a present
+	// key, null included, is an operator's answer. Dropping the key for an empty list would
+	// turn "allow anywhere" back into the scramble's list on the next restart.
+	WheelChannels []string `json:"wheelChannels"`
+
 	Mode     Mode          `json:"mode"`
 	Interval time.Duration `json:"interval"`
 
@@ -77,11 +88,7 @@ const (
 // disable that one. Unlike the leaderboard there is nothing here that is not re-derivable, since
 // the environment still holds a usable answer.
 func (s *Service) loadSettings(store *storage.Store, guildID string) settings {
-	seed := settings{
-		Channels: s.opts.AllowChannels,
-		Mode:     s.opts.Mode,
-		Interval: s.opts.Interval,
-	}
+	seed := s.seed()
 
 	var stored *settings
 	if err := store.View(func(r *storage.Reader) error {
@@ -92,6 +99,15 @@ func (s *Service) loadSettings(store *storage.Store, guildID string) settings {
 		var set settings
 		if err := json.Unmarshal(v, &set); err != nil {
 			return err
+		}
+		// A blob from before M36 has no wheel list, and the wheel ran where the scramble did.
+		// Inheriting keeps a bound server bound rather than loosening the wheel to anywhere
+		// on upgrade. Cloned, so appending to one list cannot write into the other's array.
+		var keys map[string]json.RawMessage
+		if json.Unmarshal(v, &keys) == nil {
+			if _, ok := keys["wheelChannels"]; !ok {
+				set.WheelChannels = slices.Clone(set.Channels)
+			}
 		}
 		stored = &set
 		return nil
@@ -124,21 +140,26 @@ func (s *Service) loadSettings(store *storage.Store, guildID string) settings {
 // String is what the command prints and what Init logs, which is one renderer rather than two
 // that can disagree about what the bot is currently doing.
 func (s settings) String() string {
-	where := "anywhere"
-	if len(s.Channels) > 0 {
-		// Channel mentions rather than names: Discord renders them as links, they never notify,
-		// and the alternative is a resolver lookup per channel for a line nobody reads twice.
-		ids := make([]string, len(s.Channels))
-		for i, id := range s.Channels {
-			ids[i] = "<#" + id + ">"
-		}
-		where = strings.Join(ids, " ")
-	}
 	mode := "activity mode"
 	if s.Mode == ModeInterval {
 		mode = fmt.Sprintf("interval mode every %s", s.Interval)
 	}
-	return fmt.Sprintf("%s, in %s, %s", mode, where, s.starters())
+	return fmt.Sprintf("%s, in %s, the wheel in %s, %s", mode, where(s.Channels),
+		where(s.WheelChannels), s.starters())
+}
+
+// where renders an allowlist. Channel mentions rather than names: Discord renders them as
+// links, they never notify, and the alternative is a resolver lookup per channel for a line
+// nobody reads twice.
+func where(list []string) string {
+	if len(list) == 0 {
+		return "anywhere"
+	}
+	ids := make([]string, len(list))
+	for i, id := range list {
+		ids[i] = "<#" + id + ">"
+	}
+	return strings.Join(ids, " ")
 }
 
 // starters renders the grant list, which is the only part of these settings that is about
@@ -242,7 +263,7 @@ func (s *Service) update(guildID string, fn func(*settings)) settings {
 func (s *Service) snapshot(guildID string) settings {
 	st, err := s.state(guildID)
 	if err != nil {
-		return settings{Channels: s.opts.AllowChannels, Mode: s.opts.Mode, Interval: s.opts.Interval}
+		return s.seed()
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -262,4 +283,21 @@ func (s *Service) snapshot(guildID string) settings {
 // turned them off everywhere else. A list is a statement about the guilds it names.
 func (s *Service) allowed(guildID, channelID string) bool {
 	return channels.Allows(s.resolver, s.snapshot(guildID).Channels, guildID, channelID)
+}
+
+// wheelAllowed is allowed for the wheel's own list, read through the same channels.Allows so
+// the M31b per-guild reading applies to both.
+func (s *Service) wheelAllowed(guildID, channelID string) bool {
+	return channels.Allows(s.resolver, s.snapshot(guildID).WheelChannels, guildID, channelID)
+}
+
+// seed is the environment's answer. PEREGRINE_WORDGAME_CHANNELS seeds both lists, because it
+// governed the wheel too until M36 and a fresh corpus should behave as it always has.
+func (s *Service) seed() settings {
+	return settings{
+		Channels:      s.opts.AllowChannels,
+		WheelChannels: slices.Clone(s.opts.AllowChannels),
+		Mode:          s.opts.Mode,
+		Interval:      s.opts.Interval,
+	}
 }
