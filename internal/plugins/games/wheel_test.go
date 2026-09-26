@@ -429,10 +429,16 @@ func TestWheelComponentsDoNotReachTheBoardHandler(t *testing.T) {
 }
 
 func TestWheelIsNotRegisteredWhenDisabledOrUnavailable(t *testing.T) {
+	// Top-level commands and /game's subcommands, so the wheel is found wherever it lives.
 	has := func(defs []*discordgo.ApplicationCommand, name string) bool {
 		for _, d := range defs {
-			if d.Name == name {
+			if d.Name == name && d.Name != commandName {
 				return true
+			}
+			for _, o := range d.Options {
+				if d.Name == commandName && o.Name == name {
+					return true
+				}
 			}
 		}
 		return false
@@ -556,4 +562,21 @@ func TestTheWalletIsAPlainJSONMap(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+// TestGameWheelOpensALobby is the wheel's half of M37's routing: /game wheel through the
+// gateway handler, not handleWheel called directly.
+func TestGameWheelOpensALobby(t *testing.T) {
+	r := wheelFixture(t, wheel.Options{})
+	i := wheelCommand(alice, commandName)
+	i.Data = discordgo.ApplicationCommandInteractionData{
+		Name: commandName,
+		Options: []*discordgo.ApplicationCommandInteractionDataOption{{
+			Name: wheelCommandName, Type: discordgo.ApplicationCommandOptionSubCommand,
+		}},
+	}
+	r.s.onInteraction(nil, &discordgo.InteractionCreate{Interaction: i})
+	if _, ok := r.s.wheels.Snapshot("c1"); !ok {
+		t.Fatalf("/game wheel opened no lobby: %v", r.guard.responded())
+	}
 }
