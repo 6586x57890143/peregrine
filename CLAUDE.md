@@ -294,7 +294,16 @@ The dictionary load used to be `log.Fatalf`, so a missing 64 KB word list killed
 
 **`MaybeStart` asks the counter outside its own lock**, because the counter is another package's mutex and holding one lock while taking another is how a lock-ordering deadlock gets built. Nothing needs the count and the game map to be consistent with each other; the worst case is a game started on a count that was true a microsecond ago.
 
-**`/wordgame` is the blessed path and `!wordgame` still works.** A soft move: nobody's muscle memory breaks. The slash command is what M21b's dilemma needed, because its answers can be **ephemeral**. Answering a non-admin in the channel advertises that the command exists and that they are not allowed to use it, so the bang command refuses in silence, and the case that actually bit was the operator's own: with `PEREGRINE_BOOTSTRAP_ADMIN_USER_ID` unset the check fails closed and refuses the person who deployed the bot, with the reason only in the log. A private reply says no to the person who asked and to nobody else.
+**Every game is a subcommand of `/game` as of M37**: `/game wordgame` and `/game wheel`, and the
+next game is one more subcommand rather than one more top-level command in everybody's picker.
+`/game` carries only the subcommands whose game is on, and `subcommand()` reads the choice with a
+comma-ok because `ApplicationCommandData` type-asserts. `/wordgame-config`, `/leaderboard` and
+`/wallet` stay top-level: they configure or report on games rather than being one. Registration
+is a bulk overwrite, so the old `/wordgame` and `/wheel` vanish on the first start, and
+`TestTheRegisteredCommandMatchesWhatTheHandlerReads` fails if a registered command has no
+handler. Older sections below that say `/wordgame` or `/wheel` mean these subcommands.
+
+**`/game wordgame` is the blessed path and `!wordgame` still works.** A soft move: nobody's muscle memory breaks. The slash command is what M21b's dilemma needed, because its answers can be **ephemeral**. Answering a non-admin in the channel advertises that the command exists and that they are not allowed to use it, so the bang command refuses in silence, and the case that actually bit was the operator's own: with `PEREGRINE_BOOTSTRAP_ADMIN_USER_ID` unset the check fails closed and refuses the person who deployed the bot, with the reason only in the log. A private reply says no to the person who asked and to nobody else.
 
 **Where games run, how they start and how often are STORED, not environmental, as of M30.**
 `internal/plugins/games/settings.go` keeps them in a `BlobConfig` blob, the way aggro persists its

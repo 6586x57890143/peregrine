@@ -109,7 +109,7 @@ func wheelCard(v wheel.View, assets string) (*discordgo.MessageEmbed, []discordg
 		}
 		writeEvent(&b, v.Last)
 		e.Fields = []*discordgo.MessageEmbedField{standingsField(v)}
-		e.Footer.Text = "thanks for playing" + bar + "/wheel to play again"
+		e.Footer.Text = "thanks for playing" + bar + "/game wheel to play again"
 	}
 
 	e.Description = strings.TrimRight(b.String(), "\n")
@@ -493,7 +493,7 @@ func endedCard() (*discordgo.MessageEmbed, []discordgo.MessageComponent) {
 	return &discordgo.MessageEmbed{
 		Author:      &discordgo.MessageEmbedAuthor{Name: brand},
 		Title:       "GAME OVER",
-		Description: "this game has ended" + bar + "**/wheel** starts a new one",
+		Description: "this game has ended" + bar + "**/game wheel** starts a new one",
 		Color:       colourOver,
 	}, []discordgo.MessageComponent{}
 }

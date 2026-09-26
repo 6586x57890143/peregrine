@@ -43,9 +43,17 @@ import (
 // have not refreshed their client is not locked out. The slash command is the blessed path, and
 // the one that gets the ephemeral answers.
 
-// commandName is the slash command, and it deliberately matches the bang command's name so the
-// two are visibly the same thing rather than two features.
-const commandName = "wordgame"
+// commandName is /game, and every game is a subcommand of it (M37): /game wordgame, /game
+// wheel, and whatever comes next is one more subcommand rather than one more top-level command
+// in everybody's picker. The scramble's subcommand keeps the bang command's name, so
+// !wordgame and /game wordgame are visibly the same thing.
+//
+// Registration is a bulk overwrite, so the old /wordgame and /wheel disappear on the first
+// start with this build rather than lingering beside it.
+const commandName = "game"
+
+// subWordgame is the scramble's subcommand. The wheel's is wheelCommandName.
+const subWordgame = "wordgame"
 
 // configCommandName is the settings command. A SECOND command rather than a subcommand tree or
 // more options on the first, because the two are different jobs with different audiences: one
@@ -104,15 +112,15 @@ const (
 
 // definitions is what gets registered.
 //
-// /wordgame is one command with two optional options, mirroring the bang command's single
-// argument rather than inventing a subcommand tree: "!wordgame banana" and "!wordgame 5" are one
-// command with an argument, and the slash form should not be a different shape of it.
+// /game wordgame has two optional options, mirroring the bang command's single argument:
+// "!wordgame banana" and "!wordgame 5" are one command with an argument, and the slash form
+// should not be a different shape of it. The subcommand level is per GAME, not per argument.
 //
 // wordGames FILTERS rather than decorating, and it exists because /leaderboard does not belong
 // to the word-game feature. !leaderboard has never been gated on PEREGRINE_ENABLE_WORD_GAMES,
 // since its chat half reads the stats bucket, which is populated on every message; registering
 // the slash form only when games are on would have made the two disagree. The other direction is
-// the knob-wired-to-nothing shape: a /wordgame visible in every client for a feature that is off
+// the knob-wired-to-nothing shape: a /game wordgame visible in every client for a feature that is off
 // is a command whose only possible answer is a refusal.
 func definitions(wordGames, wheelOn bool) []*discordgo.ApplicationCommand {
 	defs := []*discordgo.ApplicationCommand{{
@@ -134,14 +142,11 @@ func definitions(wordGames, wheelOn bool) []*discordgo.ApplicationCommand {
 			},
 		},
 	}}
-	// The wheel's two commands, filtered for the reason /wordgame is: a /wheel in every client
+	// /wallet, filtered for the reason /game wordgame is: a wheel command in every client
 	// for a feature that is off, or whose puzzles failed to load, is a command whose only
 	// answer is a refusal.
 	if wheelOn {
 		defs = append(defs, &discordgo.ApplicationCommand{
-			Name:        wheelCommandName,
-			Description: "Open a Wheel of Fortune lobby in this channel",
-		}, &discordgo.ApplicationCommand{
 			Name:        walletCommandName,
 			Description: "Your lifetime gold in this server, and this week's",
 		})
@@ -152,12 +157,27 @@ func definitions(wordGames, wheelOn bool) []*discordgo.ApplicationCommand {
 	// The config command is registered for EITHER game, because it owns the wheel's channel
 	// binding too: gating it on word games alone would leave a wheel-only server with no way
 	// to say where the wheel may run.
-	defs = append(defs, configCommand())
-	if !wordGames {
-		return defs
+	//
+	// /game carries only the subcommands whose game is on, for the reason the whole command
+	// is filtered: a subcommand for a feature that is off can only ever answer with a refusal.
+	game := &discordgo.ApplicationCommand{Name: commandName, Description: "Start a game"}
+	if wordGames {
+		game.Options = append(game.Options, wordgameSubcommand())
 	}
-	return append(defs, &discordgo.ApplicationCommand{
-		Name:        commandName,
+	if wheelOn {
+		game.Options = append(game.Options, &discordgo.ApplicationCommandOption{
+			Type:        discordgo.ApplicationCommandOptionSubCommand,
+			Name:        wheelCommandName,
+			Description: "Open a Wheel of Fortune lobby in this channel",
+		})
+	}
+	return append(defs, game, configCommand())
+}
+
+func wordgameSubcommand() *discordgo.ApplicationCommandOption {
+	return &discordgo.ApplicationCommandOption{
+		Type:        discordgo.ApplicationCommandOptionSubCommand,
+		Name:        subWordgame,
 		Description: "Start a word scramble puzzle",
 		Options: []*discordgo.ApplicationCommandOption{
 			{
@@ -178,7 +198,7 @@ func definitions(wordGames, wheelOn bool) []*discordgo.ApplicationCommand {
 				MaxValue: 50,
 			},
 		},
-	})
+	}
 }
 
 func configCommand() *discordgo.ApplicationCommand {
@@ -262,7 +282,7 @@ func ptr[T any](v T) *T { return &v }
 // open. It is also the first moment the bot's own application ID is knowable.
 func (s *Service) registerCommands() {
 	if s.session == nil || s.session.State == nil || s.session.State.User == nil {
-		log.Println("[WORDGAME] No session identity, so /wordgame was not registered. The bang " +
+		log.Println("[WORDGAME] No session identity, so /game was not registered. The bang " +
 			"command still works.")
 		return
 	}
@@ -291,13 +311,22 @@ func (s *Service) onInteraction(_ *discordgo.Session, ic *discordgo.InteractionC
 		name = ic.ApplicationCommandData().Name
 		switch name {
 		case commandName:
-			handle = s.handleInteraction
+			sub, _ := subcommand(ic.Interaction)
+			name += " " + sub
+			switch sub {
+			case subWordgame:
+				handle = s.handleInteraction
+			case wheelCommandName:
+				handle = s.handleWheel
+			default:
+				// A subcommand this build does not register: a client with a stale command
+				// list, since registration is a bulk overwrite and propagation is not instant.
+				return
+			}
 		case configCommandName:
 			handle = s.handleConfig
 		case boardCommandName:
 			handle = s.handleLeaderboard
-		case wheelCommandName:
-			handle = s.handleWheel
 		case walletCommandName:
 			handle = s.handleWallet
 		default:
@@ -418,7 +447,7 @@ func (s *Service) startWordFor(i *discordgo.Interaction, word string) {
 	log.Printf("[WORDGAME] Started a game in channel %s from /%s.", i.ChannelID, commandName)
 }
 
-// startGauntletFor is /wordgame count:<n>.
+// startGauntletFor is /game wordgame count:<n>.
 func (s *Service) startGauntletFor(i *discordgo.Interaction, n int) {
 	queued, err := s.manager.Queue(i.ChannelID, n)
 	switch {
@@ -484,11 +513,28 @@ func interactionRequester(i *discordgo.Interaction) Requester {
 // A count wins over a word when somebody supplies both, because a gauntlet of planted words is
 // not a thing this feature does and refusing the combination would mean an error message for a
 // request that has an obvious reading.
+// subcommand is /game's chosen subcommand and its options, or "" when the payload has none.
+//
+// A comma-ok on the data, for the reason componentID has one: discordgo's ApplicationCommandData
+// type-ASSERTS, and an interaction's type and its data are two independent fields off the wire.
+func subcommand(i *discordgo.Interaction) (string, []*discordgo.ApplicationCommandInteractionDataOption) {
+	if i == nil {
+		return "", nil
+	}
+	data, ok := i.Data.(discordgo.ApplicationCommandInteractionData)
+	if !ok || len(data.Options) == 0 || data.Options[0] == nil ||
+		data.Options[0].Type != discordgo.ApplicationCommandOptionSubCommand {
+		return "", nil
+	}
+	return data.Options[0].Name, data.Options[0].Options
+}
+
 func interactionArgs(i *discordgo.Interaction) (word string, count int) {
 	if i == nil {
 		return "", 0
 	}
-	for _, opt := range i.ApplicationCommandData().Options {
+	_, opts := subcommand(i)
+	for _, opt := range opts {
 		if opt == nil {
 			continue
 		}

@@ -24,8 +24,10 @@ func interaction(userID string, perms int64, opts ...*discordgo.ApplicationComma
 			Permissions: perms,
 		},
 		Data: discordgo.ApplicationCommandInteractionData{
-			Name:    commandName,
-			Options: opts,
+			Name: commandName,
+			Options: []*discordgo.ApplicationCommandInteractionDataOption{{
+				Name: subWordgame, Type: discordgo.ApplicationCommandOptionSubCommand, Options: opts,
+			}},
 		},
 	}
 }
@@ -272,7 +274,7 @@ func TestTheRegisteredCommandMatchesWhatTheHandlerReads(t *testing.T) {
 	// Every command onInteraction dispatches, against every option its handler reads. Keyed by
 	// name rather than by index so adding a command is a row here and not a rewrite.
 	want := map[string][]string{
-		commandName:       {optWord, optCount},
+		commandName:       {subWordgame, optWord, optCount},
 		configCommandName: {optChannel, optGame, optMode, optInterval, optReset, optAllow, optDeny},
 		boardCommandName:  {optScope},
 	}
@@ -291,6 +293,10 @@ func TestTheRegisteredCommandMatchesWhatTheHandlerReads(t *testing.T) {
 		names := map[string]bool{}
 		for _, o := range def.Options {
 			names[o.Name] = true
+			// A subcommand's own options, which is where /game's live.
+			for _, sub := range o.Options {
+				names[sub.Name] = true
+			}
 		}
 		for _, opt := range options {
 			if !names[opt] {
@@ -302,6 +308,15 @@ func TestTheRegisteredCommandMatchesWhatTheHandlerReads(t *testing.T) {
 			t.Errorf("/%s has no description; Discord refuses a command without one", def.Name)
 		}
 		delete(want, def.Name)
+	}
+	// And the other direction, which a leftover top-level /wheel after M37 would fail: every
+	// registered command, with every game on, is one onInteraction dispatches.
+	for _, def := range definitions(true, true) {
+		switch def.Name {
+		case commandName, configCommandName, boardCommandName, walletCommandName:
+		default:
+			t.Errorf("registered /%s, which onInteraction does not dispatch", def.Name)
+		}
 	}
 	for name := range want {
 		t.Errorf("onInteraction dispatches /%s, which is not registered, so nobody can run it",
@@ -315,5 +330,33 @@ func TestTheRegisteredCommandMatchesWhatTheHandlerReads(t *testing.T) {
 	if len(off) != 1 || off[0].Name != boardCommandName {
 		t.Errorf("with word games off the registered set is %v, want just /%s",
 			off, boardCommandName)
+	}
+}
+
+// TestGameRoutesOnItsSubcommand is M37: /game wordgame reaches the scramble through the
+// gateway handler, and a /game with no subcommand, or one this build does not register (a
+// client with a stale command list), is not answered with the wrong game.
+func TestGameRoutesOnItsSubcommand(t *testing.T) {
+	s, guard, _, _ := fixtureDictOpts(t, enabled())
+
+	s.onInteraction(nil, &discordgo.InteractionCreate{
+		Interaction: interaction(snowflake(500), discordgo.PermissionAdministrator),
+	})
+	onePuzzle(t, guard)
+
+	bare := interaction(snowflake(500), discordgo.PermissionAdministrator)
+	bare.Data = discordgo.ApplicationCommandInteractionData{Name: commandName}
+	stale := interaction(snowflake(500), discordgo.PermissionAdministrator)
+	stale.Data = discordgo.ApplicationCommandInteractionData{
+		Name: commandName,
+		Options: []*discordgo.ApplicationCommandInteractionDataOption{{
+			Name: "tetris", Type: discordgo.ApplicationCommandOptionSubCommand,
+		}},
+	}
+	before := len(guard.responded())
+	s.onInteraction(nil, &discordgo.InteractionCreate{Interaction: bare})
+	s.onInteraction(nil, &discordgo.InteractionCreate{Interaction: stale})
+	if got := guard.responded(); len(got) != before {
+		t.Errorf("answered a /game with no known subcommand: %v", got[before:])
 	}
 }
