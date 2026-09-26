@@ -66,7 +66,7 @@ var wheelActions = map[string]wheel.ActionKind{
 }
 
 const (
-	wheelCommandName  = "wheel"
+	wheelCommandName  = "wheel" // a subcommand of /game as of M37
 	walletCommandName = "wallet"
 
 	// walletKey is the lifetime wallet: a JSON map of user ID to gold, beside the weekly
@@ -240,7 +240,7 @@ func (s *Service) handleWheel(i *discordgo.Interaction) {
 	if err != nil {
 		msg, known := wheelRefusal(err)
 		if !known {
-			log.Printf("[WHEEL] /%s failed to open a lobby: %v", wheelCommandName, err)
+			log.Printf("[WHEEL] /%s %s failed to open a lobby: %v", commandName, wheelCommandName, err)
 		}
 		// A jump link rather than a bare refusal, because the useful answer to "a game is
 		// already running" is where.
