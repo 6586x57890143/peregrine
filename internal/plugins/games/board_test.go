@@ -1,12 +1,14 @@
 package games
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
 
+	"github.com/6586x57890143/peregrine/internal/storage"
 	"github.com/6586x57890143/peregrine/internal/wordgame"
 )
 
@@ -300,10 +302,10 @@ func TestTheGoldColumnAppearsOnlyWhenSomebodyHasGold(t *testing.T) {
 		t.Fatalf("a board with no gold has %d columns, want 2", len(fields))
 	}
 
-	s.board(testGuild).AddGold(snowflake(701), "rich", 5600)
+	payWallet(t, s, testGuild, snowflake(701), 5600)
 	s.postLeaderboard(testGuild, "c1", snowflake(700))
 	fields := guard.posted()[1].Fields
-	if len(fields) != 3 || fields[2].Name != "wheel · gold" || !fields[2].Inline {
+	if len(fields) != 3 || fields[2].Name != "wheel · gold (all time)" || !fields[2].Inline {
 		t.Fatalf("fields %+v", fields)
 	}
 	// Three columns narrow every name, because three 16-rune names side by side wrap.
@@ -312,7 +314,7 @@ func TestTheGoldColumnAppearsOnlyWhenSomebodyHasGold(t *testing.T) {
 		t.Errorf("gold column:\n%s", fields[2].Value)
 	}
 	// The viewer has no gold, and the column says so rather than leaving them out.
-	if !strings.Contains(fields[2].Value, "no gold this week") {
+	if !strings.Contains(fields[2].Value, "no gold yet") {
 		t.Errorf("the viewer's missing row is not explained:\n%s", fields[2].Value)
 	}
 	// A gold-only player is not on the scramble board.
@@ -326,8 +328,8 @@ func TestAGlobalBoardSumsGold(t *testing.T) {
 	s.members = &countingMembers{seen: map[string]int{}}
 
 	who := snowflake(700)
-	s.board(testGuild).AddGold(who, "p", 1000)
-	s.board(otherGuild).AddGold(who, "p", 2500)
+	payWallet(t, s, testGuild, who, 1000)
+	payWallet(t, s, otherGuild, who, 2500)
 
 	s.handleLeaderboard(boardInteraction(who, testGuild, scopeGlobal))
 	fields := guard.posted()[0].Fields
@@ -346,7 +348,7 @@ func TestPagesCoverTheLongestOfThreeColumns(t *testing.T) {
 	s, guard, _, _ := fixture(t, enabled())
 	s.members = &countingMembers{seen: map[string]int{}}
 	for i := range 25 {
-		s.board(testGuild).AddGold(snowflake(5000+i), "p", 100*(i+1))
+		payWallet(t, s, testGuild, snowflake(5000+i), 100*(i+1))
 	}
 	s.postLeaderboard(testGuild, "c1", snowflake(700))
 	if !strings.Contains(guard.posted()[0].Description, "page 1/3") {
@@ -354,5 +356,47 @@ func TestPagesCoverTheLongestOfThreeColumns(t *testing.T) {
 	}
 	if row := guard.lastComponents(); len(row) != 1 {
 		t.Fatalf("a three-page gold column carried %d button rows", len(row))
+	}
+}
+
+// The gold column is lifetime, so it survives a weekly reset: it reads the wallet, not the board.
+func TestTheGoldColumnSurvivesTheWeeklyReset(t *testing.T) {
+	s, guard, _, _ := fixture(t, enabled())
+	s.members = &countingMembers{seen: map[string]int{}}
+	payWallet(t, s, testGuild, snowflake(701), 5600)
+	s.board(testGuild).AddGold(snowflake(701), "rich", 5600)
+	if !s.board(testGuild).MaybeReset(time.Now().AddDate(0, 0, 8)) {
+		t.Fatal("the weekly board did not reset")
+	}
+	if len(s.board(testGuild).Golds()) != 0 {
+		t.Fatal("weekly gold survived the reset")
+	}
+
+	s.postLeaderboard(testGuild, "c1", snowflake(700))
+	if fields := guard.posted()[0].Fields; len(fields) != 3 || !strings.Contains(fields[2].Value, "5,600") {
+		t.Fatalf("gold after a weekly reset: %+v", fields)
+	}
+}
+
+// payWallet credits lifetime gold the way persistResult does, without playing a match.
+func payWallet(t *testing.T, s *Service, guildID, userID string, gold int) {
+	t.Helper()
+	store, err := s.corpora.For(guildID)
+	if err != nil {
+		t.Fatalf("corpus: %v", err)
+	}
+	if err := store.Update(func(w *storage.Writer) error {
+		wallet, err := readWallet(&w.Reader)
+		if err != nil {
+			return err
+		}
+		wallet[userID] += gold
+		out, err := json.Marshal(wallet)
+		if err != nil {
+			return err
+		}
+		return w.PutBlob(storage.BlobLeaderboard, walletKey, out)
+	}); err != nil {
+		t.Fatalf("paying the wallet: %v", err)
 	}
 }
