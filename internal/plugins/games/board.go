@@ -87,7 +87,8 @@ func parseButtonID(customID string) (scope, int, bool) {
 // stops the two scopes drifting into two layouts.
 type tally struct {
 	// wins is word-game points by user ID, chat is message counts by user ID, and gold is
-	// what the wheel paid out this week by user ID.
+	// LIFETIME wheel gold by user ID, read from the wallet rather than the weekly board: gold
+	// is a balance people keep, so a column that emptied every Monday said everybody went broke.
 	wins map[string]int
 	chat map[string]int
 	gold map[string]int
@@ -126,10 +127,13 @@ func (s *Service) gather(sc scope, guildID string) (tally, error) {
 			return tally{}, fmt.Errorf("no corpus for guild %s: %w", g, err)
 		}
 
-		var chatScores map[string]int
+		var chatScores, wallet map[string]int
 		if err := store.View(func(r *storage.Reader) error {
 			var err error
-			chatScores, err = weeklyScores(r)
+			if chatScores, err = weeklyScores(r); err != nil {
+				return err
+			}
+			wallet, err = readWallet(r)
 			return err
 		}); err != nil {
 			if sc == scopeGlobal {
@@ -145,7 +149,7 @@ func (s *Service) gather(sc scope, guildID string) (tally, error) {
 		for id, count := range chatScores {
 			t.chat[id] += count
 		}
-		for id, gold := range board.Golds() {
+		for id, gold := range wallet {
 			t.gold[id] += gold
 		}
 		if e, ok := board.Fastest(); ok && (t.fastest == nil || e.FastestMS < t.fastest.FastestMS) {
