@@ -113,7 +113,7 @@ func leaderboardEmbed(wins, chat, gold wordgame.Board, nextReset time.Time, foot
 	}
 	if gold.Players > 0 {
 		e.Fields = append(e.Fields, &discordgo.MessageEmbedField{
-			Name:   "wheel · gold",
+			Name:   "wheel · gold (all time)",
 			Value:  renderBoard(gold, "gold", width),
 			Inline: true,
 		})
@@ -154,7 +154,12 @@ func renderBoard(b wordgame.Board, unit string, width int) string {
 		// Said rather than omitted. A missing row is indistinguishable from a bug, and "you
 		// have none" is a real answer to the question that was asked.
 		sb.WriteString("　\n")
-		fmt.Fprintf(&sb, "_no %s this week_\n", unit)
+		// Gold is lifetime, so "this week" would be a false claim about it.
+		when := "this week"
+		if unit == "gold" {
+			when = "yet"
+		}
+		fmt.Fprintf(&sb, "_no %s %s_\n", unit, when)
 	}
 	return strings.TrimRight(sb.String(), "\n")
 }
