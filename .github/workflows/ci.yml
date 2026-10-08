@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # A manual run exists so a deploy can be tested without inventing a commit to
+  # merge. It deploys only when dispatched against main: the ref check below is
+  # unchanged, so dispatching on a branch runs the checks and nothing else,
+  # which keeps unreviewed code off the host exactly as before.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -124,7 +129,7 @@ jobs:
 
   push-image:
     needs: [lint-test, secret-scan, docker-build]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -147,7 +152,7 @@ jobs:
 
   deploy:
     needs: push-image
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     # ONE DEPLOY AT A TIME, BECAUSE THERE IS ONE HOST. Three merges landed on
     # main within three minutes on 2026-08-29 and their deploys ran in parallel
