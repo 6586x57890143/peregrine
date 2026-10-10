@@ -400,7 +400,7 @@ func goldenPrompts() []string {
 // cannot silently make the length assertion above stop matching what Style can produce.
 func longestFiller() int {
 	longest := 0
-	for _, set := range [][]string{openers, closers, interjections, metaComments} {
+	for _, set := range [][]string{openers, closers} {
 		for _, f := range set {
 			if n := len(strings.Fields(f)); n > longest {
 				longest = n

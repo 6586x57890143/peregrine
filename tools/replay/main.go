@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -39,14 +40,15 @@ func main() {
 	seed := flag.Uint64("seed", 1, "PCG seed, so two runs are comparable")
 	cpu := flag.String("cpuprofile", "", "write a CPU profile here")
 	quiet := flag.Bool("q", false, "print only the summary")
+	misses := flag.Bool("misses", false, "print every unattested trigram in the new replies")
 	flag.Parse()
-	if err := run(*db, *dir, *n, *seed, *cpu, *quiet); err != nil {
+	if err := run(*db, *dir, *n, *seed, *cpu, *quiet, *misses); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
-func run(db, dir string, n int, seed uint64, cpu string, quiet bool) error {
+func run(db, dir string, n int, seed uint64, cpu string, quiet, misses bool) error {
 	samples, err := load(dir)
 	if err != nil {
 		return err
@@ -84,6 +86,9 @@ func run(db, dir string, n int, seed uint64, cpu string, quiet bool) error {
 
 	took := make([]time.Duration, 0, len(samples))
 	var now, then coherence
+	if misses {
+		now.misses = os.Stdout
+	}
 	words, produced := 0, 0
 	for _, s := range samples {
 		m := mem.For(s.Channel)
@@ -167,7 +172,13 @@ func load(dir string) ([]tuning.Sample, error) {
 // its four-word windows: the first two rise as joins get less arbitrary, and the third is
 // the recitation check, because a sentence copied whole from one message attests
 // everything. Both directions have to be read together.
-type coherence struct{ bi, tri, quad, biN, triN, quadN int }
+type coherence struct {
+	bi, tri, quad, biN, triN, quadN int
+
+	// misses, when set, receives every unattested trigram with its reply, which is how
+	// the share above gets explained rather than just reported.
+	misses io.Writer
+}
 
 func (c *coherence) add(r *storage.Reader, reply string) {
 	words := text.Tokenize(reply)
@@ -187,6 +198,8 @@ func (c *coherence) add(r *storage.Reader, reply string) {
 			c.triN++
 			if seen(words[i-2:i], words[i]) {
 				c.tri++
+			} else if c.misses != nil {
+				fmt.Fprintf(c.misses, "miss %q | %s\n", strings.Join(words[i-2:i+1], " "), strings.Join(words, " "))
 			}
 		}
 		if i >= 3 {
