@@ -101,6 +101,11 @@ type Corpus interface {
 	TopicWordsFor(word string) (map[string]corpus.TopicAssoc, error)
 	NameTopicsFor(name string) (map[string]corpus.TopicAssoc, error)
 
+	// TopicWord is one entry of TopicWordsFor, by point lookup. The scorer asks it once
+	// per candidate per topic, where decoding the whole map per step cost three quarters
+	// of generation CPU on a real corpus.
+	TopicWord(word, assoc string) (corpus.TopicAssoc, error)
+
 	// IsName is presence only. The decoding version would put a JSON unmarshal in
 	// the innermost loop, which is why storage has both.
 	IsName(key string) bool
