@@ -6,7 +6,10 @@
 // SPEC.md section 10 keeps saying the same thing: revisit against real ingested text. This
 // is that: the prompts people actually sent, the corpus the bot actually had, and a seeded
 // source so two runs differ only by the change between them. It prints each prompt with
-// the reply the bot sent then and the one it would send now, plus the latency spread.
+// the reply the bot sent then and the one it would send now, then summarizes the new ones:
+// latency, how much of their phrasing the corpus attests, and how often they reuse a word
+// of the prompt. The old replies are not scored, because the bot learns its own output and
+// the snapshot therefore attests nearly all of them.
 //
 // The corpus opens read-only, so a snapshot pulled off the host is the intended input and
 // the file is not modified. Conversation memory is replayed per channel in archive order,
@@ -85,7 +88,7 @@ func run(db, dir string, n int, seed uint64, cpu string, quiet, misses bool) err
 	}
 
 	took := make([]time.Duration, 0, len(samples))
-	var now, then coherence
+	var now coherence
 	if misses {
 		now.misses = os.Stdout
 	}
@@ -106,7 +109,6 @@ func run(db, dir string, n int, seed uint64, cpu string, quiet, misses bool) err
 		}
 		if err := store.View(func(r *storage.Reader) error {
 			now.add(r, reply)
-			then.add(r, s.Reply)
 			return nil
 		}); err != nil {
 			return err
@@ -124,7 +126,7 @@ func run(db, dir string, n int, seed uint64, cpu string, quiet, misses bool) err
 		}
 	}
 
-	fmt.Printf("\nthen: %v\nnow:  %v\n", then, now)
+	fmt.Printf("\nnow:  %v\n", now)
 	if produced > 0 {
 		fmt.Printf("now produced %d of %d, mean %.1f words, %.1f%% reuse a content word of the prompt\n",
 			produced, len(samples), float64(words)/float64(produced), 100*float64(onTopic)/float64(produced))
@@ -197,15 +199,7 @@ func (c *coherence) add(r *storage.Reader, reply string) {
 		_, ok, err := r.Successor(strings.Join(prefix, " "), next)
 		return err == nil && ok
 	}
-	missed := c.triN - c.tri
-	defer func() {
-		if len(words) >= 3 {
-			c.cleanN++
-			if c.triN-c.tri == missed {
-				c.clean++
-			}
-		}
-	}()
+	missed := 0
 	for i := 1; i < len(words); i++ {
 		c.biN++
 		if seen(words[i-1:i], words[i]) {
@@ -215,8 +209,11 @@ func (c *coherence) add(r *storage.Reader, reply string) {
 			c.triN++
 			if seen(words[i-2:i], words[i]) {
 				c.tri++
-			} else if c.misses != nil {
-				fmt.Fprintf(c.misses, "miss %q | %s\n", strings.Join(words[i-2:i+1], " "), strings.Join(words, " "))
+			} else {
+				missed++
+				if c.misses != nil {
+					fmt.Fprintf(c.misses, "miss %q | %s\n", strings.Join(words[i-2:i+1], " "), strings.Join(words, " "))
+				}
 			}
 		}
 		if i >= 3 {
@@ -224,6 +221,12 @@ func (c *coherence) add(r *storage.Reader, reply string) {
 			if seen(words[i-3:i], words[i]) {
 				c.quad++
 			}
+		}
+	}
+	if len(words) >= 3 {
+		c.cleanN++
+		if missed == 0 {
+			c.clean++
 		}
 	}
 }

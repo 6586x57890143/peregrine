@@ -100,12 +100,16 @@ services:
       # them is version controlled.
       - ./blocklist.txt:/blocklist.txt:ro
     restart: unless-stopped
-    # bbolt mmaps the whole corpus. Mapped clean pages are reclaimable, so a
-    # 1 GB corpus does not need 1 GB of resident memory, but a write
-    # transaction dirties pages that do count against this limit. Raise it if
-    # the corpus grows past a few hundred MB, and watch for the OOM killer
-    # rather than guessing.
-    mem_limit: 512m
+    # bbolt mmaps the whole corpus, and under cgroup v2 the page cache backing
+    # that mapping is charged to this limit. Clean pages are reclaimable, so a
+    # limit below the corpus does not OOM; it THRASHES, which is worse because
+    # it looks healthy. At 512m against 900 MB of corpora, a container 30
+    # minutes old had 155 MB resident, 38k major faults and 19k refaults, while
+    # replies took a median 2.5 s against tens of milliseconds for the same
+    # corpus held in a workstation's page cache. Keep
+    # this above the combined size of /data/corpora plus a few hundred MB for
+    # the heap and dirty pages, and raise it as the corpora grow.
+    mem_limit: 1536m
     cpus: 1.0
     logging:
       driver: json-file
