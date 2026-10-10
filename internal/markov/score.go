@@ -494,6 +494,13 @@ func (g *Generator) heuristics(s *Step, c candidate, assoc assocCache) float64 {
 		}
 	}
 
+	// Continuity: the longer the context a candidate was found at, the more of the
+	// sentence so far it actually continues. See Weights.Continuity for why the model's
+	// own interpolation does not already do this on a corpus this sparse.
+	if c.order > 1 {
+		logit += w.Continuity * float64(c.order-1)
+	}
+
 	// The end sentinel, shifted by the length model. This is now the ONLY place length
 	// influences generation: the discard-and-retry and the second progress-based
 	// multiplier are gone, so there is one answer to "how long should this be" instead

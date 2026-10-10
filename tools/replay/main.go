@@ -89,7 +89,7 @@ func run(db, dir string, n int, seed uint64, cpu string, quiet, misses bool) err
 	if misses {
 		now.misses = os.Stdout
 	}
-	words, produced := 0, 0
+	words, produced, onTopic := 0, 0, 0
 	for _, s := range samples {
 		m := mem.For(s.Channel)
 		start := time.Now()
@@ -114,6 +114,9 @@ func run(db, dir string, n int, seed uint64, cpu string, quiet, misses bool) err
 		if reply != "" {
 			produced++
 			words += len(strings.Fields(reply))
+			if sharesContent(s.Prompt, reply) {
+				onTopic++
+			}
 		}
 		if !quiet {
 			fmt.Printf("%6dms  %q\n    then: %q\n    now:  %q (%s)\n",
@@ -123,7 +126,8 @@ func run(db, dir string, n int, seed uint64, cpu string, quiet, misses bool) err
 
 	fmt.Printf("\nthen: %v\nnow:  %v\n", then, now)
 	if produced > 0 {
-		fmt.Printf("now produced %d of %d, mean %.1f words\n", produced, len(samples), float64(words)/float64(produced))
+		fmt.Printf("now produced %d of %d, mean %.1f words, %.1f%% reuse a content word of the prompt\n",
+			produced, len(samples), float64(words)/float64(produced), 100*float64(onTopic)/float64(produced))
 	}
 
 	slices.Sort(took)
@@ -175,6 +179,10 @@ func load(dir string) ([]tuning.Sample, error) {
 type coherence struct {
 	bi, tri, quad, biN, triN, quadN int
 
+	// clean counts replies with no unattested trigram at all, out of replies long enough
+	// to have one. A reader judges a reply whole, so one bad join costs the reply.
+	clean, cleanN int
+
 	// misses, when set, receives every unattested trigram with its reply, which is how
 	// the share above gets explained rather than just reported.
 	misses io.Writer
@@ -189,6 +197,15 @@ func (c *coherence) add(r *storage.Reader, reply string) {
 		_, ok, err := r.Successor(strings.Join(prefix, " "), next)
 		return err == nil && ok
 	}
+	missed := c.triN - c.tri
+	defer func() {
+		if len(words) >= 3 {
+			c.cleanN++
+			if c.triN-c.tri == missed {
+				c.clean++
+			}
+		}
+	}()
 	for i := 1; i < len(words); i++ {
 		c.biN++
 		if seen(words[i-1:i], words[i]) {
@@ -218,6 +235,24 @@ func (c coherence) String() string {
 		}
 		return 100 * float64(a) / float64(b)
 	}
-	return fmt.Sprintf("attested bigrams %.1f%%  trigrams %.1f%%  4-grams %.1f%% (recitation)",
-		pct(c.bi, c.biN), pct(c.tri, c.triN), pct(c.quad, c.quadN))
+	return fmt.Sprintf("attested bigrams %.1f%%  trigrams %.1f%%  4-grams %.1f%% (recitation)  clean replies %.1f%%",
+		pct(c.bi, c.biN), pct(c.tri, c.triN), pct(c.quad, c.quadN), pct(c.clean, c.cleanN))
+}
+
+// sharesContent reports whether a reply reuses any non-stop word of its prompt: a crude
+// relevance floor, read beside the coherence numbers so a change that makes replies more
+// fluent by making them about nothing in particular shows up as one.
+func sharesContent(prompt, reply string) bool {
+	in := map[string]bool{}
+	for _, w := range text.Tokenize(prompt) {
+		if w = text.LowerExceptURLs(w); !text.IsStopWord(w) {
+			in[w] = true
+		}
+	}
+	for _, w := range text.Tokenize(reply) {
+		if in[text.LowerExceptURLs(w)] {
+			return true
+		}
+	}
+	return false
 }
