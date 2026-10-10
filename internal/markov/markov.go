@@ -101,6 +101,11 @@ type Corpus interface {
 	TopicWordsFor(word string) (map[string]corpus.TopicAssoc, error)
 	NameTopicsFor(name string) (map[string]corpus.TopicAssoc, error)
 
+	// TopicWord is one entry of TopicWordsFor, by point lookup. The scorer asks it once
+	// per candidate per topic, where decoding the whole map per step cost three quarters
+	// of generation CPU on a real corpus.
+	TopicWord(word, assoc string) (corpus.TopicAssoc, error)
+
 	// IsName is presence only. The decoding version would put a JSON unmarshal in
 	// the innermost loop, which is why storage has both.
 	IsName(key string) bool
@@ -319,6 +324,29 @@ type Weights struct {
 	// from them at the very end.
 	Connective float64
 
+	// Continuity is added once per word of context a candidate was found at beyond the
+	// first, so a continuation of the last three words outranks one of the last word alone.
+	//
+	// Interpolated Kneser-Ney already prefers higher-order evidence IN PRINCIPLE, but on a
+	// corpus where nearly every high-order count is one, a context keeps only 1-D of its
+	// mass and hands the rest down: at D=0.75 three quarters of every step's probability
+	// belonged to candidates that only continue the last word. Once one of those is drawn,
+	// the next two-word context is usually one nobody ever wrote, so the walk stays a bigram
+	// walk for the rest of the sentence. That is the drift in the live output: replayed
+	// against the production corpus, only 23% of replies were free of an unattested
+	// trigram, and lowering D did not move it, because the problem was where the walk went
+	// rather than how mass was split once there.
+	//
+	// 1.0 took that share to 32% at a cost of about four points of 4-gram attestation,
+	// against thirty with the author gate off, and left the share of replies reusing a word
+	// of their prompt where it was. It cannot buy back recitation the gate refuses: a
+	// candidate only reaches the scorer with an order the gate already admitted it at, so
+	// this ranks shared phrasing, never somebody's sentence. 1.5 reached 35% and is where
+	// the golden fixture's criterion 7 starts failing, because continuing the chain starts
+	// outbidding NameTopic for the person the prompt named; past that, replies also shrink
+	// toward the four-word floor (SPEC.md section 8, finding 61).
+	Continuity float64
+
 	// StyleChance and StyleChanceName are the probability that the persona post-pass
 	// adds filler, the second when the reply is about a recognized person.
 	//
@@ -346,7 +374,8 @@ type Weights struct {
 // strong and a weak continuation in a sparse corpus run to several nats, so a weight
 // near 1.0 is a firm opinion and anything past 2.0 will override the model outright.
 // Nothing here is above 1.0 except the repetition penalties, which are meant to
-// override.
+// override, and Continuity, which is 1.0 per word of context and corrects the model's
+// own handling of a sparse corpus rather than overriding it.
 func DefaultWeights() Weights {
 	return Weights{
 		TopicGravity:    0.70,
@@ -367,6 +396,7 @@ func DefaultWeights() Weights {
 		EndLate:         0.35,
 		EndLateCap:      1.80,
 		Connective:      0.15,
+		Continuity:      1.00,
 		StyleChance:     0.35,
 		StyleChanceName: 0.45,
 	}

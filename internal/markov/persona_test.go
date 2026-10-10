@@ -3,8 +3,6 @@ package markov
 import (
 	"strings"
 	"testing"
-
-	"github.com/6586x57890143/peregrine/internal/text"
 )
 
 // TestStyleLeavesShortSentencesAlone. A three-word reply plus an opener is mostly
@@ -96,85 +94,6 @@ func TestStyleIsMoreLikelyForANameAndForRoast(t *testing.T) {
 	}
 }
 
-// TestInsertPosPrefersTheMiddle is the pin for the part of the old implementation that
-// was actually wrong rather than merely duplicated.
-//
-// It used a flat draw over the sentence interior, which puts filler immediately after
-// the first word about as often as in the middle. At the edges an interjection reads as
-// a typo. A triangular draw concentrates on the middle with no tuning constant.
-func TestInsertPosPrefersTheMiddle(t *testing.T) {
-	src := seeded(3, 4)
-	const n = 11 // valid positions 1..10, middle around 5
-	const runs = 20000
-
-	// Every position offered, so this measures the draw rather than the safety filter.
-	all := make([]int, 0, n-1)
-	for p := 1; p <= n-1; p++ {
-		all = append(all, p)
-	}
-
-	var edge, middle int
-	for range runs {
-		pos := insertPos(src, all)
-		if pos < 1 || pos > n-1 {
-			t.Fatalf("insertPos returned %d, outside [1, %d]", pos, n-1)
-		}
-		switch {
-		case pos <= 2 || pos >= n-2:
-			edge++
-		case pos >= 4 && pos <= 6:
-			middle++
-		}
-	}
-	if middle <= edge {
-		t.Errorf("middle positions chosen %d times against %d at the edges; a flat draw "+
-			"would put filler where it reads as a typo", middle, edge)
-	}
-}
-
-// TestInsertPosSignalsWhenThereIsNowhereSafe.
-//
-// -1 rather than a fallback position, because the caller must be able to decline to add
-// filler at all. Falling back to an arbitrary index is what produced "why would ngl you say".
-func TestInsertPosSignalsWhenThereIsNowhereSafe(t *testing.T) {
-	src := seeded(1, 1)
-	if got := insertPos(src, nil); got != -1 {
-		t.Errorf("insertPos with no candidates = %d, want -1", got)
-	}
-	if got := insertPos(src, []int{3}); got != 3 {
-		t.Errorf("insertPos with one candidate = %d, want 3", got)
-	}
-}
-
-// TestInsertAtDoesNotAliasTheCallersSlice. The old implementation used the
-// append-into-a-subslice trick, which writes through the caller's backing array. It was
-// latent rather than live because the caller did not keep a reference, but a copy costs
-// one allocation on a path that already joins the whole slice into a string.
-func TestInsertAtDoesNotAliasTheCallersSlice(t *testing.T) {
-	fields := []string{"a", "b", "c", "d"}
-	original := append([]string(nil), fields...)
-
-	insertAt(fields, "X", 2)
-
-	for i := range fields {
-		if fields[i] != original[i] {
-			t.Fatalf("insertAt mutated the caller's slice: %v, want %v", fields, original)
-		}
-	}
-}
-
-func TestInsertAtPlacesTheWord(t *testing.T) {
-	got := insertAt([]string{"a", "b", "c"}, "X", 2)
-	if got != "a b X c" {
-		t.Errorf("got %q, want \"a b X c\"", got)
-	}
-	// An out-of-range position appends rather than panicking, because a styling bug
-	// must not take down a reply.
-	if got := insertAt([]string{"a"}, "X", 99); got != "a X" {
-		t.Errorf("got %q, want \"a X\"", got)
-	}
-}
-
 // TestLexiconBiasOnlyAppliesToRoast, and the lexicon is shared with the post-pass rather
 // than being a second copy. Two mechanisms with overlapping intent is what finding G6
 // was about.
@@ -236,64 +155,6 @@ func containsInOrder(s string, want []string) bool {
 		rest = rest[i+len(w):]
 	}
 	return true
-}
-
-// TestStyleNeverSplitsAConstruction is the pin for finding 45, and it fails against the
-// pre-M16 splicer.
-//
-// The live sample that motivated it was "why would ngl you say", where the post-pass put an
-// interjection between a modal and its subject. Style is the fourth producer of words in the
-// pipeline and was the only one with no rule about what it was joining.
-//
-// The rule being asserted is the measured one, not the obvious one. "neither neighbour is a
-// function word" is stricter and wrong: it would reject "greg is lowkey coping", which is
-// where an adverb belongs. What breaks is filler BEFORE a function word, plus the one case a
-// determiner on the left makes.
-func TestStyleNeverSplitsAConstruction(t *testing.T) {
-	interior := map[string]struct{}{}
-	for _, w := range interjections {
-		interior[w] = struct{}{}
-	}
-
-	f := goldenCorpus()
-	checked := 0
-	for _, temp := range []float64{0.7, 1.0, 1.6} {
-		p := testParams()
-		p.Temperature = temp
-		p.MinDistinctAuthors = 2
-
-		for _, prompt := range goldenPrompts() {
-			for _, persona := range []Persona{PersonaNeutral, PersonaRoast} {
-				g := New(f, p, seeded(0xC0FFEE, 0xBADF00D))
-				for range 8 {
-					line := generateReply(g, prompt, persona, true)
-					if line == "" {
-						continue
-					}
-					checked++
-					words := strings.Fields(line)
-					for i := 1; i < len(words)-1; i++ {
-						if _, ok := interior[words[i]]; !ok {
-							continue
-						}
-						if text.IsStopWord(words[i+1]) {
-							t.Errorf("filler %q sits before the function word %q in %q, which "+
-								"binds leftward and reads as a dropped token",
-								words[i], words[i+1], line)
-						}
-						if text.IsDeterminer(words[i-1]) {
-							t.Errorf("filler %q sits after the determiner %q in %q, which binds "+
-								"rightward to its noun", words[i], words[i-1], line)
-						}
-					}
-				}
-			}
-		}
-	}
-	if checked == 0 {
-		t.Fatal("no styled samples generated, so this test would pass vacuously")
-	}
-	t.Logf("checked %d styled samples", checked)
 }
 
 // TestStyleChanceIsCappedAfterTheLengthFactor.

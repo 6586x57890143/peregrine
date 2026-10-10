@@ -456,9 +456,23 @@ func (g *Generator) twoHop(in SeedInput) map[string]float64 {
 		seen[s] = struct{}{}
 	}
 
+	// Memoized per call because the first hop converges: the strongest associates of
+	// almost any word are the same few common ones, so without this the second hop decoded
+	// the largest association ranges in the corpus once per source word. On the production
+	// corpus that made this 1%-of-seeds tier half of all generation CPU.
+	memo := map[string][]assocEntry{}
+	top := func(word string, limit int) []assocEntry {
+		if e, ok := memo[word]; ok && len(e) >= limit {
+			return e[:limit]
+		}
+		e := g.topAssoc(word, max(limit, twoHopFirst))
+		memo[word] = e
+		return e[:min(limit, len(e))]
+	}
+
 	for _, src := range sources {
-		for _, first := range g.topAssoc(src, twoHopFirst) {
-			for _, second := range g.topAssoc(first.word, twoHopSecond) {
+		for _, first := range top(src, twoHopFirst) {
+			for _, second := range top(first.word, twoHopSecond) {
 				if _, isSource := seen[second.word]; isSource {
 					continue
 				}
@@ -515,19 +529,30 @@ func (g *Generator) topAssoc(word string, limit int) []assocEntry {
 		return nil
 	}
 
-	out := make([]assocEntry, 0, len(merged))
-	for w, d := range merged {
-		out = append(out, assocEntry{word: w, assoc: d})
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].assoc.Count != out[j].assoc.Count {
-			return out[i].assoc.Count > out[j].assoc.Count
+	// A bounded insertion rather than a sort of everything: limit is single digits and a
+	// common word has tens of thousands of associates, so sorting them all to keep six was
+	// most of what this function cost.
+	stronger := func(a, b assocEntry) bool {
+		if a.assoc.Count != b.assoc.Count {
+			return a.assoc.Count > b.assoc.Count
 		}
-		return out[i].word < out[j].word
-	})
-
-	if len(out) > limit {
-		out = out[:limit]
+		return a.word < b.word
+	}
+	out := make([]assocEntry, 0, limit+1)
+	for w, d := range merged {
+		e := assocEntry{word: w, assoc: d}
+		if len(out) == limit && !stronger(e, out[limit-1]) {
+			continue
+		}
+		i := len(out)
+		out = append(out, e)
+		for ; i > 0 && stronger(e, out[i-1]); i-- {
+			out[i] = out[i-1]
+		}
+		out[i] = e
+		if len(out) > limit {
+			out = out[:limit]
+		}
 	}
 	return out
 }

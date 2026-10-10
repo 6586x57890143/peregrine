@@ -1,6 +1,7 @@
 package markov
 
 import (
+	"math"
 	"strings"
 	"testing"
 
@@ -178,6 +179,32 @@ func TestHeuristicsAreBoundedEvenUnderPiledUpEvidence(t *testing.T) {
 	if got <= 0 {
 		t.Errorf("heuristics returned %.4f with strong topic evidence present; the term "+
 			"should be positive, just bounded", got)
+	}
+}
+
+// TestContinuityPrefersTheLongerContext pins the term that keeps a walk on attested ground.
+//
+// On a sparse corpus interpolated Kneser-Ney hands most of a high-order context's mass to
+// candidates that only continue the last word, and drawing one of those strands the rest of
+// the sentence on a bigram walk. The same token found at three words of context must outscore
+// itself found at one, by exactly the weight per extra word, and order zero (no context
+// recorded) must cost nothing rather than read as a penalty.
+func TestContinuityPrefersTheLongerContext(t *testing.T) {
+	f := newFake()
+	g := New(f, testParams(), seeded(1, 2))
+	s := newStep([]string{"the", "bird", "is"})
+	assoc := g.loadAssoc(s)
+
+	score := func(order int) float64 {
+		return g.heuristics(s, candidate{token: "loose", order: order}, assoc)
+	}
+	w := DefaultWeights().Continuity
+	if got := score(3) - score(1); math.Abs(got-2*w) > 1e-9 {
+		t.Errorf("order 3 over order 1 = %.4f, want %.4f", got, 2*w)
+	}
+	if score(0) != score(1) {
+		t.Errorf("order 0 scored %.4f against %.4f at order 1; an unrecorded order must not be "+
+			"a penalty", score(0), score(1))
 	}
 }
 

@@ -2,6 +2,7 @@ package markov
 
 import (
 	"math"
+	"sort"
 	"strings"
 
 	"github.com/6586x57890143/peregrine/internal/corpus"
@@ -94,6 +95,10 @@ type Step struct {
 	// Jumps counts the dead-end jumps this sentence has already taken. Jump reads it and
 	// increments it, so the count cannot drift away from the sentence it describes.
 	Jumps int
+
+	// nameHops caches the strongest NameAssoc keys for the second hop. NameAssoc does not
+	// change within a sentence, so they are ranked once rather than once per step.
+	nameHops []string
 
 	// Trace collects what the walk did, for the tuning export, or is nil.
 	//
@@ -247,37 +252,68 @@ func (g *Generator) admissible(count uint64, authors uint32, order int) bool {
 	return authors >= 1 && count <= uint64(g.params.SoloRepeatLimit)
 }
 
-// assocCache holds the co-occurrence maps one sentence needs, loaded once.
-type assocCache map[string]map[string]corpus.TopicAssoc
-
-// loadAssoc pre-loads every topic association the heuristics will ask about.
+// nameHopLimit bounds the second hop out of a recognized name to its strongest topics.
 //
-// Once per step rather than once per candidate per step, which is what the old code
-// did before it grew a cache with the same shape as this one. Kept as an explicit
-// type so it is obvious that the scoring loop below does no I/O at all.
+// A name the server talks about a lot has thousands of recorded topics: measured on the
+// production corpus, a name-bearing prompt carried a median of 2,831 and up to 8,942. The
+// hop used to decode every one of their association maps on every step, about a million
+// entries per step at p90, which made it three quarters of all generation CPU and the
+// reason a reply took seconds on the host (SPEC.md section 8, finding 59). The term it
+// feeds is squashed with tanh(x/3), so it saturates on a handful of strong topics anyway:
+// the long tail of one-co-occurrence topics was paying for a contribution the squash threw
+// away.
+const nameHopLimit = 24
+
+// assocCache answers the one co-occurrence question the heuristics ask, "how often does
+// this candidate appear near that topic", by point lookup.
+//
+// It used to be the opposite shape: every association map of every topic the step might
+// ask about, decoded in full, once per step. The scorer then read one entry per candidate
+// out of each, so a step that scored a hundred candidates against a topic with forty
+// thousand associates decoded thirty-nine thousand nine hundred entries nobody read. A
+// point lookup is a B-tree descent in the read transaction generation already holds, and
+// the count of them is bounded by candidates times topics, both of which are capped.
+type assocCache struct {
+	corpus Corpus
+
+	// hops are the name topics the second hop reads, strongest first.
+	hops []string
+}
+
+// get is assoc[topic][tok], with ok false when the pair was never recorded.
+func (a assocCache) get(topic, tok string) (corpus.TopicAssoc, bool) {
+	if topic == "" {
+		return corpus.TopicAssoc{}, false
+	}
+	d, err := a.corpus.TopicWord(topic, tok)
+	return d, err == nil && d.Count > 0
+}
+
+// loadAssoc builds the view the heuristics read for one step.
 func (g *Generator) loadAssoc(s *Step) assocCache {
-	cache := make(assocCache, len(s.CoreTopics)+len(s.NameAssoc)+1)
-	load := func(topic string) {
-		if topic == "" {
-			return
-		}
-		if _, ok := cache[topic]; ok {
-			return
-		}
-		if a, err := g.corpus.TopicWordsFor(topic); err == nil {
-			cache[topic] = a
-		} else {
-			cache[topic] = nil
-		}
+	if s.nameHops == nil {
+		s.nameHops = strongest(s.NameAssoc, nameHopLimit)
 	}
-	for topic := range s.CoreTopics {
-		load(topic)
+	return assocCache{corpus: g.corpus, hops: s.nameHops}
+}
+
+// strongest returns at most n keys of m by descending count, ties by key so the result is
+// deterministic. Never nil, so a Step can tell "computed, and empty" from "not yet".
+func strongest(m map[string]corpus.TopicAssoc, n int) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
 	}
-	for topic := range s.NameAssoc {
-		load(topic)
+	sort.Slice(out, func(i, j int) bool {
+		if m[out[i]].Count != m[out[j]].Count {
+			return m[out[i]].Count > m[out[j]].Count
+		}
+		return out[i] < out[j]
+	})
+	if len(out) > n {
+		out = out[:n]
 	}
-	load(s.CurrentTopic)
-	return cache
+	return out
 }
 
 // heuristics is the sum of every additive logit for one candidate.
@@ -297,11 +333,7 @@ func (g *Generator) heuristics(s *Step, c candidate, assoc assocCache) float64 {
 	// the candidate's usual position matches where we are in the sentence.
 	var gravity float64
 	for topic, significance := range s.CoreTopics {
-		a, ok := assoc[topic]
-		if !ok || a == nil {
-			continue
-		}
-		d, ok := a[tok]
+		d, ok := assoc.get(topic, tok)
 		if !ok {
 			continue
 		}
@@ -336,16 +368,12 @@ func (g *Generator) heuristics(s *Step, c candidate, assoc assocCache) float64 {
 	// Name association: the same idea for topics tied to a recognized name, applied
 	// hierarchically, the name's position gating the word's.
 	var nameScore float64
-	for topic, td := range s.NameAssoc {
-		topicPos := math.Exp(-math.Abs(s.Position-td.MeanPosition()) * 3.0)
+	for _, topic := range assoc.hops {
+		topicPos := math.Exp(-math.Abs(s.Position-s.NameAssoc[topic].MeanPosition()) * 3.0)
 		if topicPos <= 0.1 {
 			continue
 		}
-		a, ok := assoc[topic]
-		if !ok || a == nil {
-			continue
-		}
-		d, ok := a[tok]
+		d, ok := assoc.get(topic, tok)
 		if !ok {
 			continue
 		}
@@ -357,12 +385,8 @@ func (g *Generator) heuristics(s *Step, c candidate, assoc assocCache) float64 {
 	}
 
 	// Staying inside the topic the sentence started in.
-	if s.CurrentTopic != "" {
-		if a := assoc[s.CurrentTopic]; a != nil {
-			if _, ok := a[tok]; ok {
-				logit += w.CurrentTopic
-			}
-		}
+	if _, ok := assoc.get(s.CurrentTopic, tok); ok {
+		logit += w.CurrentTopic
 	}
 
 	// Global significance. Squashed, so a word seen ten thousand times does not
@@ -468,6 +492,13 @@ func (g *Generator) heuristics(s *Step, c candidate, assoc assocCache) float64 {
 				logit += w.TrigramRepeat
 			}
 		}
+	}
+
+	// Continuity: the longer the context a candidate was found at, the more of the
+	// sentence so far it actually continues. See Weights.Continuity for why the model's
+	// own interpolation does not already do this on a corpus this sparse.
+	if c.order > 1 {
+		logit += w.Continuity * float64(c.order-1)
 	}
 
 	// The end sentinel, shifted by the length model. This is now the ONLY place length

@@ -205,6 +205,10 @@ func (f *fakeCorpus) TopicWordsFor(word string) (map[string]corpus.TopicAssoc, e
 	return f.topicWords[word], nil
 }
 
+func (f *fakeCorpus) TopicWord(word, assoc string) (corpus.TopicAssoc, error) {
+	return f.topicWords[word][assoc], nil
+}
+
 func (f *fakeCorpus) NameTopicsFor(name string) (map[string]corpus.TopicAssoc, error) {
 	return f.nameTopics[name], nil
 }
