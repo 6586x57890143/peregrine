@@ -64,7 +64,7 @@ func run(db, dir string, n int, seed uint64, cpu string, quiet, misses bool) err
 	if err != nil {
 		return err
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	// The production dials, as the most recent tuning snapshot reported them.
 	opts := generate.Options{
@@ -80,7 +80,7 @@ func run(db, dir string, n int, seed uint64, cpu string, quiet, misses bool) err
 		if err != nil {
 			return err
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		if err := pprof.StartCPUProfile(f); err != nil {
 			return err
 		}
@@ -166,7 +166,7 @@ func load(dir string) ([]tuning.Sample, error) {
 			}
 		}
 		err = sc.Err()
-		f.Close()
+		_ = f.Close()
 		if err != nil {
 			return nil, err
 		}
@@ -212,7 +212,7 @@ func (c *coherence) add(r *storage.Reader, reply string) {
 			} else {
 				missed++
 				if c.misses != nil {
-					fmt.Fprintf(c.misses, "miss %q | %s\n", strings.Join(words[i-2:i+1], " "), strings.Join(words, " "))
+					_, _ = fmt.Fprintf(c.misses, "miss %q | %s\n", strings.Join(words[i-2:i+1], " "), strings.Join(words, " "))
 				}
 			}
 		}

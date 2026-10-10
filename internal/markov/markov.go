@@ -344,7 +344,7 @@ type Weights struct {
 	// this ranks shared phrasing, never somebody's sentence. 1.5 reached 35% and is where
 	// the golden fixture's criterion 7 starts failing, because continuing the chain starts
 	// outbidding NameTopic for the person the prompt named; past that, replies also shrink
-	// toward the four-word floor.
+	// toward the four-word floor (SPEC.md section 8, finding 61).
 	Continuity float64
 
 	// StyleChance and StyleChanceName are the probability that the persona post-pass

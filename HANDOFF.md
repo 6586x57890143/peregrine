@@ -1,94 +1,79 @@
-# Handoff: M35 (Wheel of Fortune, gold, and a lifetime wallet), and what comes next
+# Handoff: M38 (generation measured on real text), and what comes next
 
-Written 2026-09-23, at the end of M35. Read this with `CLAUDE.md` and `SPEC.md` section 9.
+Written 2026-10-10, at the end of M38. Read this with `CLAUDE.md` and `SPEC.md` section 9.
 
 ## Where the branches are
 
 | Branch | PR | State |
 |---|---|---|
-| `main` | | Has M34 (PR #62). M33 (PR #55) is merged too. |
-| `m35a-wheel-engine` | #63 | `internal/wheel`, the engine and its tests. Branched off `main`. |
-| `m35b-guard-edit-embed` | #64 | `Guard.EditEmbed` and `Guard.RespondModal`. Branched off `main`. |
-| `m35c-gold-board` | #65 | Gold as the board's third column. Branched off `main`. |
-| `m35d-wheel-game` | #66 | The game in `games`, config, wiring. **Stacked**: merges a, b and c. |
-| `m35e-docs` | #67 | This file and SPEC rows 33 and 35. Stacked on d. |
-| `m35f-wheel-card-polish` | #68 | The card redesign, the recap between rounds, chat-driven reposts, the banner assets. Stacked on e. |
+| `main` | | Has M37 (`/game`), the lifetime gold board, and manual-dispatch deploys. |
+| `m38-coherence-speed` | | This milestone. Branched off `main`. |
 
-a, b and c are independent of each other and can merge in any order; d and e shrink to their
-own commits once they have. **Check `gh pr list --state all` rather than trusting this table**,
-which is a snapshot of a moment.
+**Check `gh pr list --state all` rather than trusting this table**, which is a snapshot of a
+moment.
 
-## What M35 did
+## What M38 did
 
-`/wheel` opens a Wheel of Fortune lobby card in the channel. People join with a button, the
-host starts it or the lobby closes on its own, and the match plays out on that one card: spin,
-call a consonant, buy a vowel for 250, solve. Three rounds, then a bonus round for the top
-bank with R S T L N E given. Letters and solves are typed into a modal. Gold goes on the weekly
-`/leaderboard` as a third column and into a lifetime wallet, `/wallet`.
+The brief was coherence, then speed, then engagement. Every change was measured with the new
+`tools/replay` against the production prompts in the tuning archive and a snapshot of the main
+guild's corpus, averaged over five seeds of 400 prompts each.
 
-The reasons worth keeping:
+| | `main` | M38 |
+|---|---|---|
+| replies with no unattested trigram | 22.5% | 32.2% |
+| attested trigrams | 69.8% | 76.7% |
+| 4-grams attested (recitation check) | 16.9% | 21.9% |
+| replies reusing a word of their prompt | 74.6% | 73.1% |
+| mean words | 7.6 | 7.0 |
+| generation p90, local | 774 ms | 32 ms |
 
-- **`internal/wheel` owns the match and does no I/O**, the scramble's split. Four properties are
-  structural: a `Result` comes back exactly once, from the locked section that deletes the
-  match; an error never mutates; every turn action carries a Turn token; and a wrong solve is
-  never carried, so one blocklisted guess cannot make every repaint fail the emit gate.
-- **It lives in `games`**, because the weekly board is games' in-memory `Leaderboard` and
-  `saveBoard` overwrites the blob. Gold written from anywhere else would be lost on the next save.
-- **Board and wallet are paid in one transaction.** The wallet is `BlobLeaderboard` key
-  `"wallet"`, a JSON map of user ID to gold, never cached.
-- **A press is the repaint; the sweep does everything else.** `wheel-sweep` runs every second
-  and repaints through the new `Guard.EditEmbed`. `Painted` is last-ack-wins so an out-of-order
-  edit heals on the next tick.
-- **Restarts need no shutdown work.** Live matches are lost (a match is a ten-minute event), and
-  a press on an old card replaces it with an "ended" card with no buttons.
+The prompt-reuse drop is about one and a half standard errors at 2,000 replies: within noise,
+but it is the number to watch, because it is also the strongest engagement correlate below.
 
-## M35f, the polish pass
+- **Speed (finding 59).** The scorer decoded every association map it might need on every
+  step, up to a million entries, to read one per candidate. It uses point lookups now, and the
+  name hop reads its 24 strongest topics. The two-hop seed tier memoizes and keeps a bounded
+  top-k. Output was byte-identical across that change.
+- **The production latency had a second cause:** `mem_limit: 512m` against 900 MB of corpora.
+  The mmap's page cache counts against the cgroup, so the bot thrashed (38k major faults in half
+  an hour). Now 1536m.
+- **Coherence (findings 60 and 61).** Persona filler goes only at the edges, and a `Continuity`
+  logit of 1.0 per extra word of context keeps walks off stranded bigram runs.
+- **Engagement was measured but not tuned.** In the archive, replies of five words or fewer drew
+  engagement 78.5% of the time against about 71% for longer ones, and replies reusing a prompt
+  word 74.8% against 67.6%. Both effects are moderate, and time of day swings more than either.
+  M38 shortened replies and held prompt reuse; it did not move a seed weight, because the
+  per-tier split was too noisy to act on (name-topic seeds draw human replies at the same rate
+  as prompt seeds and differ only in reactions).
 
-- **The card uses every part of an embed**: an emoji-tile board (every tile followed by a
-  space, or two letters render as a flag), a letters-left tracker, one inline field per player,
-  a rules footer, and the wheel strip as its image.
-- **A solved round pauses on a recap**: the answer, who solved it and the standings, until a
-  player presses next or eight seconds pass. Before this, nobody saw the answer.
-- **The card follows the conversation**: after `PEREGRINE_WHEEL_REPOST_AFTER` messages (6), at
-  most once per 20 seconds, it is reposted at the bottom. A press on the old card still counts and
-  is acknowledged with `Guard.Acknowledge`; the sweep repaints the live card.
-- **The strip** (25 PNGs in `assets/wheel`, generated by `go run ./tools/wheelart`) pins the card's
-  width and lights the wedge a spin landed on. It is served from the raw GitHub URL, so **it shows
-  nothing until this branch is on `main`**, and nothing if the repo goes private.
+Measured and rejected, so nobody repeats them: lowering `PEREGRINE_KN_DISCOUNT` to 0.5 or 0.3
+(no effect), `minCandidates` 3 or 2 (one to three trigram points, not worth a constant), a
+cubic length skew (length is decided by the chain choosing to end, 92% of the time), and a
+per-`Seed` memo of association reads (5 to 8% for 35 lines).
 
 ## Operational changes an operator must know
 
-1. **Two new commands**, `/wheel` and `/wallet`, appear on the next start. Registration is a bulk
-   overwrite and global commands can take up to an hour to propagate.
-2. **New environment variables**, all with working defaults, in `.env.example` under
-   "engagement: wheel of fortune": `PEREGRINE_ENABLE_WHEEL` (true), `PEREGRINE_WHEEL_PUZZLES`,
-   `_LOBBY`, `_MIN_PLAYERS`, `_MAX_PLAYERS`, `_ROUNDS`, `_TURN_TIMEOUT`, `_IDLE_STRIKES`,
-   `_MAX_DURATION`, `_REPOST_AFTER`, `_ASSET_URL`. Two are cross-checked and a bad pair is a
-   startup error naming both.
-3. **`MIN_PLAYERS` defaults to 1, so solo play is allowed** and one person can farm gold, bounded
-   by one match per channel and how long a match takes. Set it to 2 to require an opponent.
-4. **The wheel has its own channel binding as of M36**: `/wordgame-config game:wheel channel:bind`. A settings blob stored before M36 inherits the scramble's list, so nothing loosens on upgrade.
-5. **As of M37 the games are `/game wordgame` and `/game wheel`.** `/wordgame` and `/wheel` are
-   gone; `!wordgame` still works. Clients may show the old commands until propagation catches up,
-   and a press of one then gets Discord's own "unknown command".
-6. **Nothing to migrate.** `Entry.Gold` is `omitempty` and the wallet is a new key; no schema bump.
+1. **The container's memory limit is 1536m.** Keep it above the combined size of
+   `/data/corpora` plus a few hundred MB. A limit below the corpus looks like a slow bot, not a
+   crash.
+2. **Replies are a little shorter and change subject less.** No variable changed.
+3. **Nothing to migrate.** No schema or config change.
 
 ## What is NOT done, in priority order
 
-1. **A live smoke test.** Nothing in M35 has run against Discord. The checks that matter: a
-   full match with two accounts through the bonus; a stale press after a timeout is refused
-   privately; a modal submit repaints the card (Discord allows an update-message response to a
-   modal opened from a component, and the tests cannot prove Discord agrees); a restart mid-match
-   followed by a press shows the ended card; `/leaderboard` shows the gold column and `/wallet`
-   the balance. The M31/M32 smoke test from the previous handoff is still owed as well.
-2. **The card's look on real clients.** Emoji tile widths on a narrow phone, the strip's width
-   fix, and a repost during chat have only been checked as text. Look at all three live.
-3. **Three inline columns on a desktop board.** Names narrow to 12 runes when the gold column is
-   present; whether that is enough on a narrow desktop window has not been looked at.
-4. **No lifetime leaderboard.** The wallet exists and nothing ranks it. Add one if people ask;
-   it is a `Rank` over the wallet map.
-5. **Everything the previous handoff listed is still open**: `-tuning-report` has no guild
-   dimension, the remaining global dials are scalars, and a Discord-reachable kill switch is
+1. **Confirm the production latency fell.** After the deploy, the tuning export's `took_ms`
+   should drop from a median of 2.5 s. `-tuning-report` warns when an archive spans versions:
+   split it by version before comparing. If it has not fallen, look at `pgmajfault` in the
+   container's `memory.stat` before looking at code.
+2. **Measure engagement on the new version** the same way, once a week of samples exists.
+   Short replies and prompt reuse are the two leads worth testing deliberately.
+3. **`tools/replay` covers one guild.** It takes one snapshot; the second guild's corpus is a
+   third of the size and has not been replayed.
+4. **Carried from M35, status unverified since:** a live smoke test of the wheel (a full match
+   with two accounts, a stale press refused privately, a modal submit repainting the card, a
+   restart mid-match showing the ended card, `/leaderboard`'s gold column and `/wallet`); the
+   card's look on real clients; three inline columns on a narrow desktop board; no lifetime
+   leaderboard; `-tuning-report` has no guild dimension; a Discord-reachable kill switch is
    still SPEC section 10's open decision.
 
 ## The checks this repo runs
@@ -100,10 +85,5 @@ em=$'\342\200\224' ell=$'\342\200\246' ldq=$'\342\200\234' rdq=$'\342\200\235'
 grep -rnI --exclude-dir=.git -e "$em" -e "$ell" -e "$ldq" -e "$rdq" .
 ```
 
-All green as of this writing. `-race` needs a C toolchain this checkout does not have and is
-CI-only; `TestConcurrentSpinPressesActOnce` is the wheel test that means most under it.
-
-The wheel tests to keep green above all others: `TestRandomPlayInvariants` in
-`internal/wheel` (300 seeded matches, invariants checked after every step) and
-`TestAFullMatchPaysGoldExactlyOnce` in `internal/plugins/games`. Run
-`go test ./internal/wheel -run FullMatch -v` and read the event log once after any rule change.
+`-race` needs a C toolchain this checkout does not have and is CI-only. For any engine change,
+also run `tools/replay` over a few seeds and compare against the table above.

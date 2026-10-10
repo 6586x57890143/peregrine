@@ -28,6 +28,16 @@ go test ./internal/markov/ -run TestGenerateGolden -v  # print golden samples an
 govulncheck ./...
 ```
 
+**Judge an engine change on real text with `tools/replay`**, not only on the golden fixture. It
+regenerates the prompts in a tuning archive against a corpus snapshot under a seeded source and
+prints latency, how much of the output the corpus attests (bigrams, trigrams, 4-grams as the
+recitation check), the share of replies with no unattested trigram, and how often a reply reuses
+a word of its prompt. Average a few seeds before believing a difference of a point or two:
+```sh
+go run ./tools/replay -db ./snapshot.db -tuning ./tuning -n 400 -q -seed 1
+go run ./tools/replay -db ./snapshot.db -tuning ./tuning -n 100 -misses   # every unattested trigram
+```
+
 The `-race` line needs a C toolchain, which a stock Windows checkout does not have. Without gcc it fails with `cgo: C compiler "gcc" not found`, which is a missing toolchain and not a broken test. CI runs on `ubuntu-latest` where cgo works, so the race detector is effectively CI-only unless you install one locally.
 
 There is a prose check in CI that fails the build on em dashes, ellipsis characters and curly quotes anywhere in the repo. Run it before pushing, because it is easy to trip in a comment:
@@ -886,7 +896,11 @@ The engine is `internal/markov` as of M7a. Read `SPEC.md` §5 for the full speci
 
 **The golden harness resolves names, and it did not until M14.** It built its `SeedInput` with no `Names` and no `NameTokens`, so three seed tiers and two logits had never fired in a printed sample: every name-aware part of the engine was invisible to the only instrument for judging output. Its fixture's associations also carry realistic positions rather than all claiming 0.5, without which the position preference above cannot be judged. If you add a tier or a logit, make the harness exercise it in the same change.
 
-**The persona is one mechanism.** `Persona` drives both the in-sampler lexicon bias and the post-pass filler, so the roast decision is made once instead of by two independent coin flips. The post-pass picks its insertion point from a triangular draw concentrated mid-sentence; the old flat draw over the interior put filler at the edges, where an interjection reads as a typo. The lexicon matches whole tokens and real chat inflects, so both "cope" and "coping" are listed: extend it by enumerating forms, not by stemming, because in this register the inflected form is often the joke.
+**`Continuity` is the one logit that reads a candidate's ORDER, and it exists because Kneser-Ney's own preference is too weak here.** With nearly every high-order count at one, a context hands three quarters of its mass to candidates that only continue the last word, and one draw of those strands the rest of the reply on a bigram walk. 1.0 per extra word of context took replayed replies with no unattested trigram from 23% to 32%; 1.5 fails criterion 7 in the golden fixture (`SPEC.md` §8, finding 61). Lowering `PEREGRINE_KN_DISCOUNT` does not do the same job: it was measured and moved nothing.
+
+**The scorer asks the association indexes by point lookup and never decodes a whole range per step.** `assocCache` is `TopicWord(topic, candidate)`, and the second hop out of a name reads its 24 strongest topics. The decoding version was three quarters of generation CPU on the production corpus, because a popular name carries thousands of topics (`SPEC.md` §8, finding 59). Decoding a range is fine once per sentence in `Seed`; it is not fine per step.
+
+**The persona is one mechanism.** `Persona` drives both the in-sampler lexicon bias and the post-pass filler, so the roast decision is made once instead of by two independent coin flips. The post-pass adds filler only as an opener or a closer, never in the interior: M38 replayed real prompts and found mid-sentence interjections and meta-comments among the most common breaks in the output, whatever position rules bounded them (`SPEC.md` §8, finding 60). The lexicon matches whole tokens and real chat inflects, so both "cope" and "coping" are listed: extend it by enumerating forms, not by stemming, because in this register the inflected form is often the joke.
 
 **Conversation memory is per channel and bounded.** One shared memory meant a reply here was steered by an unrelated conversation elsewhere, which is wrong context rather than chaos. The 200-channel bound is not optional: the map grows with every guild the bot joins, and a test that uses one channel would never reveal it.
 
@@ -1047,6 +1061,8 @@ The bot's own output is excluded from those counts, and the exclusion is a compa
 Merlin's pipeline, adapted. `.github/workflows/ci.yml` runs `go vet`, `golangci-lint`, `go test -race -cover`, `govulncheck`, a `gitleaks` secret scan, the prose check and a Docker build on every push and PR. On push to `main` only it also builds and pushes a multi-arch (amd64/arm64) image to GHCR and deploys to the VPS over SSH using `docker-compose.prod.yml`.
 
 The prod image tag is pinned to the commit SHA in `deployed-tag.env` on the host, with the previous value kept in `previous-tag.env`, so a rollback is editing one line rather than working out from GHCR what used to be running. The image prune is scoped `--filter "until=168h"` deliberately: a bare `docker image prune -f` on a host that just retagged can delete the previous release, which is the one thing a rollback needs to still exist.
+
+**`mem_limit` must stay above the combined size of the corpora.** bbolt reads through an mmap, and under cgroup v2 the page cache behind it is charged to the container, so a limit below the corpus does not OOM, it thrashes: at 512m against 900 MB the bot had 155 MB resident and replies took seconds. That failure looks like a slow engine, which is why it went unnoticed (`SPEC.md` §8, finding 59). `docker-compose.prod.yml` has the current figure; raise it as the corpora grow.
 
 **There is no backup sidecar, and the omission is deliberate.** Merlin's works because `pg_dump` is a client asking the server for a consistent snapshot. bbolt has no equivalent, and `cp markov.db` is *not* a backup: the file is a single mmap updated by copy-on-write pages plus a meta-page flip at commit, so an external byte copy can capture a state between the page write and the flip, or mid-remap, and the result usually *appears* to work, which is the worst property a backup can have. A sidecar cannot snapshot it either, because of the exclusive flock.
 
