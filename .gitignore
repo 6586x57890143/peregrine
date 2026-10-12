@@ -40,3 +40,4 @@ voicenotes/
 
 *.log
 AI_CODE_REVIEW.md
+.wrangler/
