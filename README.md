@@ -92,11 +92,11 @@ cp .env.example .env          # set DISCORD_BOT_TOKEN
 go run ./cmd/bot
 ```
 
-In the Discord Developer Portal the application needs the **Message Content** privileged intent ticked, under Bot. Without it Discord refuses the connection and the bot cannot read the messages it exists to learn from. Since M3 that refusal is a startup error naming the checkbox, rather than a process that connects to nothing and looks healthy while doing so.
+Add peregrine to a server from **https://peregrine.skua.lol**. That is `web/`, a Cloudflare Worker that redirects to Discord's bare install link for application `1436415016965509181`. The bare link asks for the app's Default Install Settings, and peregrine writes those itself at every boot from `core.Permissions` (`internal/core/install.go`), so the invite never goes stale when a feature needs a new permission. Deploy the Worker with `cd web && wrangler deploy`, only when `web/` changes.
 
-The other two intents, `GUILDS` and `GUILD_MESSAGES`, are not privileged and need no portal toggle.
+The same boot step switches on the **Message Content** privileged intent (the `_LIMITED` flag Discord lets an app under 100 servers set for itself). Without it Discord refuses the connection and the bot cannot read the messages it exists to learn from. A verified app cannot self-grant it: tick "Message Content Intent" under Bot in the Developer Portal, and if it is missing the startup error names that checkbox. The other intents, `GUILDS`, `GUILD_MESSAGES` and `GUILD_MESSAGE_REACTIONS`, are not privileged.
 
-Invite scopes: `bot`. Permissions: View Channels, Read Message History, Send Messages, Send Messages in Threads, Add Reactions, and Manage Messages (used to clean up its own word-game messages).
+Scopes are `bot` and `applications.commands`. Permissions are View Channels, Read Message History, Send Messages, Send Messages in Threads, Embed Links (the leaderboard and wheel embeds), Add Reactions, and Manage Messages (to clean up its own word-game messages). The long-form link, for when the Worker is down: `https://discord.com/oauth2/authorize?client_id=1436415016965509181&scope=bot+applications.commands&permissions=274878000192`.
 
 ### With Docker
 

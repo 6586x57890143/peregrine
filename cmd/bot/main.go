@@ -214,6 +214,13 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 	if err != nil {
 		return err
 	}
+	// Before Open, so a fresh app identifies with Message Content already granted. A failure
+	// is not fatal: the app may already be set up by hand, and WatchReady diagnoses a 4014.
+	if changed, err := core.SyncApplication(session); err != nil {
+		log.Warn("could not sync the Discord application's intents and install settings", "err", err)
+	} else if len(changed) > 0 {
+		log.Info("updated the Discord application", "fields", changed)
+	}
 
 	dispatcher := core.NewDispatcher(cfg.MessageWorkers, cfg.MessageQueue, log)
 	registry := core.NewRegistry(core.Deps{

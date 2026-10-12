@@ -1,0 +1,12 @@
+{
+  "$schema": "https://unpkg.com/wrangler/config-schema.json",
+  "name": "peregrine-invite",
+  "main": "worker.js",
+  "compatibility_date": "2026-09-15",
+  "workers_dev": false,
+  // The Discord application ID is public; it is in every invite link.
+  "vars": { "APP_ID": "1436415016965509181" },
+  // skua.lol is a zone on the same account as skua's invite Worker; a custom_domain
+  // creates the DNS record and the cert.
+  "routes": [{ "pattern": "peregrine.skua.lol", "custom_domain": true }]
+}
