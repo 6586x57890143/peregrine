@@ -43,8 +43,8 @@ func TestApplicationPatch(t *testing.T) {
 }
 
 func TestPermissionsNumber(t *testing.T) {
-	// The README's fallback invite carries this number; update both together.
+	// docs/invite.md carries this number in its fallback link; update both together.
 	if Permissions != 274878000192 {
-		t.Errorf("Permissions = %d; update README.md's invite link to match", Permissions)
+		t.Errorf("Permissions = %d; update docs/invite.md to match", Permissions)
 	}
 }

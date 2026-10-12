@@ -252,7 +252,7 @@ jobs:
             # pull died with `lease does not exist`, so `deployed-tag.env` named
             # a SHA whose image was never on the host, `previous-tag.env` named
             # the SHA that was still running, and the rollback recipe in
-            # README.md became a silent no-op. A file that says what IS running
+            # docs/operate.md became a silent no-op. A file that says what IS running
             # is worth more than a file that says what somebody meant to run,
             # because the only moment anybody reads it is the moment they need
             # to go back to a version that definitely exists. `set -e` above is
