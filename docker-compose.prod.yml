@@ -11,7 +11,7 @@ services:
     # pinned SHA is already in the local image cache from the last deploy, so it
     # needs no registry access at all. The fallback only helps on a host with
     # GHCR credentials and no deployed-tag.env, which in practice means a
-    # developer's machine. See README's Runbook, where omitting this step broke
+    # developer's machine. See docs/operate.md, where omitting this step broke
     # the first production deploy.
     image: ghcr.io/6586x57890143/peregrine:${PEREGRINE_IMAGE_TAG:-latest}
     read_only: true

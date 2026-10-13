@@ -1,143 +1,127 @@
-# Peregrine Bot: Project Specification
+# peregrine: design
 
-CODENAME "peregrine", branded as "peregrine" (bird species), sibling to "merlin".
+A Markov-chain Discord bot in Go, built on `discordgo` v0.29 and `bbolt` v1.5. It learns from
+channel messages and replies in the server's own voice. It runs in a meme-heavy, high-traffic
+community and its purpose is engagement, fun and chaos, which makes its quality criterion unusual
+and is the thing most likely to be misread by someone reading the code cold. See §1 and §5.
 
-A Markov-chain Discord engagement bot in Go, built on `discordgo` v0.29 and `bbolt` v1.4. It learns from channel messages and replies in the server's own voice. It runs in a meme-heavy, high-traffic community and its purpose is engagement, fun and chaos, which makes its quality criterion unusual and is the single thing most likely to be misread by someone reading the code cold. See §1 and §5.
-
-This document is the design target. The repository is partway to it; §9 tracks how far.
-
----
-
-## 1. Design Principles
-
-1. **Quality means "lands", not "is grammatical".** The bot exists to be funny and to provoke replies. Punchy, surprising, on-topic-enough output beats coherent output. A 40-word grammatical Markov ramble is a worse result than a 6-word non-sequitur that gets a reaction. Several deliberate choices in §5 look like defects against a conventional language-model metric and are not.
-2. **The operator carries what the bot says.** Users are assumed to be actively hostile and to be trying to make the bot emit gross or borderline illegal content. Protecting the operator is a first-class requirement, not polish, and it is architectural rather than a matter of adding patterns. See §4.
-3. **Gates go at chokepoints, never at call sites.** Any check that must not be bypassable belongs at the single funnel every path traverses. A check at one of four call sites is not a check. This principle exists because the moderation in this bot was defeated exactly that way for its whole life (§4, A1).
-4. **Fail safe, and never fail silent.** A missing blocklist is a startup error, not an empty ruleset. A refused send is logged, not discarded. One feature failing disables that feature, never the process. `log.Fatal` is reserved for a missing token and an unopenable corpus.
-5. **Every feature is part of the product.** Aggro, image reposts, word games, the roast persona and autonomous posting are the engagement surface, not cruft. They get fixed, configured and turned on deliberately. The only thing deleted outright is configuration that was never wired to anything.
-6. **Prefer making a bug unwritable over fixing it once.** Where a structural change can make a class of defect impossible to express, take it: the `Reader`/`Writer` seam in §3, the reactor `handled` contract in §6, the two gates in §4.
-7. **The output bar is written down, and it is settled by reading samples rather than by argument.** A reply should be a short-to-medium memey sentence that grasps the corpus, incorporates the people around it, and is funny by **recombining** concepts that were never adjacent in any one source message. That last clause is the one that constrains the engine, and it cuts against most of the work in §5: a bot that recites is not funny even when every word is in register, so a change that improves coherence by removing recombination has made the product worse while improving every conventional metric. §5.5 is the rubric and the tests that keep it honest.
+Section numbers are stable because code comments cite them. Comments also cite "finding N" and
+milestones ("M24"): those are in this file's history, `git show 4aaf753:SPEC.md`, sections 8 and 9.
 
 ---
 
-## 2. Repository Layout
+## 1. Design principles
 
-Target, per merlin's conventions:
+1. **Quality means "lands", not "is grammatical".** The bot exists to be funny and to provoke
+   replies. A 6-word non-sequitur that gets a reaction beats a 40-word grammatical ramble. Several
+   choices in §5 look like defects against a conventional language-model metric and are not.
+2. **The operator carries what the bot says.** Users are assumed to be hostile and to be trying to
+   make the bot emit gross or borderline illegal content. Protecting the operator is architectural,
+   not a matter of adding patterns. See §4.
+3. **Gates go at chokepoints, never at call sites.** A check that must not be bypassed belongs at
+   the single funnel every path traverses. A check at one of four call sites is not a check.
+4. **Fail safe, and never fail silent.** A missing blocklist is a startup error, not an empty
+   ruleset. A refused send is logged. One feature failing disables that feature, never the
+   process. `log.Fatal` is reserved for a missing token and an unopenable corpus.
+5. **Every feature is part of the product.** Aggro, image reposts, word games, the roast persona
+   and autonomous posting are the engagement surface. Configuration wired to nothing is deleted.
+6. **Prefer making a bug unwritable over fixing it once.** The `Reader`/`Writer` seam (§3), the
+   reactor's consume contract (§6) and the two gates (§4) each make a class of defect impossible
+   to express.
+7. **The output bar is written down and settled by reading samples, not by argument.** A reply is
+   a short-to-medium memey sentence that grasps the corpus, involves the people around it, and is
+   funny by **recombining** concepts that were never adjacent in one source message. A bot that
+   recites is not funny even when every word is in register, so a change that improves coherence
+   by removing recombination makes the product worse. §5.5 is the rubric.
+
+---
+
+## 2. Repository layout
 
 ```
-cmd/bot/                 wiring only: flags, logger, config, signal handling
-internal/config/         Config, Load, validation. Env only, no YAML
-internal/corpus/         value types ONLY, zero internal imports
-internal/storage/        the only package that knows a bucket exists
-internal/dbtest/         temp-file bbolt harness
-internal/text/           tokenizer, similarity, sentence cleanup, interner
-internal/filter/         spam and character-class filters, precompiled
+cmd/bot/                 main.go (mode, signals) and services.go (the only place features meet)
+internal/config/         Config, Load, validation. Environment only
+internal/corpus/         value types only, no internal imports
+internal/storage/        the only package that imports bbolt; one corpus per guild
+internal/dbtest/         a real corpus in t.TempDir()
+internal/text/           tokenizer, sentence cleanup, interner
+internal/filter/         spam and character-class filters
 internal/safety/         normalizer, blocklist, CheckLearn and CheckEmit
-internal/markov/         learn and generate. Imports neither bbolt nor discordgo
-internal/ingest/         guild and channel walk, per-channel cursors
-internal/core/           Service registry, Dispatcher, RunLoop, WatchReady
-internal/discordguard/   the send chokepoint
-internal/maintenance/    -clean-db and -compact against an already-open store
-internal/plugins/        reply, learn, aggro, images, wordgame, voicenote, health
+internal/markov/         the engine. Imports neither bbolt nor discordgo
+internal/core/           Service registry, Dispatcher, RunLoop, WatchReady, install sync
+internal/discordguard/   the outbound chokepoint
+internal/maintenance/    -clean-db, -compact, -purge-author
+internal/ingest/         guild and channel history walk, per-channel cursors
+internal/learn/          the only way anything enters the corpus
+internal/generate/       prompt to sentence, per-channel memory
+internal/names/          who a message is about, and what the corpus calls them
+internal/channels/       what a channel is, from the state cache
+internal/activity/       where people are talking, from gateway traffic
+internal/wordgame/       scramble games and the leaderboard
+internal/wheel/          the wheel game engine; wheelart draws its strips
+internal/tuning/         the tuning export's wire types (stdlib only)
+internal/plugins/        chat, aggro, images, games, autopost, health, backup, ingest,
+                         repair, tuning, voicenote
+web/                     the peregrine.skua.lol invite redirect
+tools/replay/            replays real prompts against a corpus snapshot
 ```
 
-Seams follow merlin's dominant pattern: **each consumer declares the minimal interface it needs, and the concrete type satisfies it structurally.** `internal/markov` declares `Corpus` (read) and `Sink` (write); `*storage.Reader` and `*storage.Writer` satisfy them with no glue. This exists so that (a) packages cannot form import cycles, and (b) the 1,000 lines of generation heuristics can be tested against Go maps with no database at all, which is currently impossible.
+Each consumer declares the minimal interface it needs and the concrete type satisfies it
+structurally. `internal/markov` declares `Corpus`; `*storage.Reader` satisfies it with no glue, and
+the assertion lives in an external test package. That keeps import cycles impossible and lets the
+generation heuristics be tested against Go maps.
 
-Import rules, stated because each has already nearly been violated:
+Import rules:
 
 - `corpus` and `text` stay leaves. `corpus` holds type declarations and nothing else.
-- `clustering` used to point the wrong way: `legacy` aliased *its* bucket-name constants, so the algorithm package owned storage-layer names. **Fixed in M6b:** every bucket name is unexported inside `storage`, and `clustering` lost its last caller. **Deleted in M7b** rather than rewritten, per finding 29, so the package is gone from both the target layout and the tree.
-- `markov` declares the interface it needs and `*storage.Reader` satisfies it structurally. The compile-time assertion lives in an **external** test package (`markov_test`), which is what lets it import `storage` to make the claim without putting that import anywhere the production package could pick it up.
-- `markov` must never import `storage`. Every method on `Corpus`/`Sink` returns a stdlib or `corpus.` type, or the cycle returns.
+- `markov` never imports `storage`; every `Corpus` method returns a stdlib or `corpus` type.
 - `storage` never imports `config`. `Open` takes a path plus options.
-- `core` never imports `plugins`. Plugins import `core`; registration happens only in `cmd/bot`.
-- `dbtest` is not a `_test.go` file (so any package's tests can import it) and is imported by nothing outside `_test.go` files (so it never enters the binary).
-
-**Sequencing.** Everything was `package main`, and two `main` packages cannot share code, so M1 moved the root files verbatim into `internal/legacy` with `main()` renamed to `Run(ctx)`. Every later milestone moves one subsystem *out* of `legacy`, which shrinks monotonically and is deleted in M13. This is the only ordering that keeps `go build ./...` green at every commit while still ending at the target layout.
-
-As shipped, through M6b:
-
-```
-cmd/bot/                 main.go plus services.go: flags, slog, signal context, registration
-internal/config/         live
-internal/core/           live
-internal/text/           live
-internal/filter/         live
-internal/safety/         live
-internal/corpus/         live
-internal/storage/        live: the only package that imports bbolt
-internal/dbtest/         live
-internal/maintenance/    live: -clean-db, -compact, -purge-author
-internal/discordguard/   live: the send chokepoint, mention suppression, CheckEmit
-internal/ingest/         live: the guild and channel walk, per-channel cursors
-internal/markov/         live: KN, the logits, the sampler, seeds, length, persona
-internal/wordgame/       live: the scramble game, its Manager and the leaderboard
-internal/activity/       live: where people are talking and who is around, from the gateway
-internal/channels/       live: what a channel is, and where the bot may speak unprompted
-internal/names/          live: who a message is about, and what the corpus calls them
-internal/learn/          live: the only way anything enters the corpus
-internal/generate/       live: the glue from a Discord prompt to a sentence
-internal/plugins/        live: chat (the reactor), aggro, images, games, autopost,
-                         voicenote, ingest, backup, health
-(internal/legacy/ is deleted: M13 was the last of it)
-(voicenotes/ is deleted: M12 replaced it with internal/plugins/voicenote's Engine seam)
-```
-
-**`internal/legacy` is deleted as of M13**, which is what the sequencing was for. It went from 3,200 lines to one file in M6b, to 250 lines in M11c, to nothing. The two things worth keeping from it are the reason it existed (two `main` packages cannot share code, so the entrypoint move needed somewhere importable) and the way it shrank: every milestone took one subsystem out and the linter reporting the leftovers unused is how each was confirmed dead rather than assumed.
-
-The three root subpackages keep their paths deliberately. Relocating them is a one-line import change with no risk, which is exactly why it should ride along with the milestone that actually rewrites each one, rather than producing a diff that touches them twice.
-
-`legacy.Run` takes only a `ctx` and no logger, which differs from what this section said before M1 landed. Every log call in the package is the stdlib `log` package, and `cmd/bot` routes those into the slog handler with `slog.SetDefault`, so the output is structured without editing 200 call sites inside a milestone whose entire value was being reviewable as a rename. `slog.SetLogLoggerLevel` must be called before `SetDefault`, or bridged records ignore the handler's level. The signature grows a `*config.Config` in M2.
+- `core` never imports a plugin. Registration happens only in `cmd/bot`.
+- `dbtest` is imported only from `_test.go` files, so it never enters the binary.
 
 ---
 
 ## 3. Storage
 
-bbolt: embedded, single-file, pure Go. Pure Go is load-bearing, because it is what allows `CGO_ENABLED=0`, which is what allows a distroless static image identical to merlin's while still owning a database.
+bbolt: embedded, single-file, pure Go. Pure Go is what allows `CGO_ENABLED=0` and a distroless
+static image.
 
-Properties that shape the design rather than merely inform it:
+Properties that shape the design:
 
-- **One writer, process-wide.** Any slow loop inside `db.Update` blocks all ingestion.
-- **Exclusive flock.** `bbolt.Open` always passes a `Timeout` (5s); without it, `-clean-db` against a live bot hangs forever with no output.
-- **Nested transactions deadlock.** A read txn holds `mmaplock.RLock` for its whole life; a writer needing to grow the mmap takes the write lock; Go's `RWMutex` queues new readers behind a waiting writer. Outer read plus waiting writer plus inner read never completes, and it gets likelier as the file grows.
+- **One writer, process-wide.** A slow loop inside `db.Update` blocks all ingestion.
+- **Exclusive flock.** `Open` always passes a 5 s timeout, or a maintenance mode against a live bot
+  hangs with no output.
+- **Nested transactions deadlock.** A read transaction holds the mmap read lock; a writer growing
+  the mmap waits for the write lock; new readers queue behind it. `Reader` has no method that opens
+  a transaction, so a nested one cannot be written.
 - **The file never shrinks.** Deletes free pages for reuse only, hence `-compact`.
+- **Long read transactions grow the file**, because copy-on-write pages cannot be reused while an
+  old reader can see them. Counts are counters in `meta`, never `Bucket.Stats()`.
 
-### 3.1 The key layout, and why it changes
-
-The layout up to M6 stored a JSON `map[string]int` as the *value* of each prefix key. So the key `"the"` held a map of every word that had ever followed "the", read, decoded, mutated, re-encoded and rewritten in full on **every occurrence of the word "the"**. That was the root performance defect, and it had a pathological special case: the ingestion loop ran the n-gram order down to 1, and at order 1 the prefix slice is empty, so the key was the empty string and **the entire vocabulary accumulated into a single database key**. Nothing read it: every reader constructs a prefix of at least one word. It was pure write amplification and the dominant reason the corpus reached 128 MiB.
-
-As shipped in M6a and in use by the bot since M6b:
+### 3.1 Key layout
 
 ```
 bucket "ngram"       key = <prefix> 0x00 <next>              value = count u64 | authors u32
 bucket "ngram_auth"  key = <prefix> 0x00 <next> 0x00 <uid>   value = presence
-```
-
-The value is twelve bytes rather than eight, because the distinct-author count lives
-alongside the frequency: generation reads both together on every candidate, so
-splitting them would double the reads on the hot path.
-
-`0x00` is a safe separator because the tokenizer can only emit URLs, mentions, emotes, shortcodes and runs of letters, digits, symbols and apostrophes, none of which contain a NUL. The codec asserts this and returns an error rather than writing an ambiguous key. `0x00` also sorts below space, so a seek on `"the\x00"` cannot wander into `"the cat\x00..."`. `IncSuccessor` becomes one 8-byte get, an add and one 8-byte put: constant work, no decode, no whole-map rewrite. The ingestion loop starts at order 2, so the empty prefix cannot be produced, and `PEREGRINE_MAX_NGRAM` validates a minimum of 2. Unigram frequency already lives correctly in the `topics` bucket, one key per word.
-
-The two association indexes get the same treatment (`word 0x00 assoc` to a 16-byte `{count, posSum}`), because they share the shape and are the real cost behind finding 12. There were three of them before M6b; `TopicClusterBucket` is gone, because it recorded the same word pairs as `topic_word` with the direction and the position discarded (finding 28).
-
-M9 adds one more, and it needed no schema bump:
-
-```
 bucket "cursor"      key = <channel id>                      value = snowflake be64
-```
-
-M11b rekeys one, and it did need a bump:
-
-```
 bucket "image"       key = <msgID be64> 0x00 <url>           value = author be64
 ```
 
-The URL alone was the key before, with a timestamp as the value, and that shape is what made §4's A7 mitigations unbuildable rather than merely unbuilt: nothing recorded where a cached URL came from, so it could not be attributed, capped, or revoked when its source message was deleted. Putting the snowflake first also makes eviction chronological by construction, the same property finding 10 turned on for the history bucket, which replaced a full-bucket minimum search that ran inside the eviction loop.
+The count and the distinct-author count share one 12-byte value because generation reads both for
+every candidate. `0x00` is a safe separator: the tokenizer cannot emit a NUL, and the codec refuses
+to write an ambiguous key. It also sorts below space, so a seek on `"the\x00"` cannot wander into
+`"the cat\x00"`. Learning one n-gram is a point get, an add and a put. The ingestion loop starts at
+order 2, so an empty prefix cannot be produced; `PEREGRINE_MAX_NGRAM` has a minimum of 2.
 
-**Schema 2 has a migration where schema 1 has a refusal, and the asymmetry is the rule rather than an inconsistency.** `upgradeToV2` empties the image cache and resets its counter, in the transaction that stamps the version. Converting the corpus would mean rewriting every key and the corpus is expensive to convert and re-derivable from Discord history, so it is refused; the image cache is a hundred URLs that refill themselves from live traffic within minutes, so it is discarded. Migrate what is cheap to lose, refuse what is not.
+The association indexes use the same shape (`word 0x00 assoc` to a 16-byte `{count, posSum}`).
+Snowflakes are fixed-width big-endian, so key order is chronological: the oldest cached image is a
+cursor's `First()`, and the writer refuses to move an ingest cursor backwards with one
+`bytes.Compare`.
 
-The per-channel ingest high-water mark. Stored as a fixed-width big-endian snowflake for the same reason history keys are: byte order is numeric order is chronological order, so the writer can refuse to move a cursor backwards with one `bytes.Compare` instead of parsing. A new bucket is backward compatible because `Open` creates every bucket it knows about with `CreateBucketIfNotExists`, so a pre-M9 corpus simply gains an empty one; bumping `SchemaVersion` would have forced operators to discard a corpus for a feature that reads nothing out of it.
+`schema_version` is 2. A version 1 corpus is refused, not migrated, because the corpus is expensive
+to convert and re-derivable from Discord history; `upgradeToV2` only empties the image cache, which
+refills itself in minutes. Migrate what is cheap to lose, refuse what is not. A corpus with data and
+no version is refused too, rather than opened and silently ignored.
 
 ### 3.2 Kneser-Ney indexes
 
@@ -147,684 +131,313 @@ bucket "kn_pre"    key = <token> 0x00 <preceding ctx>   value = presence
 bucket "kn_pre_n"  key = <token>                        value = N1+(. token)   distinct predecessors
 ```
 
-`kn_succ` is the interpolation normalizer. It is derivable with a cursor count, but that is O(successors) on every lookup, so it is stored and maintained incrementally. `kn_pre` is a presence set whose only job is to make `kn_pre_n` correct, since a distinct-predecessor count cannot be maintained without knowing whether a given predecessor was already seen. **Its value is one byte, not zero.** bbolt`s `Bucket.Get` returns nil both for a key that does not exist and for a key stored with an empty value, so `Get(k) == nil` cannot tell those apart; with a zero-length value every presence check reported absent and both this count and the author count counted occurrences instead of distinct things. Three tests caught it. This is the honest cost of KN: roughly one extra read and two extra writes per n-gram per message, against a presence value of zero bytes. Worth paying, because §3.1 removes far more write volume than this adds.
+`kn_succ` is the interpolation normalizer, stored because deriving it is a scan per lookup.
+`kn_pre` exists only to keep `kn_pre_n` correct, since a distinct count needs to know whether a
+predecessor was already seen. **Presence values are one byte, not zero**: bbolt's `Get` returns nil
+for both a missing key and an empty value.
 
-`kn_pre` grows with distinct (token, context) pairs and is the fastest-growing structure in the database. It will need a pruning policy. Deliberately not in M6: get it correct and measure first, because a wrong prune corrupts the continuation counts that KN's entire benefit rests on.
+`kn_pre` grows with distinct (token, context) pairs and is the fastest-growing structure. It will
+want a pruning policy once there is data to design one against (§10).
 
 ### 3.3 Author diversity
 
-Each markov key carries a distinct-author count alongside its frequency, maintained the same way as `kn_pre_n`. §4 explains why this is the load-bearing anti-poisoning control rather than a nicety.
-
-### 3.4 Migration
-
-There is none, and that is a decision rather than an omission. Every n-gram key changes shape, so the existing corpus is not readable under the new layout. Production starts empty on a named volume; the corpus is re-derivable from Discord history.
-
-The abandonment is explicit rather than silent. `storage.Open` reads a `schema_version` key from the `meta` bucket and distinguishes three cases: the key is present and current, so proceed; the key is absent and no bucket holds data, so stamp it, which is a new file; the key is absent but data exists, so **refuse**, with an error saying to remove the corpus and let it relearn. The third case checks the pre-M6 bucket names too, so an old corpus is recognised as old rather than mistaken for empty and stamped as current.
-
-Refusing rather than salvaging is deliberate. An earlier draft of this section proposed deleting the stray empty-prefix key on open and logging the bytes reclaimed, to rescue a local development database. That is worse than it sounds: it makes the pre-M6 file *open successfully* while every other key in it is still unreadable, so the bot starts, appears healthy, and learns from scratch beside a corpus it silently ignores. A refusal with an instruction is the honest outcome. Deploying M6b therefore requires `docker volume rm peregrine_corpus` once.
-
-Starting fresh is also a **safety** win, not only a schema convenience: per §4 A1 the unfiltered path has been the main ingestion route all along, so the existing corpus is poisoned to an unknown degree.
+Each n-gram carries a distinct-author count beside its frequency, maintained like `kn_pre_n`. §4
+explains why it is the load-bearing anti-poisoning control.
 
 ---
 
-## 4. Safety and Threat Model
+## 4. Safety and threat model
 
-Assume users actively try to make the bot say gross or borderline illegal things, and that the operator wears the consequences. The existing filters are the right instinct; the architecture around them does not hold.
+Assume users actively try to make the bot say gross or borderline illegal things, and that the
+operator wears the consequences.
 
-### 4.1 Findings
+### 4.1 Threats
 
-**A1. The backfill path bypassed moderation entirely, which defeated the live path.** ~~The live handler runs the filters, but `learnMessage` has four callers and the other three pass content through raw: the historical rescan, self-learning, and voice transcripts. Since the backfill re-reads the trailing 24 hours every 10 minutes, a message the live path blocked is learned anyway, unfiltered, minutes later.~~ **CLOSED IN M5.** `gate.CheckLearn` is called inside `learnMessage`, so all four callers and any fifth are covered by construction. `internal/learn/learn_test.go` pins it from two directions (it was `internal/legacy/learngate_test.go` until M11c moved it with the code): behaviourally (blocked content, including evaded spellings, writes nothing to the corpus when learnMessage is called directly, which is exactly the backfill path) and structurally (the package is parsed and the test fails if the gate call leaves learnMessage.s body, because that regression passes every behavioural test).
+**A1. A learning path that skips moderation defeats the one that has it.** `learnMessage` has
+several callers (live messages, history backfill, repair). `gate.CheckLearn` is called inside
+`learn.Learner.Message`, so every caller, and any new one, is covered. An AST test fails if the
+call leaves that body.
 
-**A2. There was essentially no output-side filter.** ~~The only check on generated text tests length, character repetition and character-class ratio. No slur check, no illegal-content check. Anything in the corpus can come back out verbatim.~~ **CLOSED IN M5** at the single generation exit: `gate.CheckEmit` applies the built-in slur and illegal lists plus the operator blocklist against the normalized form, and the bot returns empty and stays silent rather than substituting a fallback. M10 moves the call into `internal/discordguard` so all thirteen send sites are covered structurally rather than only the one path that generates.
+**A2. Generated text needs its own filter.** `gate.CheckEmit` applies the built-in slur and illegal
+lists plus the operator blocklist to everything the bot sends. On rejection the bot stays silent
+rather than substituting a fallback.
 
-**A3. Filtering the corpus cannot bound the output, even in principle.** A Markov chain composes novel sequences from n-grams learned separately, so individually innocuous fragments can join into something the operator answers for. Input filtering lowers the rate; only an output gate bounds the result. This is why two gates are not redundant.
+**A3. Filtering the corpus cannot bound the output.** A Markov chain composes novel sequences from
+fragments learned separately, so innocuous pieces can join into something the operator answers for.
+Input filtering lowers the rate; only an output gate bounds the result. That is why two gates are
+not redundant, and why `CheckEmit` lives in `internal/discordguard` and covers every send, not only
+generation.
 
-**Closed in M10a.** `CheckEmit` sat at the single exit from generation from M5, which covered the reply path and nothing else. It lives in `internal/discordguard` now, so it covers every send: the autonomous poster, the word-game announcements and the transcription results had all been reaching Discord ungated, and the last of those is the one that matters most, because a Whisper transcript of arbitrary audio is the least controlled text the bot has ever posted. Generation is not the only thing that produces output.
+**A4. Illegal content.** The `illegal` category loads from `PEREGRINE_BLOCKLIST_PATH`, is dropped on
+learn, blocked on emit, and alerts. The patterns are deliberately not in this repository; startup
+warns when the loaded list has none.
 
-**A4. The illegal-content filter is a placeholder.** Two toy regexes in `internal/filter` and a comment saying so. **Mechanism closed in M5, content still the operator.s:** the `illegal` category loads from `PEREGRINE_BLOCKLIST_PATH`, is dropped on learn, blocked on emit, and additionally alerts, and `cmd/bot` warns at startup when the loaded list has no `illegal` rules at all. The patterns themselves are deliberately not in this repository.
+**A5. Slurs: laundering and evasion.** Replacing a slur and learning the rest teaches the bot the
+sentence, so the learning path rejects whole and `Verdict` has no rewritten-text field. Matching
+runs against `safety.Normalize`, which removes spacing, leet, homoglyphs, combining marks and
+zero-width characters. `internal/filter` keeps `TestSlurRulesAreEvadable` so nobody mistakes raw
+matching for sufficient.
 
-**A5. The slur filter laundered instead of rejecting, and was easy to evade.** ~~It *replaces* matches, so a slur-bearing message is still learned with its structure intact and the replacement token injected into the corpus. Matching is on raw text with `\b` boundaries and only `[i1]`, `[a@]`, `[o0]` leet classes, so intra-word spacing, combining marks, zero-width characters, Cyrillic homoglyphs and any unenumerated variant pass through.~~ **CLOSED IN M5**, in two parts.
+**A6. Poisoning is cheap and self-amplifying.** Repeating a phrase is a direct write to the model.
+The generation gate requires a continuation to have come from `PEREGRINE_MIN_DISTINCT_AUTHORS`
+people (default 2), which turns the attack from persistence into collusion. The bot's own output
+carries no author, so self-learning cannot bootstrap a phrase. A narrow allowance
+(`PEREGRINE_SOLO_REPEAT_LIMIT`) admits a one-author edge at low count and short context, because a
+strict gate leaves a chat corpus nearly mute; long one-author contexts are someone's sentence and
+stay refused. `-clean-db` and `-purge-author` are the retroactive remedies.
 
-For the laundering: `Verdict` has no field for rewritten text, so laundering is unexpressible on the learning path rather than merely discouraged. The `m.Content = filterSlurs(m.Content)` line in the live handler is deleted, and that deletion is load-bearing twice over. It was already wrong (the message was learned anyway, with a harmless token in the slur's grammatical position, so the bot had been taught the sentence), and with the gate in place it became actively harmful: laundering *before* the gate would hand it pre-cleaned text and defeat it.
-
-For the evasion: matching happens against `safety.Normalize`. `internal/filter` keeps `TestSlurRulesAreEvadable`, which asserts that raw matching still lets every one of those variants through, so nobody mistakes a green suite there for sufficiency; `internal/safety` asserts the same inputs are caught. Blocklist patterns are written against the normalized form and must not re-enumerate what the normalizer removes.
-
-**A6. Poisoning is cheap, permanent and self-amplifying.** ~~Nothing rate-limits how much one author teaches the bot, and n-gram weight is raw frequency, so repeating a phrase is a direct write to the model. Self-learning feeds the bot's own output back in, reinforcing anything that got through once.~~ **Principal control closed across M6b and M7a.** The distinct-author counts have been maintained since M6b and the generation gate reads them since M7a, defaulting to 2, so a continuation must have come from two different people before the bot will produce it regardless of how often one person said it. That turns the attack from persistence into collusion. The bot's own output passes an empty author, so self-learning cannot bootstrap a phrase into eligibility.
-
-**M11c widened it to every producer**, which it had not been. The gate was applied in the sampler's candidate filter, and generation has three places a word can come from: the sampler, the dead-end jump, and the seed. The other two read the co-occurrence indexes, which carry no author attribution at all, so a phrase one person repeated was refused at every step and handed straight back by the jump. See finding 31: the same class as A1, one milestone after the principle that names it was written down.
-
-Two things are deliberately still open rather than done. The **per-author learning budget** in §4.2 point 4 is an optional second layer and has never been built; the diversity gate is the load-bearing one and the budget would bound write volume rather than generation eligibility. And **the existence of a `-clean-db` mode is evidence this already happened** to the corpus that predates all of this, which is why the retroactive remedies (`-clean-db`, `-purge-author`) exist alongside the preventive control rather than instead of it.
-
-**A7. Image reposting is an unattributed republishing channel.** ~~Cached user-posted image and Tenor URLs are reposted later, by the bot, in a channel of its choosing. A hostile user can seed the cache and have the bot publish it under its own name. The only current guard is an NSFW flag check on the source channel.~~ **CLOSED IN M11b**, in three parts, and the enabling change was a key layout rather than a check.
-
-The image cache was keyed by the URL alone, which is why the mitigations in §4.2 were specified in M5 and could not be built: with no record of where a URL came from there was nothing to attribute, nothing to cap, and no way to ask which entries a deleted message had contributed. `Writer.DeleteImageURL` sat in `internal/storage` for a milestone with a comment about deleted messages and no caller, which is what an unimplementable design looks like from the inside. The key is `<message snowflake> NUL <url>` with the author in the value now.
-
-- **Per-author caps.** `PEREGRINE_IMAGE_MAX_PER_AUTHOR`, default 5 against a cache of 100, enforced inside `Writer.AddImageURL` rather than at the caller, for the same reason `CheckLearn` lives inside `learnMessage`. At the cap the author's own oldest entry is evicted rather than the new URL dropped, so a prolific poster's share stays current instead of freezing at whatever they posted first; either way the cap holds. A value at or above the cache size is a **startup error naming both variables**, because a cap one person can saturate is not a cap and an operator who believes it is on is worse off than one who knows it is off.
-- **The deleted-message rule.** `MESSAGE_DELETE` and `MESSAGE_DELETE_BULK` handlers, through the dispatcher because a moderator clearing a raid arrives as a burst and each deletion opens a write transaction. Deletion is treated as a signal about *republishing* only: removing learned n-grams on delete is a different and much harder question and is deliberately out of scope.
-- **The destination is checked as well as the origin.** Capture already refused to remember media from an NSFW channel; nothing stopped a repost carrying an image out of a general channel into one the bot has no business posting in. Both directions fail closed on a state-cache miss.
-
-The fourth mitigation §4.2 asks for, the blocklist on the destination, was **already there and is now pinned rather than assumed**. A Tenor URL carries hyphen-separated words in its slug, so `tenor.com/view/<slur>-gif-1234` is a way to make the bot post a slur that never enters the corpus as text; every send goes through the guard, the guard runs `CheckEmit`, and `safety.Normalize` treats the hyphen as a boundary. That reasoning was correct, which is exactly why it needed a test.
-
-Riding along, because the same function was being rewritten: the key layout also fixed an eviction cost defect of finding 11's shape (the trim ran a full bucket scan to find the minimum timestamp *inside* the eviction loop, so trimming k entries cost O(n*k); a snowflake-prefixed key makes a cursor's `First()` the oldest by construction), and `captureImageURLs` no longer holds its mutex across a bbolt write transaction, which had made one capture block every other one for the length of a serialized write.
+**A7. Image reposting republishes other people's links under the bot's name.** The cache is keyed
+by source message, so it can attribute, cap and revoke: at most `PEREGRINE_IMAGE_MAX_PER_AUTHOR`
+entries per author (enforced inside `AddImageURL`), deleting a message revokes what it contributed,
+and the destination channel gets the same NSFW check as the origin. Every repost passes `CheckEmit`,
+which catches words in a Tenor slug.
 
 ### 4.2 The defense architecture
 
-1. **One `internal/safety` gate, two directions.** `CheckLearn(text)` and `CheckEmit(text)`, sharing one normalizer and one ruleset. `CheckLearn` is called inside `learnMessage`, which closes A1 for all four callers at once and for any fifth. `CheckEmit` is called inside `internal/discordguard`, covering every send site structurally. On rejection the bot **stays silent** rather than substituting a fallback: silence is always safe, and a fallback is a new output to reason about.
-2. **Reject, never launder, on the learning path.** A message tripping the blocklist is dropped whole. Replacement remains available for display paths, never for the corpus.
-3. **Normalize before matching.** NFKC, strip zero-width characters and combining marks, fold confusable homoglyphs to ASCII, collapse repeated characters and intra-word separators. Blocklist patterns are written against that form and must not re-enumerate evasions the normalizer already removes.
-4. **Author diversity gates generation, not just storage.** A continuation must have come from `k` distinct authors (`PEREGRINE_MIN_DISTINCT_AUTHORS`, default 2) before the bot will generate it, independent of frequency. This is the strongest single anti-poisoning control: it converts the attack from persistence into collusion. The bot's own output is excluded from those counts so self-learning cannot bootstrap a phrase into eligibility. A per-author learning budget per window is a second layer.
-5. **The blocklist is data, not source.** Loaded from `PEREGRINE_BLOCKLIST_PATH`; the real file is gitignored and only `blocklist.example.txt` is committed. Committing it would make this repo a searchable copy of a slur list and turn every addition into a rebuild and a public diff instead of an edit the operator makes mid-incident. It fails **closed**: missing or unreadable is a startup error, because an empty ruleset is indistinguishable from a working one until the worst possible moment. The `illegal` category additionally alerts the operator, so keep it narrow: every entry pages a human.
-6. **Operator controls.** `PEREGRINE_PAUSE_ALL_WRITES` is a process-wide mute for when the bot is actively saying something awful and a deploy is too slow. Every emit rejection is logged so attempted poisoning is visible rather than inferred. `-clean-db` is the retroactive remedy, plus a per-author purge so one bad actor's contributions can be removed without discarding the corpus.
-
-For image reposting: cap cached URLs per author, never repost from a message that was subsequently deleted (deletion is a strong signal), and apply the NSFW and blocklist checks to the destination as well as the origin. **All four shipped in M11b**, and the lesson worth keeping is that three of them were blocked on a key layout rather than on a check: with the cache keyed by URL alone there was nothing to attribute and no way to ask what a deleted message had contributed, so the mitigation could be specified and not built for two milestones (A7).
+1. **One gate, two directions.** `CheckLearn` inside the learner, `CheckEmit` inside the guard,
+   sharing one normalizer and one ruleset. On rejection, silence.
+2. **Reject, never launder, on the learning path.** Replacement is for display only.
+3. **Normalize before matching.** NFKC, strip zero-width characters and combining marks, fold
+   homoglyphs, collapse repeats and intra-word separators. Patterns must not re-enumerate what the
+   normalizer removes.
+4. **Author diversity gates generation, as a filter rather than a penalty.** A penalty can be
+   out-repeated; a filter cannot. It never relaxes when it empties the candidate set.
+5. **The blocklist is data, not source.** `PEREGRINE_BLOCKLIST_PATH`; the real file is gitignored.
+   Committing it would make the repo a searchable slur list and turn every addition into a public
+   diff. It fails closed: missing, unreadable, malformed or empty is a startup error. Keep `illegal`
+   narrow, because every entry pages a human.
+6. **Operator controls.** `PEREGRINE_PAUSE_ALL_WRITES` mutes every send process-wide. Every
+   rejection is logged. `-clean-db` and `-purge-author` repair a corpus after the fact.
+7. **No mentions, ever.** The guard sends an explicit empty allowed-mentions object on every call,
+   because a learned mention is a corpus token the chain will emit again.
 
 ### 4.3 A policy decision worth arguing with
 
-The character-class filter permits only `unicode.Latin`, so any predominantly Cyrillic, CJK or Arabic message is dropped as spam at the 0.80 ratio threshold. That is recorded here rather than left buried in a helper because it is a real policy with a real cost: it excludes non-Latin-script participants from the corpus entirely. It also, accidentally, blocks whole-message homoglyph attacks. Keep it, change it, or narrow it, but do so deliberately.
+The character-class filter permits only `unicode.Latin`, so a predominantly Cyrillic, CJK or Arabic
+message is dropped as spam at the 0.80 threshold. That excludes non-Latin-script participants from
+the corpus entirely, and incidentally blocks whole-message homoglyph attacks. Keep it, change it or
+narrow it, but deliberately.
 
 ---
 
-## 5. The Generation Pipeline
+## 5. Generation
 
-`internal/markov` owns the probability model, the heuristics, the sampler, seed selection, the length model and the persona layer. §5.1 is history as of M7b; §5.2 describes what shipped.
+`internal/markov` owns the probability model, the heuristics, the sampler, seed selection, the
+length model and the persona.
 
-### 5.1 What was wrong
+### 5.1 Why this model
 
-**Fixed in M7a.** The unnormalized multiplicative scoring, the `Creativity` exponent, the unweighted prefix-shrink backoff, the `"<END>"` branch and its character-length guard, the first-candidate jitter, the three punctuation stubs, the per-candidate roast-vocabulary map, and the short-token blindness in topic gravity.
+`log P(next | prefix)` from **interpolated Kneser-Ney**, plus bounded additive logits for every
+heuristic, then temperature and top-k/top-p sampling.
 
-**Fixed in M7b.** The three competing length mechanisms, the globally shared conversation memory, the two overlapping persona mechanisms, and the all-pairs co-occurrence loop. Also the two dead concept-cluster tiers in seed selection, replaced by a bounded two-hop expansion rather than by a rebuilt cluster bucket (finding 29).
+KN fits because the corpus is small and sparse: at order 5 nearly every 4-gram has count 1, and
+backoff over counts that are almost all 1 is close to arbitrary. Absolute discounting is built for
+that.
 
-The original findings are kept below because each names the failure mode that motivated the replacement.
-
-**The engine is less random than it looks.** Candidate scores begin as raw n-gram counts and are multiplied by an unbounded topic-gravity term and roughly a dozen further ad-hoc factors, with no normalization, then raised to a power. Scores span orders of magnitude and one candidate almost always dominates: the sampler is effectively argmax with noise. For a bot whose purpose is chaos this is the worst available failure, and it hides well because output still varies slightly.
-
-**`Creativity` inverts its own name.** Applied as an exponent of `1/(Creativity+0.01)`, so at the 0.75 default the exponent is 1.316, which sharpens rather than flattens. Raising it toward 1 approaches an exponent of 1.0 and never passes it, so the dial cannot reach the interesting half of its range.
-
-**Backoff carries no weight.** The prefix-shrink loop takes the first non-empty result from the longest prefix, so a 4-gram and a bigram continuation are scored on the same scale.
-
-**Dead and incoherent scoring.** A first-candidate bonus of 1.0 to 1.05 applied to whichever candidate Go's randomized map iteration happened to yield first. A branch comparing against `"<END>"` when the only sentinel produced is `"<end>"`, guarded by a character-length check on a word-joined string. Three hollow "removed as punctuation is no longer desired" comment stubs. A 14-entry roast-vocabulary map rebuilt, with 14 lowercase conversions, per candidate per step.
-
-**Length is tuned for prose, not chat.** `30 + rand(15)` words is a paragraph, governed by three competing mechanisms: an end-token multiplier, a discard-and-retry, and the loop bound.
-
-**Context bleeds across channels.** One 50-entry decayed conversation memory is shared by every channel in every guild, so a reply is steered by an unrelated conversation elsewhere. That is not chaos, it is wrong context, and it makes replies read as non-sequiturs to the thread they are in.
-
-**Repetition control is triplicated** across a used-word map, a generated-n-gram set and an immediate-repetition scan.
-
-**Topic gravity ignores short tokens.** Topic counts skip words under 3 characters, so "ok", "no" and "wtf" always score zero.
-
-### 5.2 The model, as shipped in M7a
-
-`log P(next | prefix)` from **interpolated Kneser-Ney**, plus additive logits for every heuristic, then temperature and top-k/top-p sampling.
-
-Three implementation decisions are worth recording here because none is obvious from the formula.
-
-**Additive logits are the point, not a stylistic choice.** Addition in log space multiplies a candidate's probability by a *bounded* factor: a weight of 0.7 roughly doubles its odds, and it does so regardless of how large or small the base probability was. The old multiplicative form had no such property, which is exactly how one unbounded topic term could and did swamp the model. Every heuristic that sums over evidence is squashed with `tanh` so it cannot exceed its own weight however much evidence piles on, and a test asserts the total against the sum of the positive weights.
-
-**Candidate enumeration is bounded and the bias is stated.** Textbook interpolated KN assigns mass to the whole vocabulary through the recursion, which is neither affordable nor wanted: generating a word that never followed anything resembling this context is noise, not chaos. Candidates come from the longest context that has any, extended one order down at a time only while the set is below a floor of 5, with a per-order cap and a total cap. The floor does real work rather than guarding an edge case: at order 5 nearly every 4-gram has count 1, so without it the longest context usually offers exactly one continuation and the step is deterministic no matter what the sampler does. That was a large part of why the old engine felt canned. The caps select by count, which biases enumeration toward frequency; that is acceptable because top-k truncates at 40 anyway and because frequency bias runs with this bot's register rather than against it.
-
-**`c(prefix, .)` is a cursor scan, not a counter.** It is the normalizer of the discounted term and it is needed at *every* order, including the single-word context. `Reader.PrefixTotal` sums it with a zero-allocation sequential scan; the alternative, an unconditional read and write of `kn_succ` on every n-gram of every message, is about twenty percent more steady-state write work inside bbolt's single write transaction, which serializes all ingestion. Trading a bounded read-path scan for that is the right direction: the reader is a human waiting for a reply, and the writer is background ingestion. Distinct successors stay a stored point lookup, because unlike the total they cannot be derived without visiting every key anyway.
-
-**The author-diversity gate is a filter, not a logit.** A penalty is something a determined poisoner can out-repeat; a filter is not. When it empties the candidate set the step becomes a dead end and the sentence ends early, and it deliberately does not relax: a safety control that yields the moment it has an effect is not a control. The end sentinel is exempt, because gating it would mean a sentence cannot end until several people happened to end a message the same way, which is a length bug wearing a safety hat.
-
-**Seed selection is seven weighted tiers, and the two-hop tier is what replaced concept clusters.** The direct tiers read the co-occurrence indexes, which answer "what appears near X". Only a second hop answers "what appears near something that appears near X", and that transitive reach was the one thing clusters genuinely offered. It is one bounded query-time expansion now: at most six first-hop associations per source and four per second hop, each requiring at least two recorded co-occurrences, weight decayed per hop, every candidate required to have continuations. Never stale, no bucket, no codec, and a weight the golden samples can judge. It enters at 6.0, below every direct-association tier, because a transitive claim is a weaker claim; the cluster tier it replaces fired at 50.0, twice the next tier (finding 29).
-
-**One length model, three regimes.** A target is sampled once per sentence between `MIN_WORDS` and `MAX_WORDS`, skewed short with a squared uniform so the mode sits at the floor and the tail still reaches the cap. Below the floor the end token takes a hard penalty, easing linearly to zero at the target; past the target it takes a growing bonus, capped, so a sentence that has outstayed its welcome ends on its own rather than only at the hard cap. That replaces an end-token multiplier, a discard-and-retry and a loop bound that all had an opinion.
-
-The penalty is finite rather than negative infinity on purpose: a context whose only continuation is the sentinel must still be able to end.
-
-**Under two words the bot stays silent.** A seed drawn from a non-prompt tier can dead-end on its first step, because the length floor is a logit penalty and a penalty does nothing when no candidate is eligible at all. The caller re-seeds up to three times and keeps the longest attempt; below two words it posts nothing. A one-word reply is not punchy, it is a reply that looks broken, and silence is the safe default this bot already uses when the emit gate refuses. This was found by reading golden samples, not by reasoning, which is what the harness is for.
-
-**The persona is one mechanism.** A `Persona` selects both an in-sampler lexicon bias and the post-pass filler, so "how roast-y is this reply" is decided once. Previously the sampler bias and `applyEdgyStyle` were independent coin flips that could disagree. The post-pass picks its insertion point from a triangular draw concentrated on the middle of the sentence, where the old code used a flat draw over the interior: at the edges an interjection reads as a typo.
-
-**Conversation memory is per channel**, in a map bounded at 200 channels with oldest-touched eviction. One shared memory meant a reply here was steered by an unrelated conversation elsewhere, which is not chaos but simply wrong context. The bound is new and necessary: an unbounded map keyed by channel ID is a slow leak that no test using one channel would ever reveal.
-
-**Co-occurrence is windowed on the learn path.** Default 5, and 0 restores all-pairs. This is a model change as much as a cost fix: "co-occurs anywhere in the same message" gets weaker as messages get longer, because a long message links every word to every other, and proximity is what association actually means. The cost half matters because the loop runs inside the single write transaction that serializes all ingestion, where a 200-word message was nearly 40,000 read-add-writes.
-
-KN is the right model here because the corpus is small and sparse: a server's chat is on the order of 10^5 to 10^6 tokens, so at order 5 nearly every 4-gram has count 1, and stupid backoff over counts that are almost all 1 is close to arbitrary. Absolute discounting is built for exactly this.
-
-**The deliberate deviation from textbook KN.** KN estimates lower orders from *continuation counts*: the number of distinct contexts a token follows. That correctly demotes a token like "Francisco", frequent but nearly always preceded by "San". The problem is that a meme, a copypasta and an inside joke are statistically indistinguishable from "Francisco": high frequency, few distinct contexts. Pure KN would systematically suppress exactly the register this server runs on. So:
+**The deliberate deviation from textbook KN.** KN estimates lower orders from continuation counts,
+which correctly demotes "Francisco" (frequent, nearly always after "San"). A meme, a copypasta and an
+inside joke look statistically identical to "Francisco", so pure KN would suppress exactly this
+server's register:
 
 ```
 P_low = (1 - mu) * P_kn_continuation + mu * P_raw
 ```
 
-`PEREGRINE_KN_RAW_MIX` is `mu`. `0.0` is textbook KN and maximizes conventional quality; `1.0` is raw counts; `0.25` leans to KN while keeping the memes. **Pure KN optimizes perplexity; peregrine optimizes for landing a joke.** Anyone setting this to 0 on the authority of a paper is making output worse by the only metric that matters here.
+`PEREGRINE_KN_RAW_MIX` is `mu`: 0 is textbook KN, 1 is raw counts, 0.25 leans KN and keeps the
+memes. Pure KN optimizes perplexity; peregrine optimizes for landing a joke.
 
-Single-discount interpolated KN first. Modified KN (separate discounts for counts 1, 2 and 3+) is a further gain on sparse data and is a later option, not a first attempt.
+### 5.2 The model
 
-KN replaces the **probability model only**. Persona bias, topic gravity and the repetition penalty remain, as additive logits with documented ranges, which is what normalization makes possible.
+**Additive logits.** Addition in log space multiplies a candidate's odds by a bounded factor
+whatever its base probability. Every heuristic that sums evidence is `tanh`-squashed to its own
+weight, and a test bounds the total by the sum of the positive weights.
+
+**Bounded enumeration.** Candidates come from the longest context that has any, extended one order
+down while the set is below a floor, with per-order and total caps. The floor matters: at high
+orders nearly every context has one continuation, and without it the step is deterministic.
+
+**`c(prefix, .)` is a scan, not a counter.** `Reader.PrefixTotal` is a memoized zero-allocation
+cursor scan. A stored counter would add work inside the single write transaction that serializes
+ingestion; the reader is a human waiting, the writer is background work.
+
+**The author gate is a filter** (§4.2). The end sentinel is exempt, or a sentence could not end
+until several people ended a message the same way.
+
+**Continuity.** A logit rewards candidates that continue more of the matched context, which keeps
+walks off stranded bigram runs.
+
+**Seeds are seven weighted tiers**: prompt n-grams, names, direct associations, and a bounded
+two-hop association tier for transitive reach ("near something near X"), weighted below every direct
+tier. Every candidate must have continuations, and a lone function word is never a seed.
+
+**One length model.** A target is sampled per sentence between `MIN_WORDS` and `MAX_WORDS`, skewed
+short. Below the floor the end token takes a finite penalty easing to zero at the target; past it, a
+capped bonus. Under two words the bot re-seeds up to three times and otherwise stays silent: a
+one-word reply looks broken.
+
+**Jumps** recover a dead end at most once per sentence, never past `Length.Min` and never after a
+function word.
+
+**One persona** drives both the in-sampler lexicon bias and the post-pass filler, which goes only at
+the start or end of a reply: in the middle it reads as a typo.
+
+**Context.** Only the prompt may seed; the reply chain, channel topics and recalled names may only
+steer. Conversation memory is per channel and bounded at 200 channels. Co-occurrence is windowed on
+the learn path (default 5), because proximity is what association means and all-pairs on a long
+message is tens of thousands of writes in the single writer.
 
 ### 5.3 Knobs
 
-| Variable | Meaning | Default | Live |
-|---|---|---|---|
-| `PEREGRINE_TEMPERATURE` | `logit/T`. Higher is more chaotic, and unlike `Creativity` it can actually exceed 1. Range 0 to 10; 0 is argmax | 1.0 | M7a |
-| `PEREGRINE_TOP_K` | Truncate the candidate tail before sampling. 0 disables | 40 | M7a |
-| `PEREGRINE_TOP_P` | Nucleus threshold, applied after top-k | 0.95 | M7a |
-| `PEREGRINE_KN_DISCOUNT` | KN absolute discount `D`. Must stay below 1, or every count-1 continuation is erased and in this corpus that is nearly all of them | 0.75 | M7a |
-| `PEREGRINE_KN_RAW_MIX` | `mu`, per §5.2 | 0.25 | M7a |
-| `PEREGRINE_MIN_DISTINCT_AUTHORS` | Generation eligibility, per §4.2. 0 disables | 2 | M7a |
-| `PEREGRINE_PROMPT_RELEVANCE_BOOST` | Logit added to a candidate that appears in the prompt. **Units changed in M7a** and the range narrowed to 0 to 5 | 0.6 | M2, rescaled M7a |
-| `PEREGRINE_MAX_NGRAM` | Highest order. Minimum 2, per §3.1 | 5 | M2 |
-| `PEREGRINE_MIN_WORDS` | Length floor. Under two words the bot stays silent regardless | 4 | M7b |
-| `PEREGRINE_MAX_WORDS` | Length cap. Short lands, long reads as malfunction | 18 | M7b |
-| `PEREGRINE_COOCCURRENCE_WINDOW` | Bounds co-occurrence on the learn path. 0 means unbounded | 5 | M7b |
-| `PEREGRINE_ROAST_CHANCE` | Probability a direct mention gets the roast persona | 0.10 | M7b |
+| Variable | Meaning | Default |
+|---|---|---|
+| `PEREGRINE_TEMPERATURE` | `logit/T`. Range 0 to 10; 0 is argmax | 1.0 |
+| `PEREGRINE_TOP_K` | Truncate the tail before sampling. 0 disables | 40 |
+| `PEREGRINE_TOP_P` | Nucleus threshold, after top-k | 0.95 |
+| `PEREGRINE_KN_DISCOUNT` | KN discount `D`; must stay below 1 or count-1 continuations vanish | 0.75 |
+| `PEREGRINE_KN_RAW_MIX` | `mu`, per §5.1 | 0.25 |
+| `PEREGRINE_MIN_DISTINCT_AUTHORS` | Generation eligibility, per §4. 0 disables | 2 |
+| `PEREGRINE_SOLO_REPEAT_LIMIT` | One-author allowance, per §4 A6. 0 is the strict gate | 2 |
+| `PEREGRINE_PROMPT_RELEVANCE_BOOST` | Logit for a candidate in the prompt. Range 0 to 5 | 0.6 |
+| `PEREGRINE_MAX_NGRAM` | Highest order. Minimum 2 | 5 |
+| `PEREGRINE_MIN_WORDS` | Length floor | 4 |
+| `PEREGRINE_MAX_WORDS` | Length cap. Short lands, long reads as malfunction | 18 |
+| `PEREGRINE_COOCCURRENCE_WINDOW` | Co-occurrence window on learn. 0 is unbounded | 5 |
+| `PEREGRINE_ROAST_CHANCE` | Probability a direct mention gets the roast persona | 0.10 |
 
-**One variable was rescaled rather than renamed, and that was the safer choice.** `PEREGRINE_PROMPT_RELEVANCE_BOOST` used to be added to an unnormalized score measured in raw n-gram counts, so its default was 15.0. As a logit, 15.0 multiplies a candidate's odds by three million and makes echoing the prompt the only thing the bot does. Keeping the name and narrowing the validated range to 0 to 5 means a stale value is a **startup error naming the range**; renaming the variable would instead have let the old value silently stop being read, which is the failure mode this whole section is written against.
+**The logit weights are deliberately not variables.** They are only meaningful relative to each
+other and an operator has no instrument to judge them. They live in `markov.DefaultWeights`, tuned
+by reading golden samples and `tools/replay`.
 
-**The thirteen logit weights are deliberately not variables.** They are only meaningful relative to each other, an operator has no instrument to judge them, and the rule here is that a knob nobody can reason about is worse than no knob. They live in one `markov.Weights` struct with documented ranges, tuned by reading golden samples. The previous arrangement had the same numbers scattered across ninety lines of one function as bare multipliers, which is the actual problem being solved.
+**When a variable's units change, the name stays and the range narrows**, so a stale value is a
+startup error naming the range rather than silently reinterpreted.
 
-Top-k and top-p are what keep a high temperature *surprising* rather than word salad: truncate the tail, then sample the surviving head hot.
-
-**Repetition is deliberately not penalized hard.** Memetic repetition (copypasta cadence, a doubled emote, "ratio ratio ratio") is the desired register. The penalty should suppress stuttering artifacts without flattening intentional-looking repetition. Settle this against golden samples, not in the abstract.
-
-**Two variables are deleted, not ported.** `ContextWindow` and `CoherencyBalance` were declared and never read. They get no env var, because a documented knob wired to nothing is worse than no knob: an operator turns it during an incident and concludes the bot is broken. Recorded here so nobody "restores" them. When a real coherence-versus-novelty dial exists, it gets a variable in the same change as the code that reads it.
-
-**A third was deliberately a constant until M7a, and is now gone.** M2 promoted every other tuning constant to an environment variable but left `Creativity` in the code, and that was not an oversight. Its arithmetic contradicted its name: applied as an exponent of `1/(Creativity+0.01)`, raising it toward 1 could only approach an exponent of 1.0 and never pass it, so the knob could not reach the half of its own range that would add chaos. Exposing it would have invited an operator to tune something broken and conclude the bot ignores configuration, which is the same failure the two deletions above avoid. `PEREGRINE_TEMPERATURE` replaced it in M7a, in the same change that normalized the scoring so the dial actually moves. There is deliberately no `PEREGRINE_CREATIVITY` and there never was.
-
-**Every variable that later milestones will read is documented in `.env.example` and warned about at startup.** Setting one today does nothing, and silence about that is indistinguishable from the bot ignoring its own documentation, so `config.DeferredSet` logs one warning naming each such variable and the milestone that starts reading it. The list is a map in `internal/config`, and `TestDeferredVarsAreNotAlsoLive` fails if an entry is left behind after its milestone lands, which is the mistake the mechanism invites.
+**Repetition is deliberately not penalized hard.** Copypasta cadence and "ratio ratio ratio" are
+the register. The penalty suppresses stutter and reaches a cap.
 
 ### 5.4 Verification
 
-Generation quality cannot be settled by assertions alone. `TestGenerateGolden` loads a small fixed corpus and generates with a seeded source across a sweep of temperature and top-k, printing output so before-and-after is directly comparable and the chaos dials are tuned by reading rather than guessing:
+`TestGenerateGolden` generates from a fixed corpus with a seeded source across a sweep of
+temperature and top-k, printing output so before and after are directly comparable:
 
 ```sh
 go test ./internal/markov/ -run TestGenerateGolden -v
 ```
 
-Reproducibility is what makes it an instrument rather than a curiosity: if the same seed produced different text twice, no printed difference could be attributed to a weight. `markov.Source` is a parameter for that reason, and `DefaultSource` is stateless so production still has no shared generator to race on.
+`markov.Source` is a parameter so the same seed always gives the same text. Assertions pin the
+mechanics: KN sums to one; backoff prefers the higher order; temperature raises entropy
+monotonically; top-k and top-p always leave a survivor; the author gate refuses a phrase one author
+repeated 500 times; heuristics stay under their weights; length skews short; no sentinel or
+separator leaks. The fake corpus is Go maps, and an external test package re-checks the same
+properties against real bbolt.
 
-Assertions pin the mechanics, and these exist as of M7a: interpolated Kneser-Ney sums to one, which is the test that catches a wrong lambda and the only one that would; backoff prefers the higher order when both have mass, with the fixture built so raw frequency points the other way; an unseen context is a no-op rather than a perturbation; `mu` moves the base case in the direction its comment claims; temperature raises entropy monotonically and can reach a genuinely flat distribution, which is what `Creativity` could not do; top-k and top-p truncate and always leave at least one survivor; equal logits do not resolve by slice position; extreme logits do not overflow to NaN; the author gate refuses a phrase one author repeated 500 times and admits one two authors said; heuristics stay under the sum of their own weights under piled-up evidence; the repetition penalty reaches a cap so memetic repetition survives; length skews short; emote shortcodes survive to the output; and no sentinel or key separator ever leaks.
+On real text, `tools/replay` replays production prompts against a corpus snapshot and reports
+attested n-gram rates, recitation and prompt reuse. Average several seeds before believing a small
+difference.
 
-M7b adds: a prompt n-gram wins the seed draw over the association tiers; the two-hop tier reaches a word that is two association hops away and zero direct hops, which is the pin for what replaced clusters; it refuses a candidate with no continuations and refuses to follow a single co-occurrence; the seed draw is reproducible under a seeded source; the length target stays in range and skews below the midpoint while its tail still reaches the cap; the end logit has three regimes and its late bonus is capped; sentences end before the hard cap more often than not; the persona post-pass never drops a word, respects its chance dial, and inserts toward the middle rather than the edges; the co-occurrence window records adjacent words, refuses distant ones, keeps both directions, and treats 0 as unbounded; and conversation memory is isolated per channel and bounded with the current channel surviving eviction.
+### 5.5 The output bar
 
-Verified by **reverting the fix and watching the test fail** rather than by assuming: the lambda computation, the author-diversity filter, the co-occurrence window, and the per-channel memory. One more pins wiring rather than behavior, because `Config` to `markov.Params` is a dozen assignments of two types and a transposition would compile and pass everything else.
+§1 principle 7 is the standard. Checked against the golden samples:
 
-One caveat worth stating about the fixtures: three separate tests had to be corrected because they passed or failed for the wrong reason (a fallback that happened to return the expected token, a zero `MaxWords` capping every sentence at one word, a lexicographically-first prefix standing in for a two-hop hit). A test that is green for the wrong reason is worse than no test, so the fixtures carry comments saying what they had to be built to exclude.
+1. **Length.** A median of 4 to 12 words.
+2. **In register.** Reads as somebody in this server typing.
+3. **Grasps the data.** No dangling function word, jump seam, misplaced filler or leaked sentinel.
+4. **Involves people.** When the prompt names somebody, about one reply in three engages them
+   (`TestSeedDrawsTheNameOftenEnoughToNotice`).
+5. **Recombines rather than recites.** No reply reproduces a five-word span of one fixture message
+   (`TestGoldenSamplesAreNotRecitation`). Four-word matches are logged, not failed: short idioms
+   exist verbatim because several people typed them.
+6. **Spans sources.** A reply's bigrams are not all traceable to one message
+   (`TestGoldenSamplesSpanSources`).
+7. **Responds to its prompt.** A reply is more about the person its prompt named than anybody else,
+   and at least a third of replies to a named prompt engage that person
+   (`TestGoldenSamplesRespondToTheirPrompt`).
+8. **Does not collapse to one phrase** (`TestGoldenSamplesDoNotCollapseToOnePhrase`).
 
-The fake corpus is Go maps, and a separate external test package re-checks the same properties against real bbolt. That pairing is deliberate: a fake that diverges from the writer gives a green suite over a model that does not match the corpus the bot actually has.
+Criteria 7 and 8 are a pair: every context signal pulls toward the conversation, and the limit of
+that is a bot that says the same thing every time.
 
-### 5.5 The output bar, and how it is judged
-
-§1 principle 7 states the standard. This is how it is checked, and it is six criteria against the printed golden samples: the first four by eye, the last two by assertion.
-
-1. **Length.** 4 to 12 words for the median. Under 4 reads broken; a long tail is fine, and `PEREGRINE_MAX_WORDS` is the hard limit rather than anything here.
-2. **In register.** Reads as somebody in this server typing, not as a model completing a sentence.
-3. **Grasps the data.** No artifacts: no dangling function word, no jump seam, no filler splitting a construction, no sentinel or separator leaking.
-4. **Incorporates people.** When the prompt names somebody, roughly one reply in three engages with that person, by naming them or by using vocabulary the corpus ties to them. Measured directly by `TestSeedDrawsTheNameOftenEnoughToNotice`.
-5. **Recombines rather than recites.** `TestGoldenSamplesAreNotRecitation`: no generated sentence may reproduce a five-word-or-longer span of a single fixture message.
-6. **Spans sources.** `TestGoldenSamplesSpanSources`: a sentence's bigrams must not all be traceable to one source message. Recitation with one word changed passes criterion 5 and fails this.
-7. **Responds to its prompt.** `TestGoldenSamplesRespondToTheirPrompt`, in two halves. A reply must be more about the person its prompt named than about anybody else (a ratio, discriminative rather than absolute), AND at least a third of replies to a named prompt must actually engage that person. The second half exists because the first has a blind spot: a reply that says nothing about anybody contributes to neither side of a ratio, so a bot that went quiet would score perfectly.
-8. **Does not collapse to one phrase.** `TestGoldenSamplesDoNotCollapseToOnePhrase`, also in two halves: no content trigram may dominate a share of all replies or appear in answers to nearly every prompt, and the draws within one prompt and configuration must not all be identical.
-
-**Criteria 7 and 8 are a matched pair: one measures what context work adds, the other measures what it risks.** Every context signal pulls a reply toward the conversation, and the limit of that process is a bot that says the same thing every time because one phrase sits at the centre of the corpus. Before M19 nothing could fail when either happened. Criterion 4 was pinned only by `TestSeedDrawsTheNameOftenEnoughToNotice`, which measures the SEED draw and says nothing about a finished reply, and variety was not measured at all.
-
-**Both were set from a measurement and both are discriminative where they can be.** Criterion 7 compares a reply against the person its prompt named versus the four it did not, using only vocabulary that actually distinguishes them, because an absolute overlap threshold is satisfied by a topically narrow fixture and would measure ECHO rather than aboutness. That distinction matters: `text.Similarity` was deleted in M16 and reviving it here would reward a reply for parroting the prompt back, which is the failure mode next door.
-
-**Criteria 5 and 6 exist because nothing else in the suite can fail when the engine gets worse in this particular direction.** A recited sentence is grammatical, in register, the right length, and passes every other assertion. Every heuristic in the scorer pushes the output toward its sources, and the limit of that process is a bot that quotes the corpus back, which reads well and is not funny.
-
-**The threshold on criterion 5 came from a measurement, and the way it was set is the point.** It was first written against four-word spans, where the rate was 30% and looked alarming. Breaking that number down by span length showed 38 matches at exactly four words and **zero** at five or more: the engine was never reproducing a distinctive sentence, it was emitting short idioms that exist verbatim because several people typed them. "the server is doomed" is a four-word phrase the server genuinely says, and a bot producing one is doing its job. So the four-word rate was measuring the register and calling it a defect. It is still logged, because it is the number that moves first if a future weight pushes the engine toward its sources.
-
-**The harness transcript has its own exclusion, for the same reason.** The conversation memory the harness feeds generation uses only bridge vocabulary and never a word from `distinctiveWords`. The first draft did not, and raising `RecentContext` then appeared to improve criterion 7 when it was really improving the overlap between two parts of the instrument. An instrument has to be built to exclude the thing it is trying to measure.
-
-**The fixture is part of the instrument and has its own rule: shared idioms inside different sentences, never shared sentences.** The author-diversity gate admits a continuation only once two people have produced it, so a fixture must contain genuine agreement. The first version produced that agreement by giving two authors near-identical messages, which made the only admissible paths whole messages: the engine could not do anything but recite, and the metric was measuring the fixture. Real chat agrees by sharing short idioms embedded in otherwise different sentences, and that is what makes a corpus recombinable at all. Memes are the deliberate exception and stay verbatim, because that is how they are really typed.
+The fixture is part of the instrument: **shared idioms inside different sentences, never shared
+sentences.** The author gate needs genuine agreement, and agreement built from near-identical
+messages leaves recitation as the only admissible path.
 
 ---
 
-## 6. Engagement Features
+## 6. Engagement features
 
-These are the product. None are stripped. Each becomes a plugin with its bugs fixed and its magic numbers promoted to config. The common theme is that most are currently either dark or subtly broken, so the engagement surface the bot is supposed to have is not actually running.
+These are the product.
 
-- **Custom emotes.** The `:shortcode:` resolver walks `s.State.Guilds`, but the session never requests `IntentsGuilds`, so that slice is always empty and **the resolver has never once succeeded**. The bot has never spoken in the server's own emotes, which in a meme server is most of the register. Probably the largest single register improvement available. The same missing intent forces the NSFW check into a REST call on every message.
-- **Word games.** Disabled by a compile-time constant, and the dictionary load was `log.Fatalf`, so a missing 64 KB word list killed the whole bot. Now embedded via `go:embed` with a non-fatal load. Remaining: three orphan `go func` plus `Sleep` timers that fire against a closed session after shutdown, unbounded `scramble` recursion on an all-identical-letters word, and a 2-minute interval default that is plainly a leftover test value. The chat leaderboard reads the stats bucket and stays available independently of the scramble game.
-- **Bird aggro.** Works, but has no dials. Chance, duration, tick and emote became config in M2, and the six-hour target window in M11b. Its target selection cost hundreds of REST calls per tick until M11b put it on the activity tracker; the consequence is that it now targets only people the bot has seen since startup, which is the right set.
-- **Image reposting.** The cheapest chaos in the bot, throttled to 1 to 1.5% with hardcoded rates. Rates and cache size became config in M2; the per-author cap, the deleted-message rule and the destination checks landed in M11b (§4, A7).
-- **Autonomous posting.** Dead three times over: the compile-time constant was false, the channel allowlist was empty, and the loop was gated on the word-game flag (finding 30). All three are fixed, and choosing a channel no longer costs a REST call.
-
-  **The flag still defaults to false, and that is the decision rather than an omission.** `Load` refuses `ENABLE_AUTONOMOUS_POST=true` with an empty `AUTONOMOUS_POST_CHANNELS`, so a `true` default would fail startup for every deployment that has not named channels, and the alternative reading of an empty list, "anywhere", is precisely the silence that cross-check exists to prevent. There is no safe default for "where may the bot speak unprompted": that is the operator's sentence to write. What the milestones owed was that the feature works when they write it, which is true as of M11a and free as of M11b.
-- **The roast persona** lives in two places at two layers: an in-sampler vocabulary boost and a post-hoc filler injector, overlapping in intent, neither testable. Consolidated into one persona layer with a configurable logit bias plus a post-pass whose insertion points are position-weighted rather than a raw random index. Same chaos, deliberate instead of accidental.
+- **Replies.** The `chat` reactor is a table of steps; only commands consume a message. A command
+  matches the whole trimmed message, so a reply that happens to start with one is still a reply.
+- **Custom emotes.** `:shortcode:` resolves against the guilds in the state cache.
+- **Games.** Word scrambles with a hint ladder and gauntlets, and the wheel, all under `/game`.
+  `/leaderboard` and `/wallet` stand alone. Engines do no I/O; the service
+  sends through the guard.
+- **Bird aggro.** Targets someone the bot has seen speak recently, from the activity tracker.
+- **Image reposting.** Cheap chaos at a low rate, under §4 A7's controls.
+- **Autonomous posting.** Off by default, and `true` with no channel list is a startup error:
+  where the bot may speak unprompted is the operator's sentence to write.
+- **The roast persona.** One persona layer, §5.2.
 
 ---
 
 ## 7. Lifecycle
 
-**Shipped in M3.** What follows is the shape as built; the bugs it replaced are recorded because the shape is only defensible against them.
+`core.Dispatcher` owns a bounded worker pool. The gateway handler rejects bots and enqueues without
+blocking: discordgo dispatches each event on its own goroutine, so blocking would grow goroutines
+without bound, and dropping with a counter is the honest semantics for best-effort chat. Drops
+surface in the health report and the status line. **The queue is never closed**, so an in-flight
+enqueue cannot panic; shutdown sets a flag, drains to a deadline, cancels the workers and waits.
 
-The per-message handler called `wg.Add(1)` on the same WaitGroup the shutdown path waited on, which panics when an `Add` races a `Wait` at zero, and let handlers keep using the database after it closed. `main()` launched nine background goroutines, six of them hand-rolled tickers, each selecting on a package-level `stopSignal` channel, and a panic in any of them killed the process. One shared `*rand.Rand` was called from all of them and from every message goroutine.
+`core.RunLoop` runs background work: panic-isolated, context-bound, with `Immediate` for the loops
+wanted at startup. There is no shared `*rand.Rand`; `math/rand/v2`'s top-level functions are safe.
 
-`core.Dispatcher` owns a bounded worker pool reading a buffered channel. The gateway handler rejects bots and enqueues non-blocking. Non-blocking is deliberate: discordgo dispatches each event on its own goroutine, so blocking would grow goroutines without bound, and dropping with a counter is the honest semantics for best-effort chat. The drop count is reported on shutdown and surfaces in the status line.
+Startup: open the corpus, build the session, sync the application (`core.SyncApplication`: install
+permissions and the Message Content intent), `InitAll`, arm `WatchReady`, `Open`, wait for READY,
+start the dispatcher, `StartAll`. `WatchReady` is armed before `Open` because discordgo dispatches
+inside `Open`, and gateway handlers register in `Init` for the same reason. `Open` returning nil
+only means identify was sent; waiting for READY turns a rejected identify (4014) into a startup
+error.
 
-**The queue is never closed**, because closing it would let an in-flight enqueue panic on send. Shutdown sets a flag, drains until empty or a deadline, cancels the workers' own context, then waits on a WaitGroup that is only ever `Add`ed during `Start`, so the race cannot recur by construction. The dispatcher owns that cancel rather than relying on the context passed to `Start`: a `Shutdown` that could only wait for someone else to cancel would block for its entire deadline every time, which is exactly what it did in the first draft and what its tests caught.
-
-`core.RunLoop` replaces the tickers, which become a table of `core.Loop` values that reads as a list of behaviors. Each iteration is panic-isolated, because every one of those loops is an optional behavior and this bot's rule is that one feature failing disables that feature and nothing else. `Immediate` preserves the real distinction the copies made by hand and inconsistently: the status line and the backfill are wanted at startup, whereas a leaderboard reset check on a fresh process is pure noise. A non-positive interval is refused with a log line naming the loop rather than panicking inside `time.NewTicker`.
-
-There is no shared `*rand.Rand`. `math/rand/v2`'s top-level functions are goroutine-safe and auto-seeded, so the fix was to have no shared generator rather than to put a mutex around one.
-
-Shutdown order, which differed from the old code in four ways:
+Shutdown:
 
 ```
-1. session.Close()        first, not last: stop the inflow before draining
+1. session.Close()        stop the inflow before draining
 2. dispatcher.Shutdown()  bounded drain
-3. registry.ShutdownAll() reverse start order; loops stop and are waited for
-4. store.Close()          explicit and last, via cmd/bot, not a bare defer
-                          racing the per-message goroutines
+3. registry.ShutdownAll() reverse registration order
+4. store.Close()          last
 ```
 
-The final leaderboard save is the legacy service's `Shutdown`, so it lands inside step 3 and therefore strictly before the store closes. One 8-second budget covers steps 2 and 3 together, deliberately under Docker's 10 seconds between SIGTERM and SIGKILL: separate timeouts per step could add past it, and the corpus being closed by SIGKILL rather than by us is the outcome worth engineering against.
-
-Startup order has two placements that are load-bearing rather than stylistic. `WatchReady` is armed **before** `Open`, because discordgo starts dispatching inside `Open` and a handler registered after it can lose the race with READY, failing startup on a healthy connection. Gateway handlers are registered in `Init` rather than `Start`, because `Open` happens between them and registering in `Start` drops every message from that window.
-
-**As of M13 there are ten services**, registered in `cmd/bot`'s `registerServices` and nowhere else, because `internal/core` imports no feature package and cannot. The order in that list is behaviour: `Init` runs in registration order and `Shutdown` in reverse, so `chat` is registered after the features its steps call into (its `Init` arms the gateway handler and its `Start` resolves the bot's identity) and therefore stops before them, and `health` is last so its shutdown report is the final word in the log.
-
-Target: `core.Dispatcher` owns a bounded worker pool reading a buffered channel. The gateway handler does nothing but reject bots, snapshot the event into an immutable value (which also stops it mutating discordgo's struct) and enqueue non-blocking. Non-blocking is deliberate: discordgo dispatches each event on its own goroutine, so blocking would grow goroutines without bound, and dropping with a counter is the honest semantics for best-effort chat. The drop count surfaces in the status line so a persistently full queue is visible rather than inferred.
-
-**The queue is never closed**, because closing it would let an in-flight enqueue panic on send. Shutdown sets a flag, drains until empty or a deadline, then cancels the workers' context and waits on a WaitGroup that is only ever `Add`ed during startup, so the race cannot recur by construction.
-
-Shutdown order, which differs from today in four ways:
-
-```
-1. session.Close()        first, not last: stop the inflow before draining
-2. dispatcher.Shutdown()  bounded 10s drain
-3. registry.ShutdownAll() reverse start order
-4. final leaderboard save
-5. store.Close()          explicit and last, not a bare defer
-```
-
-Nine hand-rolled ticker goroutines become `core.RunLoop` calls owned by the relevant service. The orphan timers become context-bound handles the owning service stops.
+One 8 s budget covers steps 2 and 3, under Docker's 10 s between SIGTERM and SIGKILL. Services are
+registered only in `cmd/bot`'s `registerServices`, and the order is behaviour: `Init` in order,
+`Shutdown` in reverse, `chat` last.
 
 ---
 
-## 8. Refactor Targets
+## 8. Findings
 
-Verified against the source. Ranked by consequence. Numbers are referenced from code comments and from §9.
-
-**Crashes and hangs**
-
-1. ~~Nested bbolt transactions in the generation path can deadlock the process unrecoverably, and the odds rise as the file grows.~~ **Fixed in M6b, and made unwritable rather than fixed.** M6a built the `Reader`/`Writer` seam; M6b is the commit that puts the bot on it. `internal/legacy` no longer imports bbolt at all, so nothing in it can hold a handle, name a bucket, or start a transaction. The two functions that did the nesting now take the `*storage.Reader` they are already inside: `isRecognizedName`, called once per prompt word, and `getNextMap`, called once per candidate per backoff step per generated word, which was thousands of nested transactions per reply. `TestOnlyThisPackageReachesBbolt` pins the import, because the import is the exact invariant: without it the API is unreachable. It began in `internal/legacy` as `TestThisPackageCannotReachBbolt` and M11c moved it into `internal/storage` and widened it to the whole module, since there are eight packages above the seam now rather than one below it. §3.
-2. The vocabulary interner writes a global map and appends a global slice from every per-message goroutine. A concurrent map write is a Go `fatal error`: no recover, no unwind, process gone. Also an unbounded leak, never pruned.
-3. ~~One `*rand.Rand` shared across every message worker, the aggro ticker, autonomous posting and image reposting. Not goroutine-safe.~~ **Fixed in M3:** there is no shared generator at all now, `math/rand/v2` top-level functions being goroutine-safe and auto-seeded.
-4. ~~The shutdown WaitGroup race in §7.~~ **Fixed in M3.**
-
-**Correctness**
-
-5. ~~The empty-prefix unigram key.~~ **Fixed in M6b**, by three independent things rather than one: the ingestion loop descends to order 2 rather than 1, `storage.Writer.LearnNgram` refuses an empty prefix so a new caller cannot reintroduce it, and `PEREGRINE_MAX_NGRAM` validates a minimum of 2. Unigram frequency lives in the topic index, one key per word, which is where it always belonged. §3.1.
-6. ~~Self-learning stores the bot's reply under the *user's* message ID, and the user's message under the same ID, both gated by the same dedup check, so whichever transaction commits first makes the other a no-op and which one wins is a race.~~ **Closed in M10b:** the self-learn is keyed by the reply's own message ID, which `Guard.SendReply` returns.
-
-    Worth being clear that this was silent DATA LOSS rather than an inefficiency. One of the two messages was discarded on every single interaction the bot had, and which one depended on a goroutine race, so the corpus has been missing either user messages or bot replies at a rate of one per reply for the whole life of the bot. The pin asserts both bodies of text reach the corpus, and a companion test asserts the OLD behaviour (one shared ID loses one message) so the pin cannot pass for an unrelated reason.
-7. `IntentsGuilds` missing. §6. **Half fixed in M3:** the intent is requested, so custom emote output is possible for the first time. The per-message REST `s.Channel` call for the NSFW check still exists and becomes an `s.State.Channel` lookup in M10.
-8. ~~Nothing suppresses mentions, so the replied-to author is pinged on every interaction, and learned user mentions ping forever.~~ **Closed in M10a** by `internal/discordguard`, and closed structurally: `TestNothingBypassesTheGuard` parses the package and fails if any function outside three named adapters calls a session send, edit, delete or reaction method.
-
-    Two details are worth keeping, because both were established by writing the wrong version and watching a test fail rather than by reading. First, a nil `AllowedMentions` is dropped by `omitempty` and Discord reads the absent field as "parse every mention". Second, and less obvious: `&discordgo.MessageAllowedMentions{}` marshals as `"parse":null`, not `"parse":[]`. discordgo's own comment on the field says a zero value allows no mentions, which is true of the field being *present* but not of its value being the documented empty array, and whether Discord treats a null parse like an empty one is a fair reading of the API that the documentation does not state. So the guard sets `Parse`, `Roles` and `Users` to explicit empty slices, and the test asserts the **marshalled JSON**, which is the only place the difference exists.
-9. ~~The leaderboard command has no feature guard and no `return`, so it fires while word games are off and falls through into the rest of the handler.~~ **Closed in M10b by the consume contract**, not by a return statement: a return fixes one branch and leaves the shape available to the next command somebody adds.
-
-    The fall-through did more than waste work. After answering the command the handler carried on into the reply generator and the learn step, so the bot replied to its own command as if it were conversation and then taught itself the string `!leaderboard`. `TestOnlyCommandsConsume` parses the package and fails if any step other than the gate or the commands returns true, because a step that starts consuming silently stops the message being learned from and no behavioural test would notice.
-
-    The missing feature guard turned out not to be a defect. The chat half of the leaderboard reads the stats bucket, which is populated regardless of whether the scramble game runs, so it is deliberately available with word games off (§6). `!wordgame` is different and is not treated as a command when the feature is off, because consuming it would mean silently ignoring a message for something that is not running.
-10. ~~History eviction removes the lexicographically smallest snowflake, and snowflakes are variable-length decimal strings, so a 17-digit ID is evicted before an 18-digit one regardless of age.~~ **Fixed in M6b.** Keys are fixed-width big-endian, so byte order equals numeric order equals chronological order and a cursor's `First()` is genuinely the oldest message. A message ID that is not a snowflake is now an error rather than a key, which is the right answer for a caller that invented one.
-
-**Cost**
-
-11. ~~`Bucket.Stats()` walks every page and was called per message to fill a log field, and sits inside the loop condition of both trim functions, making trimming quadratic in pages.~~ **Fixed in M6b.** Both trims are counter-driven, the per-message log field reads a counter, and the only remaining `Stats()` calls are inside `Reader.Status`, on the status ticker. The reply path's "is there anything in the corpus" check became `Reader.CorpusEmpty`, one cursor `First()`, rather than a page walk over the largest bucket per reply.
-12. ~~All-pairs co-occurrence, O(n^2), inside the single write transaction.~~ **Closed in M7b.** Half went in M6b: the second all-pairs loop, over topic pairs, was pure duplication and is gone (finding 28), and each surviving pair became a 16-byte read-add-write on its own key rather than a member of an unbounded JSON map. M7b bounded the remaining loop to `PEREGRINE_COOCCURRENCE_WINDOW` words on each side, so a 200-word message goes from nearly 40,000 pairs to about 2,000, inside the transaction that serializes all ingestion. Worth recording that the window is also the more defensible model, not merely the cheaper one: a long message under all-pairs links every word in it to every other, which makes the association claim weaker the longer the message gets.
-13. ~~The 10-minute loop rescans the whole trailing 24 hours; dedup is a 10,000-key window, so on a busy guild older messages are evicted and then **re-learned, double-counting n-grams**.~~ **Closed in M9** by per-channel high-water cursors and `afterID` paging.
-
-    Worth stating the size of it: at the shipped defaults that was roughly 144 passes over every message in the window. Raising the history cap would not have fixed it, only moved the corpus size at which it starts, because the dedup record is bounded and the window is not. The cursor changes the question from "what have I forgotten" to "what is new", and the answer to that does not depend on how much the bot remembers. `PEREGRINE_INGEST_LOOKBACK` survives as a **bootstrap bound**: it applies to the first pass over a channel and never again.
-
-    The bootstrap needs an `afterID` for an instant with no message to anchor to, so `ingest.SnowflakeAt` synthesizes one from a timestamp, which Discord documents for this purpose. It clamps below the Discord epoch rather than wrapping: an unclamped subtraction produces a *future* snowflake, so the pass would ask for messages after the year 4000 and silently ingest nothing forever.
-
-    The pin gives the learner no memory at all, which is exactly the situation an evicted history entry creates, and asserts a second pass learns nothing. Verified by reverting the cursor and watching every message arrive twice.
-
-14. ~~Channel fan-out is unbounded, one goroutine per channel per guild, none visible to the shutdown path. The active-channel scan also pages every channel to count, then the ingest pass pages it again.~~ **Closed in M9.** Both levels are `errgroup.SetLimit`, from `PEREGRINE_INGEST_GUILD_CONCURRENCY` and `PEREGRINE_INGEST_CHANNEL_CONCURRENCY`, and the pass takes a context so shutdown stops it.
-
-    The double scan did not need replacing, it needed deleting. Its job was to decide which channels were worth reading, and a cursor answers that as a side effect: a channel with nothing new returns one empty page. The pin measures requests per channel and asserts an idle channel costs exactly one, which is cheaper than the count alone used to be.
-
-    `getActiveChannels` survived M9, because two callers wanted something a cursor cannot tell them: where people are *talking*, rather than what the bot has not read. **It is deleted in M11b**, along with `countRecentMessages` and `ActiveChannelInfo`, and the replacement asks nobody: `internal/activity` counts the messages the gateway already delivers.
-
-    The scale of what went away is the point. `getActiveChannels` paged every text channel in every guild fifty messages at a time with a 50ms sleep between pages; `findRandomActiveUser` then called it per guild and fetched another hundred messages per active channel to collect authors, on an hourly ticker. Hundreds of REST calls per aggro tick, answered by Discord with rate limits whose retries make it worse, for information that arrived free on the websocket and was thrown away. The tracker costs one map write per message.
-
-    It is the state cache **plus** an in-process tally, not the state cache alone, because those answer different halves: `State` knows a channel exists, what it is called, its type and its NSFW flag, and `LastMessageID` gives recency; it does not know volume. The tracker keeps per-channel *timestamps* rather than one counter, so each consumer brings its own window, and they genuinely differ: word games want "is it busy right now", aggro wants "who is around". `PEREGRINE_ACTIVE_CHANNEL_WINDOW` and `PEREGRINE_AGGRO_ACTIVITY_WINDOW` replace two hardcoded literals, and the word-game threshold gained a documented ceiling because the tracker's per-channel ring saturates, so a higher threshold could never be met.
-
-    **The word-game manager's own activity map is gone into it**, which is the finding-28 shape one level up: three features needed to know how busy a channel was, two of them asked Discord and the third kept its own copy. `Manager.Note` became `MaybeStart` and takes a `Counter` interface it declares itself. Starting a game no longer clears the channel's count, because the count is a shared observer now and zeroing it would lie to the other two consumers; a per-channel cooldown of one `ActivityWindow` reproduces the old behaviour exactly, since clearing meant a full window of fresh traffic before the threshold could be met again.
-
-    Two behaviour changes worth stating rather than discovering. **Aggro can only target someone the bot has seen since it started**, so for the first minutes after a restart there is no target; the old version could reach six hours back and pick someone who had left the conversation, which is the worse answer for a feature whose point is poking somebody who is present. And **`busiestChannel` returns nothing on a cold start** rather than falling back to `LastMessageID` recency, because recency without volume would let a channel whose last message was 59 minutes ago win the choice of where to speak unprompted.
-
-    Errors from a channel worker are deliberately swallowed rather than returned, because `errgroup` cancels its context on the first one: a guild the bot cannot read must not abandon the guilds it can. Failing to list guilds at all is the one fatal case, since there is nothing to walk and a cheerful log line would hide a revoked token.
-15. ~~Clustering does `DeleteBucket` plus `CreateBucket` every pass, a full destructive rebuild, with timestamp-based IDs so nothing is ever diffable.~~ **Closed by deletion in M7b, per finding 29.** The pass had no callers after M6b and is not being rebuilt, so there is no rebuild left to make diffable.
-16. 25 regexes recompiled per call in the filters, plus `MustCompile` inside `learnMessage` and inside a token loop.
-17. ~~An hourly NTP query to `pool.ntp.org` for what the host clock answers, whose failure silently skips a weekly reset.~~ **Closed in M11a by deletion**, and `beevik/ntp` is out of `go.mod`.
-
-    Three things were wrong and the third is the one that bit. It went to the network for something `time.Now()` answers, and a bot whose clock is an hour out has a much larger problem than a stale leaderboard. A failed query inside the one-hour window the check could fire in skipped the reset for a **whole week**, logging an error nobody would connect to a stale board six days later. And the reset had to be observed within that hour, so it depended on the tick landing there: a restart moved the phase, and downtime across Monday morning meant it never happened.
-
-    `Leaderboard.MaybeReset` compares week boundaries instead, which is idempotent, needs no network, and **catches up**: a bot that was off all Monday resets on its first tick back, because the week it holds is still the old one. The loop is `Immediate` now, which the NTP version could not usefully be. The display derives the next reset from the same boundary, where it used to compute it from the host clock while the reset consulted NTP: two sources of truth for one date.
-
-**Hygiene and privacy**
-
-18. ~~The history bucket stored 10,000 users' messages **verbatim** while nothing ever read the value, only the key's existence.~~ **Fixed in M6b.** The value is eight bytes of unix nanoseconds, which answers the one question anyone might actually ask of this bucket, and is the difference between a dedup window and a durable copy of ten thousand people's messages sitting in the operator's database.
-19. ~~A hardcoded Discord user ID was the only authorization check in the codebase.~~ **Closed in M11b**, and it took two milestones because the two halves are different problems. M2 made the ID a fail-closed environment variable, which fixed the value. It stayed an inline comparison in one command body, which left the *shape*: the second command to need authorization would reimplement it, and the way an inline reimplementation goes wrong is the empty case, which fails **open** and turns a missing variable into a public operator command.
-
-    `authorized()` is now the only place permitted to name `cfg.AdminUserID`, and an AST test parses the package and fails if anything else does. Same argument and same mechanism as `TestNothingBypassesTheGuard`: a behavioural test cannot cover this, because it would have to know about the command nobody has written yet.
-20. Word-game dictionary `log.Fatalf`, and CWD-relative paths throughout. **Fixed in M0.**
-21. ~~Voice-note download is a bare `http.Get`: no timeout, no context, no size cap, no status check.~~ **Closed in M12 by deletion.** The whole implementation went, and it carried four more defects worth naming because each is one an implementer would otherwise write again: `exec.Command` with no context, so a wedged whisper run could not be killed and shutdown waited for it; binary, model and scratch paths resolved against the working directory, which is the one thing this project says must never happen; a scratch filename derived from the URL and sanitized by hand with a regexp; and transcripts reaching the corpus without `CheckLearn`, which was one of A1's four unfiltered callers and the worst of them, since a Whisper transcript of arbitrary audio is the least controlled text the bot has ever handled.
-
-    Only the last of those is closed structurally rather than by deletion: the gate lives inside `learn.Learner.Message`, so an engine cannot reintroduce it. The other four are recorded in `internal/plugins/voicenote`'s package comment, next to the interface whoever writes an engine will implement.
-22. The slur filter iterates a map, so overlapping patterns give order-dependent, non-deterministic output.
-23. Uncommittable assets: a 465 MiB whisper model (over GitHub's hard 100 MiB per-file limit), a 96 MiB ffmpeg binary, a 128 MiB corpus. **Fixed in M0**, and the ordering mattered: `.gitignore` had to exist before `git init`.
-24. A stale `copilot-instructions.md` documenting a test file and a path that never existed. **Deleted in M0.**
-25. Zero tests; `go mod tidy` never run. **Partly fixed in M0.**
-26. Six sites with ellipsis or em-dash characters, two of them in user-visible leaderboard output. **Fixed in M0.** The tokenizer's literal right single quote is load-bearing and deliberately not covered by the check.
-
-**Found during M4, and it invalidates an earlier claim in this document**
-
-27. **Concept clusters are written in one shape and read in another, so nothing has ever read one.** `clustering` persists a `persistentCluster` whose `Members` is a `map[string]float32`, converting its internal integer term ids back to strings before writing precisely so the data survives a restart. The generation path unmarshals that JSON into `ConceptCluster`, whose `Members` is a `map[int]float32`. Go resolves a JSON object into a map with an integer key type by parsing each key with `strconv`, so every cluster fails with `json: cannot unmarshal number bird into Go struct field ConceptCluster.members of type int`. Both consumers guard with `if err := json.Unmarshal(v, &cluster); err == nil`, so the failure is silent and the entire block is skipped.
-
-    Verified by round-tripping the two real struct definitions rather than by reading. The consequence is that **both** cluster consumers are dead code: the high-priority concept-cluster branch of seed selection, and the cluster-based jump used when generation gets stuck. Clustering itself runs perfectly: a full similarity pass over the corpus every 24 hours, inside a write transaction against bbolt's single writer, ending in a destructive `DeleteBucket` plus `CreateBucket` rebuild, producing data that is then unreadable. It is pure cost with provably zero effect on output.
-
-    This invalidates an assertion made during the original review, that clustering earns its keep because concept clusters feed seed selection. They do not, and never have. That conclusion came from reading the call site and not the codec on either side of it, which is worth remembering as a general lesson: a consumer that guards an unmarshal with `err == nil` and has no `else` branch is indistinguishable from a consumer that works, and the only way to tell is to round-trip the two real types.
-
-    `PEREGRINE_ENABLE_CLUSTERING` therefore **defaults to false as of M4**. That is a behavior change in the cost only: the observable behavior, meaning what the bot posts, is provably unchanged, because the output of the pass cannot be read. Defaulting an expensive no-op to on once it is known to be a no-op is not defensible.
-
-    The codec fix is small, and it was deliberately not done here: turning the path on for real meant a seed branch firing at weight 50.0 inside a scorer that was unnormalized and already collapsing toward argmax, with no way to judge the result.
-
-    **Closed by deletion in M7b, and the deferral above turned out to be the right instinct for a better reason than the one given.** Scoping M8 found that fixing the codec would not merely have been unjudgeable, it would have shipped a regression: the merge threshold collapses every name-seed into one blob, and that blob fed the highest-weight seed tier applied to every member. See finding 29. So "the codec fix is small" was true and was exactly the hazard.
-
-**Found during M6b**
-
-28. **The topic-cluster index recorded nothing the topic-word index did not.** Both were written from the same place in `learnMessage`, over the same message, under the same `len(canonicalNames) > 0` guard and the same stop-word exclusion. `TopicWordBucket` stored every ordered pair of non-stop-words with a count and a sum of relative positions; `TopicClusterBucket` stored every unordered pair of the same words with a count and nothing else, under a key canonicalised as `min|max`. So the second index was the first one with the direction and the position thrown away, and its three consumers, two tiers of seed selection and nothing else, were asking a question the topic-word index could already answer.
-
-    Removed in M6b rather than ported, so the composite-key layout has one co-occurrence index instead of two that can disagree. The seed tiers that read it keep their weights and now read the name-topic and topic-word indexes: `NameTopicsFor` for the name-cluster tier, `TopicWordsFor` for the topic-cluster tier. The `|` separator is worth a note on its way out: it was a literal character inside the key, so a word containing a pipe produced a key that split into three parts and was silently skipped by every reader. The new layout separates with NUL, which the tokenizer provably cannot emit and which the codec asserts anyway.
-
-    Worth recording as a general shape rather than a one-off: two indexes written from the same loop, from the same data, differing only in what one of them discards, is a duplicate however different the two readers look.
-
-**Found while scoping M7**
-
-29. **Clustering cannot help, and fixing its codec would have shipped a quality regression.** M8 was scoped to rebuild the clustering pass with the finding 27 codec mismatch fixed. Reviewing it before starting found four independent reasons not to, and the second is the one that changes the decision from "not worth it" to "actively wrong".
-
-    *It derives from one index and adds no information.* `PerformClusteringOptimized` reads exactly one bucket, `name_topics`, and nothing else. A cluster is therefore a precomputed, stale grouping of the name-to-topic co-occurrence data that `Reader.NameTopicsFor` already returns directly, at query time, inside the read transaction generation already holds. This is finding 28's lesson one level up.
-
-    *Fixing the codec would have made output worse.* `MergeThreshold` is 0.005, against a cosine over weights that `normalizeAndPrune` has already forced to sum to 1. A name-seed holds up to 11 members, so weights average near 0.09 and the vector norm near 0.30, and two seeds sharing a **single** topic word score about 0.09, which is eighteen times the threshold. The stop-word list excluded from `name_topics` is plain English function words only, so "lol", "bird", "based" and "ratio" are the highest-count associations of every name in a meme server: every seed shares a high-count member with every other one, and agglomerative merging with no stopping rule beyond the threshold collapses them into one blob holding most of the name-adjacent vocabulary. That blob fed the highest-weight tier in seed selection, at 50.0 against a next tier at 25.0, applied to *every member*. A working codec would have made seeding approximately uniform over the name-adjacent vocabulary and swamped the five other tiers. Finding 27 called the codec fix small. It is, and that is the trap.
-
-    *There is no corpus scale where it produces useful structure.* A few hundred names yields a few hundred sparse vectors. At 0.005 they collapse; at a threshold high enough to avoid that they stay singletons. There is no middle regime.
-
-    *Its cost lands on the scarcest resource in the design.* A periodic full rebuild is a write transaction, and bbolt has one writer process-wide, so the pass competes directly with ingestion. It also ended in `DeleteBucket` plus `CreateBucket`, and clusters were the only structure in the layout that was derived, stale and order-dependent, which is why the "nothing may persist an interner id" rule exists at all.
-
-    What is worth keeping is one idea, and it is not a database. Clusters offer *transitive* association: A relates to B, B relates to C, so reach C from A. The co-occurrence indexes give only the first hop. That second hop is real and it is worth exactly one bounded query-time expansion tier in the seed scorer, computed from `TopicWordsFor` and `NameTopicsFor` with a decayed weight. Never stale, no bucket, no codec, no persistence, no 24-hour write transaction, and it is a dial golden samples can judge. That tier is M7b's; the package is deleted with it.
-
-    The general lesson, which is the reason this is recorded as a finding rather than as a changelog line: **a derived index inherits every assumption of the thing it derives from, and adds a staleness window and a tuning constant of its own.** Before rebuilding one, check whether the question it answers can be asked directly of the source, and whether the tuning constant it ships with was ever validated against real data. This one's never had been.
-
-**Found during M11a**
-
-30. **Autonomous posting was gated on the word-game flag and paced by word-game configuration, while posting Markov text.** `autonomousPost` calls `generateSentenceWithContext`: it has always posted a generated sentence, never a puzzle. But it returned early unless `EnableWordGames` was true AND the dictionary had loaded, then paced itself with `PEREGRINE_WORDGAME_FREQUENCY_MODE` and `PEREGRINE_WORDGAME_INTERVAL`, while two comments in the body claimed it posted word games.
-
-    The consequence is the one that matters: setting `PEREGRINE_ENABLE_AUTONOMOUS_POST=true` produced **nothing** unless word games happened to be enabled too, which they were not by default. That is the third distinct way this feature has been dead, after the compile-time constant and the empty allowlist, and it is the one that would have survived an operator carefully setting both of the variables the documentation named.
-
-**Found on the first production deploy**
-
-32. **The reply path declined silently, so a correctly working bot was indistinguishable from a broken one.** `stepReply` ended with `if reply == "" { return false }` and no log line. On a freshly deployed bot every trigger therefore looked dead: the operator addressed it, nothing happened, and nothing in the log said why.
-
-    Everything upstream was working and the log already proved it. `flags: map[SELF_MENTION_KEYWORD:true TEXT:true]` means the content arrived and the pattern matched; `[LEARNED] ... history=27` means ingestion was running. The bot had simply generated nothing and kept that to itself.
-
-    The cause was the corpus being minutes old against `PEREGRINE_MIN_DISTINCT_AUTHORS` at its default of 2, which is the control working exactly as designed (A6), made stricter by finding 31's widening of the gate to the seed and the jump. So the behaviour was right and the reporting was absent, which is the worse half: an operator cannot distinguish "wait" from "your configuration is wrong".
-
-    **The asymmetry is what makes it a defect rather than a missing nicety.** `autopost.post` logged the identical condition (`Generated message is empty, skipping`) from the day it was written. Two callers of one function, same decision, one explains itself. The path that stayed quiet is the one a user actually exercises.
-
-    `generate.Sentence` returns a typed `Outcome` now, because a bare "generated nothing" would have left the operator where they started: `CorpusEmpty` points at ingestion and `TooShort` points at the author gate, and those are different investigations. The rule worth keeping is narrower than "log more": **the bot staying silent is a feature and the operator staying uninformed is a bug**, and silence-on-purpose needs a reason attached at the point the decision is made.
-
-**Found during M11c, and it is the most serious finding since A1**
-
-31. **The author-diversity gate covered the sampler and not the two other producers of words.** `PEREGRINE_MIN_DISTINCT_AUTHORS` is the strongest single anti-poisoning control in the bot: a continuation must have come from `k` different people before the bot will generate it, which converts the attack from persistence into collusion (A6). It was applied in `eligible()`, which filters the candidates the sampler chooses between.
-
-    But the sampler is not the only thing that puts a word into a sentence. `Generator.Jump` fires when generation dead-ends and picks a token out of the **co-occurrence indexes**, appending it directly; `Generator.Seed` picks the first word from those same indexes. Neither index carries author attribution at all, because `topic_word` and `name_topic` store a count and a position sum and nothing else. So a phrase one person repeated forty times was refused by the sampler at every step and then handed straight back by the jump.
-
-    That is A6 defeated by exactly the shape design principle 3 exists to prevent: a check at one of three producers. It is the same class as A1, where the gate covered one of four callers, and it is worth recording that the class recurred **after** the principle was written down.
-
-    **How it survived a milestone with a test named after it.** `TestGenerationHonoursTheConfiguredAuthorGate` existed from M7a and passed. It seeded the corpus by calling the learn path with `nil` for the mentioned users, and both association indexes are gated on a name being present, so the fixture produced no co-occurrence data and the jump had nothing to find. The test was correct about what it asserted and silent about the path that mattered. It failed the moment M11c's rewrite passed a realistic author list, which is the argument for rewriting fixtures rather than porting them verbatim.
-
-    **The fix is `Generator.attested`**, asked at both producers. The gate is naturally a property of an EDGE, since `ngram_auth` records `(prefix, next, author)`, so "how many distinct people said this continuation" is answerable and "how many distinct people said this word" is not without a reverse index the layout deliberately does not carry. The closest honest question is whether the chain can leave the word along an edge several people used, and that is what it asks. Two deliberate asymmetries: the end sentinel is exempt in `eligible()` and **not** here, because "the only thing following this word is the end of a message somebody once sent" is not evidence that several people use it; and seeds derived from the **prompt** are exempt, because echoing somebody's own words back is not poisoning and refusing to would make the bot least responsive exactly when it was addressed directly.
-
-    Like `eligible()`, it is a filter and it does not relax. When it refuses everything, the jump fails and the sentence ends, which is the outcome a dead end already had.
-
-    Two smaller defects fell out of the same function. The allowlist was checked **after** scoring, so the busiest channel in the server won and was then rejected: a bot whose allowlist did not contain its busiest channel posted nothing and logged a rejection every cycle. And the conversation memory it generated from was seeded with `bestChannel.LastMessageID`, a snowflake, tokenized into a meaningless integer and fed to the generator as if somebody had said it.
-
-    Recorded rather than folded in silently because of the shape: **a feature gated on an unrelated feature's flag looks configured.** Every variable an operator would think to set was set, and the thing still did nothing. The comments were not merely stale, they actively described behaviour the code did not have, which is what stopped anyone reading the gate as wrong.
-
-**Found while making the bot name-aware, in M14**
-
-33. **The backfill learned no associations at all, so every name-aware tier read a nearly empty index.** `chat.stepLearn` appended the author to its `mentioned` slice before calling `Learner.Message`. `ingest.learner.Learn` did not, and `associate` returns early when that set is empty. A backfilled message therefore wrote **neither** co-occurrence index: not `name_topic`, which seed tiers 3 and 5 and the `NameAssoc` logit read, and not `topic_word`, which tier 4, the two-hop tier and all of `Jump` read.
-
-    A corpus is mostly backfill. So both indexes stayed nearly empty on a bot that looked like it was learning perfectly well, because n-grams are written outside that guard and the `[LEARNED]` line counts n-grams.
-
-    That is **A1's shape one subsystem over**: one entry point, two callers, one of them doing an extra step the other forgot. It survived because every test in `internal/learn` passed the author in, mirroring the chat caller: the only shape exercised was the only shape that worked. `TestCooccurrenceIsWindowed` even carried the comment "A named person is required, because both association indexes are gated on one" without anyone noticing that a caller did not meet it.
-
-    Fixed inside `Learner.Message`, which merges the author into the set itself, so a third caller cannot get it wrong. `learnOne` and the four co-occurrence tests now learn the way the backfill does, and reverting the merge fails five tests rather than one.
-
-    The lesson is the one A1 already taught, restated because restating it is apparently necessary: **when one function has two callers and one of them prepares an argument the other does not, that preparation belongs inside the function.** A convention that only one caller follows is not a convention.
-
-34. **The seed ladder's tier bonuses were unbounded, and one tier was dead.** Each association tier added a bare `math.Sqrt(count)` to its base weight, so a tier could climb out of its own band: at 50 recorded co-occurrences `weightNameTopic` reached 32, above the 30 that a word the user actually typed gets from tier 1. The documented ordering was therefore nominal, and which tier won depended on the counts rather than on the design. That is **finding G2's shape in the seed selector rather than the scorer**, and the scorer's own rule is the fix: every term that sums over evidence is squashed so it cannot exceed its own weight.
-
-    Separately, `weightPromptWord` added single prompt words at 15.0, but tier 1 loops `n` down to 1 and had already added exactly those keys at 30.0, with `add()` keeping the maximum. It could never win. Deleted rather than reweighted, because the question it asked was already answered one tier up, which is finding 28's shape.
-
-    Both were found by reading the constants against each other while adding a tier, which is worth noting: the new tier's first weight was 26.0, chosen to sit "just above name-topic at 25.0", and it did nothing at all. A weight below the tier that already covers your keys is not a weak preference, it is no preference.
-
-35. **The dead-end jump was the single source of unreadable output, and it was unbounded.** `Generator.Jump` appends a word taken from the co-occurrence indexes, which means it has **no n-gram relationship whatsoever** to the word before it. The join is not occasionally rough, it is rough by construction. In the first live output from a populated corpus, every unreadable line broke at exactly one such seam while the purely chain-generated lines read fine:
-
-    ```
-    what's the point of even a | know i do that
-    back to the | go
-    u just what if you dont have | get the raped
-    4 | 10 years ago
-    ```
-
-    It was also not the rare fallback its comment implied. The author-diversity gate empties the candidate set constantly on a young corpus, so dead ends are frequent and the jump was a major producer of words. And it worked directly against `length.go`'s own stated principle, that short and punchy reads as a joke while long reads as a malfunction: it bought length by spending coherence.
-
-    Four bounds, all of which make the bot say **less**: no jump once the sentence has reached `Length.Min`, because the jump exists to save a reply from being too short to post and that is the definition of too short; at most one seam per sentence, because one reads as a change of subject and two read as broken; never after a function word, because a determiner or preposition demands a specific continuation and a jump there cannot read as anything but a fault; and `TrimDangling` strips trailing function words from a sentence that ran out of chain, but **not** from one that chose to end on the sentinel. That last asymmetry is the one `attested` already makes about `EndToken`: what the corpus witnessed somebody do is evidence, what generation merely ran into is not.
-
-    The bounds live in `Jump` rather than at the call site because there are two callers, production and the golden harness, and a harness that prints output the bot cannot produce is worse than no harness.
-
-    **The harness could not see any of this, or any of the name work either.** `golden_test.go` built its `SeedInput` with no `Names` and no `NameTokens`, so three seed tiers and two logits had never once fired in a printed sample. Every name-aware part of the engine was invisible to the only instrument the project has for judging output quality. Recorded as a finding because the shape recurs: **an instrument that silently omits a code path reports on a bot that does not exist.**
-
-**Found by building an output instrument that could answer §5.5, in M15**
-
-Four of these six were found by reading generated samples, not by reading code, and each one passed every assertion in the suite while it was live. That is the argument for §5.5 existing at all.
-
-36. **The seed ladder was a per-candidate ladder and the draw was a per-tier-mass draw.** `Seed` flattened seven tiers into one map and `drawSeed` sampled proportional to weight over the whole map, so a tier's influence was its weight **times its candidate count**, and the counts are wildly unequal. Tier 1 contributes one candidate per prompt n-gram window, about eighteen for a seven-word prompt and mass 1350, while the name tier contributes exactly one at 40.
-
-    Measured over 50,000 draws on a realistic fixture with `MinDistinctAuthors=2`, a recognized name won the seed **4.57%** of the time, against a documented position above every association tier. The old comment reasoned pairwise ("above a single prompt word at 30, below a two-word phrase at 60"), which is true of one candidate against one candidate and says nothing about the draw.
-
-    The general form is the part to keep: **a bounded weight is not a bounded influence when the number of candidates carrying it is unbounded.** That generalizes finding 34, which bounded a candidate within its tier, to bounding the tier itself. Fixed by giving each tier a budget and normalizing its candidates onto it, which made `assocSpread` unnecessary and deleted it: a candidate cannot escape a tier it is normalized into. The name share is now 32.9% on a short prompt and 33.4% on a long one, where it used to be 57% and 3%.
-
-    Note what the old test suite asserted: that the name beats a single ordinary prompt word. That was the case where the old weights worked. Nothing asserted the long-prompt case, which is the one that mattered.
-
-37. **The name-positional tier was dead, for exactly the reason `weightPromptWord` was dead, one milestone after finding 34 recorded that shape.** Tier 5 read `NameTopicsFor` for the most recent name at 8.0; tier 3 had already added every one of those keys, from the identical `TopicAssoc`, at 18.0, and `add()` keeps the maximum. Its one distinguishing feature, a `HasSuccessors` filter, is implied by `attested()` at draw time whenever `MinDistinctAuthors > 0`. Deleted rather than reweighted, per finding 28.
-
-    The pin that was missing both times now exists: `TestEverySeedTierProducesASurvivingCandidate` fails if any tier contributes no candidate for a representative prompt. A shadowed tier changes no output at all, which is why two of them survived code review and no behavioural test could have caught either.
-
-38. **`TrimDangling`'s end-token exemption licensed a trailing preposition, because attestation is recorded on the token and not on the construction.** Nearly a third of generated replies ended on one: "nurock is coping about", "what do you know about". The engine was right by its own rule, which is what made it invisible. "about" is followed by the end sentinel in the corpus by two different authors, because two people ended a message with "what are you talking about", so the corpus genuinely attests that the token can end a message. Generation then cashed that in where the phrase never arrives.
-
-    The composite key layout does not carry the construction and there is no cheap way to make it, so the honest fix is to say which function words can close a sentence at all. `text.IsDanglingTail` is a separate list from `text.IsStopWord` deliberately: they answer different questions and disagree on exactly the words that matter. "it" is a stop word that ends a sentence perfectly ("i am going to lose it"); "about" is a stop word that cannot.
-
-39. **A trailing pronoun was licensed by the same exemption, and whether it dangles depends on the word in front of it.** "i am going to lose it" and "greg and lachy are you" both end on a pronoun. A pronoun needs a governor and a function word is not one, so `text.IsGovernedPronoun` takes the previous token. This is the residue of finding 38 and was only visible once the preposition case stopped dominating the sample.
-
-40. **Candidate enumeration counted candidates the author-diversity gate was about to delete.** The backoff floor was `len(pool)`, so enumeration stopped as soon as five continuations existed at any order and `eligible()` then removed most of them. Measured against the golden fixture: a prefix that stopped at the floor handed the sampler **two** candidates, where one that happened to keep backing off handed it fourteen. Top-k at 40 and any temperature at all are meaningless against a set of two, which is the old "argmax with noise" failure returning in exactly the places the floor existed to prevent it.
-
-    The floor counts survivors now. **This does not relax the gate**, and the distinction matters because it touches a safety control: every candidate still has to pass, enumeration simply keeps looking at lower orders until enough have, and when no order supplies any the step is still a dead end.
-
-    Worth recording as a negative result too: raising the floor from 5 to 32 changed the printed output not at all, so the floor's value is not a tuning lever. The defect was what it counted, not how high it was.
-
-41. **A seed could open on a conjunction.** The lone-function-word rule exempts multi-word windows, because "the bird" and "the server is" open perfectly well. That exemption let the prompt "greg and lachy are both" offer the window "and lachy are", which generated "and lachy are you know what i am going to lose it": a reply whose first half is visibly missing. A conjunction promises a clause that was never there. Prepositions are deliberately still allowed, because "at this hour is a mistake" opens fine.
-
-**Found in M15 and fixed in M16:**
-
-42. **Nothing rewards a candidate for being a word people actually say about the person under discussion.** `Step.NameAssoc`'s keys are the name's associated words, and the `NameAssoc` logit uses them as lookup keys into `TopicWordsFor`, so the term scores **two hops** from the name. `TopicGravity` scores one hop from a prompt word. The most direct name signal available has no logit at all, while its transitive weakening has 0.45.
-
-43. **`PromptGravity` is a near-constant shift plus a duplicate of `PromptRelevance`, and its only other effect is backwards.** Within one step the prefix is identical for every candidate, so a constant is added to every logit and cancels in the softmax. What varies is whether the candidate is a prompt word, duplicating a 0.6 term, and whether it repeats a prefix word, which pays a candidate for doing what three other terms penalize. It joins the prefix and re-tokenizes the prompt per candidate per step. `text.Similarity`'s own doc comment describes a rejection check no caller performs.
-
-44. **`Step.CurrentTopic` is set to the seed, and a seed is usually a multi-word prefix.** `TopicWordsFor` is keyed by single words, so the lookup returns an empty non-nil map, which passes the `a != nil` guard and never matches. The 0.35 term is silently dead for roughly nine sentences in ten, and gets deader as the corpus grows and more long windows gain successors.
-
-45. **The persona post-pass is a fourth producer of words and never got the rule the other three have.** `insertPos` draws by position alone and splices an interjection between a modal and its subject: "why would ngl you say". `Jump` got "NOT AFTER A FUNCTION WORD" in M14 for exactly this reason. Two further defects in the same nine lines: the roast multiplier is capped before the length factor, so a long name-bearing roast reply reaches a chance above 1 and filler is certain; and `StyleChanceName` at 0.65 against `StyleChance` at 0.35 means **the better name recognition works, the more filler the bot splices in**, so finding 36's fix makes this fire more often. The harness cannot see it: `generateReply` calls `Style` with `aboutName` hardcoded false.
-
-**Found in M15 and fixed in M17:**
-
-46. **The association indexes cannot be rebuilt from the corpus, so finding 33's fix repaired the writer and left the data missing.** The corpus stores n-grams and counts, never message text, and associations need original word sequences with positions. `Writer.SetCursor` is monotonic, so history is never re-read. Every historical message therefore still has no associations, and a corpus is mostly backfill. **The general lesson: a fix to a writer is not a fix to the data, and whether the data is re-derivable is a property of the layout that has to be checked before the fix is called done.**
-
-    **M18 turned the one-off repair into a mechanism, and the reason is the second half of the lesson.** M17 shipped a whole plugin, two storage accessors and two configuration variables, all naming one index, and its boundary was an RFC3339 instant the operator had to remember. That works exactly once. The failure class recurs by construction: any index built from message *structure* rather than message content has this property, so the repair is a job table now and the next one is a row.
-
-    The boundary is the part that had to change rather than merely move. **A repair boundary belongs in the corpus, not in an operator's memory.** Nothing already stored could answer "when did this writer change": no meta counter is a timestamp, the history bucket records write times but is capped and evicted by *message* time so its survivors are an arbitrary sample, and the cursor bucket answers "what has been read". So `learn.Generation` is stamped on first open and a job declares which generation fixed it. Generation 2 shipped before stamping existed, so the override survives for that one case and every generation from 3 gets an exact boundary for free.
-
-    It also **deleted a special case rather than adding one**: M17 stamped a fresh corpus as "already backfilled" in `initialize`, and with generation stamping a new file records its generation at creation, so a job bounded at "when generation N began" finds nothing on its own. One mechanism instead of two.
-
-**Found in M15 and fixed in M19:**
-
-47. **The recent seed tier had none of the opener rules the prompt tier had.** `collectSeedCands` refused a lone function word and refused any window opening on a conjunction for prompt n-grams, and applied neither to conversation memory, so recency could seed a reply on "is" or "and" while the identical window from the prompt was refused. Two statements of one rule, differing only in what one of them forgot, which is finding 28's shape. They are one function now, because the rule belongs to the question "may a reply start here", which is not a property of where the words came from.
-
-48. **One encoding served two consumers that needed opposite things, and it threw away what each of them read.** `Memory.WeightedWords` expressed recency by REPEATING each token in a flat slice. The scorer collapsed that with `wordSet`, discarding the weighting entirely, so `RecentContext` paid a word from the fiftieth-oldest message exactly what it paid one from the message being answered. The seed's recent tier read word ORDER, which in-place repetition destroys: almost every n-gram window was a doubled word, and windows straddled message boundaries because a flat slice has none. Replaced by a weight map and per-message word lists, which is one accessor per question.
-
-49. **The prompt was counted twice and the bot never heard itself.** `stepMemory` sits before `stepReply` in the step table, so the message being answered was already the freshest memory entry: it scored through `PromptSet` and again through the recency term. Separately, `selfLearn` wrote the bot's reply to the corpus and never added it to conversation memory, so the one participant present in every exchange was the only one missing from the channel's record of what was being discussed. `stepMemory` also stored raw `<@123>` markup, which reached the recent tier as tokens matching nothing: M14's substitution gap, one step over.
-
-50. **The reply chain was fetched and thrown away.** `stepClassify` made a `ChannelMessage` REST call for the referenced message, read `ref.Author.ID` to set one boolean, and discarded the content, which is exactly the context a reply needs and was already being paid for. `Message.ReferencedMessage` is on the gateway payload for ordinary replies, so the REST call is a fallback now and the request count goes DOWN; it cannot be deleted, because discordgo documents three distinct nil cases. `MessageReference.Type` also distinguishes a forward from a reply and the old check ignored it, so a forwarded message triggered a fetch that could never identify a bot author.
-
-    The rule the fix states once and tests: **the referenced message says what we are talking about, the prompt says what was said to me. Only the prompt may seed, both may steer.** The same rule governs recalled names, which reach the association tiers and never the name seed tier: naming somebody nobody just mentioned reads as a non-sequitur rather than as memory.
-
-**Found and fixed in M22:**
-
-51. **`Step.Position` was measured against the length CAP while the corpus records position as a fraction of a MESSAGE, so every position-matching term ran in the bottom third of its own domain.** The learn path stores `j/len(words)`, spread over the whole of [0, 1). Both walk loops set `Position = len(sentence)/Length.Max`. The target is a squared-uniform draw, so at the shipped 4-to-18 bounds the median is around 7 and a typical reply swept 0 to 0.39 and stopped. Since `exp(-5d)` is 0.05 at d=0.6, a word the corpus usually sees late in a message was damped to nothing for the **entire sentence** rather than only near the start, giving `TopicGravity`, `NameTopic` and both of `NameAssoc`'s nested gates a standing preference for sentence-initial vocabulary at every step. Note the contrast with `seed.go`, which prefers early-position words deliberately, because it is choosing where a sentence starts; the defect was the scorer inheriting the seed's bias for the whole walk. `Connective` was worse than damped: its late-dampening branch needs 0.85, which meant word 16 of 18 and therefore essentially never, so the term was a flat bias toward "and/but/then/because" in an engine whose length model exists to argue the opposite.
-
-    It is `Length.Progress` now, a method rather than a line in each caller, because production and the golden harness had the same wrong copy and **a harness that computes progress differently from the bot reports on a bot that does not exist**. The golden read is what settled it: three near-identical draws for one prompt became three distinct ones, dangling tails like "coping about the bird knows what" resolved, and a prompt naming somebody produced "nurock lost ranked" where nothing in the old sweep had named anyone.
-
-    **The general lesson is the one this repo keeps paying for in a new place: two numbers compared directly are one scale, and the scale belongs in the doc comment of the field.** `Step.Position` never said what it was a fraction of, which is exactly why two callers could get it wrong the same way.
-
-52. **Two of the three randomness draws on the generation path did not go through `markov.Source`.** The length target constructed a `markov.DefaultSource{}` inline whatever the caller passed, and the persona post-pass was called as `Style(nil, ...)`. So `internal/generate` could not produce the same text twice under a seed, and the visible half of the persona was unpinnable even when every other draw was seeded. `Source` exists precisely so a printed difference can be attributed to a change rather than to the draw. Found the moment a reproducibility test was written, which is the point: it is `generate`'s instance of the shape M14, M16 and M19 each found elsewhere, an instrument that silently omits a code path. One `Generator.source()` accessor now, so a fourth draw cannot invent a fourth answer.
-
-**Open, and deliberately not fixed in M22 because they need real telemetry rather than argument:** whether `TopicGravity`'s `tanh(gravity/4)` saturates into an indicator at production count magnitudes (it reads 0.44 of its 0.70 ceiling on the fixture and computes to 0.699 off a single association at plausible production magnitudes, and the test that pins the bound passes most comfortably exactly when the term is degenerate); whether `Significance` still grades once most candidates are past n=1000, where it is within 1% of its ceiling; whether `TopK` at 40 ever binds, given that `top_k=0` and `top_k=40` produce byte-identical golden output at every temperature; and where the equilibrium sits between the author-diversity gate and principle 7, since edges two people independently produced are by selection the fixed phrases, so the gate lowers the branch factor precisely where recombination happens. `Trace.MeanCandidates`, `Trace.Starved` and `Trace.MinOrder` are the numbers that decide the last three and none has been read against real traffic yet.
-
-**Found in M23, by the first measurement this project has ever taken of a real corpus, and 53 and 54 fixed in M24.** The snapshot is 19,387 messages, 257,566 edges over 180,640 prefixes, a vocabulary of 11,237 and 184 names. Three of the four questions above are answered by the corpus alone, without any of the telemetry they were waiting on, and two of the three estimates behind them were wrong by an order of magnitude in the same direction.
-
-53. **The end sentinel is an entry in the topic bucket, so `Significance` is a second length influence, and the length model does not know.** `learn.Learner.Message` appends `EndToken` before the topic loop runs, so `<end>` has a topic count of exactly the number of messages learned: 19,387, which is 15.5% of all tokens and 5.7 times the next entry ("i", 3,426). `Significance` is `0.20 * tanh(sqrt(n)/12)` and applies to every candidate with no exemption for the sentinel, so `<end>` collects `tanh(11.6)`, which is 1.000 to three places: **the full 0.200, at every step, permanently.** A median candidate collects 0.017 and a p90 candidate 0.052, so the sentinel carries a standing advantage of about 0.18 logits, worth roughly 1.20x odds on ending, at every step of every sentence.
-
-    The term is invisible where it matters. `score.go` says of the length model that "this is now the ONLY place length influences generation: the discard-and-retry and the second progress-based multiplier are gone, so there is one answer to how long should this be instead of three that could disagree" (finding 51's fix). That statement is false, and this is the third mechanism. It is worst exactly where the length model is trying to hold a sentence open: `EndEarly` eases linearly from -2.30 at `Min` to 0 at `Target`, so about 91% of the way along that ease, `Significance` has cancelled the length model's remaining objection outright.
-
-    **It also gets stronger as the corpus grows, and the harness is built so it cannot show that.** The sentinel's count is the message count, so it saturates first and stays saturated forever, while the vocabulary behind it stays on the graded part of the curve. `goldenfixture_test.go` models the sentinel correctly, which is what makes this a magnitude problem rather than a blind spot: at the 150-line fixture the sentinel reads 0.154 against a common fixture word's 0.114, a gap of 0.04, and at production scale the same two numbers are 0.200 and 0.017. **An instrument can exercise a code path faithfully and still report the wrong magnitude, because the fixture's size is itself a parameter of the thing being measured.** That is a new shape, distinct from M14, M16, M19 and M22's instrument defects, all of which were paths the harness omitted entirely.
-
-54. **`PEREGRINE_MIN_DISTINCT_AUTHORS` at 2 refuses 93.8% of the edges and 76.3% of the probability mass, and the attack it defends against is not present in the corpus at all.** 92.82% of edges have exactly one distinct author, 3.58% have two, 1.08% have three. Admission at k=2 is 15,917 edges of 257,566 and 76,185 mass of 321,576, which is the four-to-one gap between the two shares that made both worth reporting: by edges the gate looks catastrophic, by mass it looks survivable, and neither number alone describes what generation experiences.
-
-    The per-order table is what actually describes it. Dead-prefix rate, meaning prefixes with no admissible continuation at all: **77.07% at order 1, 94.05% at order 2, 98.74% at order 3, 99.68% at order 4.** Mean admissible successors: **0.93 at order 1**, 0.09 at order 2, 0.01 at order 3, 0.00 at order 4. So above the single-word context essentially every prefix is a dead end, and at the single-word context the average prefix has fewer than one continuation the bot is allowed to use. The engine is running as a near-deterministic order-1 walk, and every dial in front of it, temperature and top-k and top-p and fourteen logit weights, is arguing over a candidate set that usually has one member or none.
-
-    **This settles the open decision in section 10 that guessed the opposite.** "Backing off to a one-word context produces grammatically disconnected joins ... **it is probably a fixture-size artifact:** the golden corpus is 150 messages, so high-order contexts rarely have two authors, and a real corpus has far more high-order coverage." A real corpus has more high-order coverage and the gate refuses more of it: order 3 is 98.74% dead against a fixture that at least had the excuse of being small. The reading was right about the mechanism and wrong about the cause, and the cause is the control rather than the sparsity.
-
-    **The poisoning shape is absent, and the joint distribution is what shows it.** Single-author edges by occurrence count: 241,649 at count 1 or more, 3,184 at 2 or more, 366 at 3 or more, 46 at 5 or more, **1 at 10 or more, and 0 at 20 or more.** Section 4 A6 describes an actor repeating a phrase to write it into the model; there is exactly one edge in this corpus that a person said ten times, and none they said twenty. The gate is refusing a quarter of a million edges to defend against a shape with one instance.
-
-    **The fix keys on count, and the reason is A6's own argument rather than a concession to output quality.** n-gram weight is raw frequency, so repetition IS the write: a phrase said four times carries four counts against a corpus mass of 321,576, which is not an attack because it has no weight, and a phrase said hundreds of times is one because it does. A single-author edge below a small count threshold is evidence of a sparse corpus; above it, it is evidence of concentration. Today's gate conflates them, and it conflates them in the direction that costs almost everything and protects against almost nothing. **A control sized against a threat model nobody measured is a guess wearing a safeguard's clothes**, which is finding 29's rule with the stakes reversed: there the untested constant made a feature useless, here it makes a safety control expensive and, at these magnitudes, close to inert against the thing it names.
-
-55. **Two of M22's saturation worries were wrong by an order of magnitude, and wrong the same way.** `Significance` was suspected of having stopped grading "once most candidates are past n=1000". The vocabulary's actual distribution is mean 11.16, **p50 of 1**, p90 of 10, p99 of 144. `tanh(sqrt(n)/12)` passes 0.9 at n=311 and 0.99 at n=1011, so 99% of the vocabulary sits on the graded part of the curve and the term does what it says. `TopicGravity` was suspected of saturating into an indicator, on the strength of a calculation that it "computes to 0.699 off a single association at plausible production magnitudes"; real association counts are mean **1.19**, p50 1, p90 2, p99 4, max 94, so `tanh(gravity/4)` is nowhere near its ceiling and the plausible magnitude was two orders of magnitude too large.
-
-    Both estimates were scaling arguments about what a real corpus would look like, and both overestimated the same quantity: how often any particular item recurs. A chat corpus concentrates its mass in a few hundred function words and spreads everything else across a long tail of ones, so per-item counts stay small however large the corpus gets. **A term that saturates is a term whose input you have measured; every other claim about saturation is a claim about a distribution you are imagining.**
-
-56. **`TopK` at 40 does not bind, and the byte-identical golden output was not a fixture artifact.** Successors per prefix are mean 1.43, p50 1, p90 1, p99 8, with a maximum of 1,083; at order 1 alone the mean is 4.91. After the author-diversity gate the mean admissible set is below one. So truncating to the top 40 candidates is inert in production for the same reason it was inert in the harness, and `top_k` is not evidence of a well-tuned sampler so much as a dial with nothing to do. It becomes a live parameter only if finding 54's gate changes, which is the order to do things in: measure the candidate set the gate produces, then tune what selects from it.
-
-**Found in M24, by the golden harness, about M24's own fix:**
-
-57. **Relaxing the author gate on count alone does not buy recombination, it buys recitation, and the corpus report could not have said so.** Finding 54's measurement made an unanswerable case that the gate was refusing almost the whole graph. The obvious fix, admitting single-author edges that carry no weight, took the golden fixture's recitation rate from 2.4% to **19.8%** against a 10% bar, with whole authored lines reproduced verbatim. It also **lowered** the share of distinct output relative to the eventual fix, 36.9% against 39.3%, because a chain that follows one source message end to end is not varying, it is quoting.
-
-    The cause is that a single-author edge found at a long context IS somebody's sentence: a continuation reachable from a four-word prefix reproduces five consecutive words of one message, which is exactly `recitationMinLen`. So the allowance is capped by context length as well as by count, and read as a sentence the rule is **one or two words is shared vocabulary, three or more is somebody's phrasing.** With the cap the fixture's recitation rate returns to its 2.4% baseline and the entire variety gain is kept.
-
-    **The two instruments answer different questions and neither is sufficient**, which is the part worth keeping. The corpus report knows what the corpus contains and cannot know what a walk over it produces; the golden harness knows what the output looks like and, at 150 lines, systematically understates every magnitude (finding 53). The count limit is the mirror image: it is measurably inert on the fixture at every value from 2 to 100, so only the corpus report can size it. **A tuning constant needs an instrument that can see the quantity it controls, and "we have an instrument" is not the same claim as "we have the right one."**
-
-    Confirmed against the real corpus rather than the fixture, at `MIN_DISTINCT_AUTHORS=2`: the shipped configuration admits 59.97% of edges and 67.61% of the mass and leaves 53.24% of prefixes with no admissible continuation, against 21.10%, 35.95% and **75.40%** for the gate as it stood. Removing the order cap would reach 99.05% of edges and 0.73% dead prefixes, and that is the configuration that fails the recitation bar: the gap between "admits nearly everything" and "produces good output" is the whole finding in one line. The count limit is immaterial to admission at production scale too, 2 and 5 differing by 0.08 percentage points, which is why the default is the conservative one.
-
-    Note that these admission figures are not comparable with finding 54's, and the difference is instructive: 54's curve is authors-only, while these include the end sentinel's exemption, which by itself is most of the distance from 6.18% to 21.10%. **A gate's headline number depends on which of its exemptions you counted.**
-
-58. **The status walk was not just expensive, it was feeding the growth it measured.** `Reader.Status` answered six of its nine fields with `Bucket.Stats().KeyN`, which walks every page in the bucket. Finding 11 had already caught this call once, per message, and the fix was to move it onto a ticker; the walk itself was left alone, and on the production corpus it had reached **26 seconds**, fired every five minutes. That is a read transaction open roughly 9% of the time, and bbolt is copy-on-write: its README says "try to avoid long running read transactions, Bolt uses copy-on-write so old pages cannot be reclaimed while an old transaction is using them", and its `Tx` documentation is blunter still, "a long-running read transaction can make the database grow quickly". So for 9% of every hour the writer could not reuse freed pages and allocated new ones instead. The file grew, the next walk had more pages to cross, the window widened, and the file grew faster. The 444 MB guild corpus was carrying some unknown fraction of that as pure self-inflicted bloat, and the operator-visible symptom was a reply latency of **1m34s** on messages that landed inside the walk window, against a sub-second median.
-
-    The fix is the counter pattern this layout already uses everywhere else, and the giveaway is that **three of `Status`'s nine fields were already counters**: `HistoryWindow`, `ImageCache` and `Learned` read `meta` keys, and only the six bucket key counts still walked. Every write site already had the "is this key new" signal in hand for its own reasons, so the increments cost nothing extra: `LearnNgram` computes `firstSighting` for `kn_succ` and branches on `isPresent` for author diversity, `addAssoc` and `IncTopic` already read the existing value to add to it, and the deletes already collect their victims into a slice. One `addKeyCount` call per site, a `backfillKeyCounts` modelled on `backfillTopicTotal` to seed an existing corpus with one walk on one startup, and `Status` becomes nine key lookups.
-
-    **The general lesson is the one finding 11 half-learned: moving an expensive read off the hot path is not the same as making it cheap.** A per-message walk is obviously wrong and gets fixed; the same walk on a five-minute ticker looks affordable, reports a number nobody checks against a walk, and quietly compounds. Ask what an expensive read *costs the writer*, not only how often it runs. The corollary for this engine specifically: a long read transaction is never merely slow in bbolt, it is also a write amplifier, which is why `CorpusStats` is a `Store` method aimed at a snapshot and `ScanTopics` is bounded by its caller.
-
-59. **The scorer decoded every association map it might need on every step, about a million entries at p90, to read one entry per candidate.** `loadAssoc` called `TopicWordsFor` for each of a prompt's core topics and for every key of `NameAssoc`, once per step, per attempt. On the production corpus a name-bearing prompt carries a median of 2,831 name topics and up to 8,942, so a step decoded a median of 24,596 entries and a p90 of 833,954 into maps, and the heuristics then read roughly a hundred of them. It was three quarters of generation CPU. The scorer now asks `TopicWord(topic, candidate)` by point lookup, and the second hop out of a name reads only its 24 strongest topics, since the term is squashed with `tanh(x/3)` and saturates on a handful anyway. The two-hop seed tier had the same shape one level up, decoding and fully sorting the largest association ranges in the corpus to keep six entries, once per source word, for a tier that won 1% of seeds; it memoizes its walk and keeps a bounded top-k. Replayed against a production snapshot, p90 went from 705 ms to 25 ms with byte-identical output. **The production latency had a second cause the code could not fix:** the container's `mem_limit` was 512m against 900 MB of corpora, and because the mmap's page cache is charged to the cgroup, the bot thrashed rather than OOMed (38k major faults in half an hour, 155 MB resident). A memory limit below the corpus fails silently as latency.
-
-60. **Mid-sentence persona filler was the most common way a reply stopped reading as a sentence.** Half of all styling spliced an interjection or a meta-comment into the interior, and finding 45 had only bounded WHERE: "gotten that is (just saying) good to alex". Replaying the archive's prompts, "(just saying)", "(or so they say)" and "(allegedly)" were among the most frequent unattested trigrams in the output. Filler goes only at the edges now, which took attested trigrams from 70.1% to 73.1% with no change in recitation.
-
-61. **Interpolated Kneser-Ney's preference for higher orders is too weak on a sparse corpus to keep a walk on attested ground.** With nearly every high-order count at one, a context keeps 1-D of its mass, so at D=0.75 three quarters of each step belonged to candidates continuing only the last word. One draw of those, and the next two-word context is usually one nobody wrote, so the rest of the reply is a bigram walk: only 23% of replayed replies were free of an unattested trigram. Lowering D did not move it, because the problem was where the walk went rather than how mass was split once there, and turning the heuristics off entirely bought four points. A `Continuity` logit of 1.0 per word of context beyond the first took clean replies to 32%, with prompt-word reuse within noise of where it was (73.5% to 73.1%) and 4-gram attestation up four points against thirty with the author gate off. It cannot reach past the gate, because a candidate's order is the one the gate already admitted it at. At 1.5 the golden fixture's criterion 7 fails: continuing the chain starts outbidding `NameTopic` for the person the prompt named.
-
-Plus, folded into the milestones that touch them: byte-based nickname truncation splitting multi-byte runes (**fixed in M0**); trim loops calling `Stats()` in a loop condition; a `ForEach` on a possibly-nil bucket; `stringContains` reimplementing `slices.Contains`; `s.User("@me")` called per reply when the bot ID is already known (**fixed in M10b**, along with `extractNamesFromMessage` being called three times per message and an `s.State.User.ID` dereference that would have panicked before the state cache filled).
-
----
+The numbered findings catalogue (1 to 61) that code comments cite is in history:
+`git show 4aaf753:SPEC.md`.
 
 ## 9. Milestones
 
-Small, mergeable PRs. `go build ./...`, `go vet ./...`, `golangci-lint run`, `go test ./... -race`, the prose check and the Docker build are all green at the end of every row.
+One milestone or slice per PR, green at every commit: `go vet`, `golangci-lint run`, `go test`,
+the prose check and the Docker build. The milestone table (M0 to M38) is in history:
+`git show 4aaf753:SPEC.md`.
 
-| # | Milestone | Deliverable | Status |
-|---|---|---|---|
-| 0 | Repo hygiene, docs, full CI/CD | `.gitignore` before `git init`; `.dockerignore`; module path; `go mod tidy`; the six punctuation fixes; rune-safe truncation; embedded dictionary; `PEREGRINE_DB_PATH`; `bbolt.Open` timeout; lint green from day one; Dockerfile, both compose files, `.env.example`, `blocklist.example.txt`; `ci.yml` with all six jobs; dependabot; docs; delete `copilot-instructions.md` | **done** |
-| 1 | `cmd/bot` and `internal/legacy` | Verbatim move, `main()` becomes `Run(ctx)`, `performDatabaseCleanup` becomes `CleanDatabase() error`, merlin's `main`/`runGuarded`/`run` split, `slog` bridged over the stdlib `log`, `godotenv`, `signal.NotifyContext`, no `os.Exit` left in `legacy`, Dockerfile builds `./cmd/bot` | **done** |
-| 2 | `internal/config` | Every constant and hardcoded value becomes an env var defaulting to today's value; the two dead knobs deleted and `Creativity` deliberately left a constant (§5.3); the hardcoded admin user ID becomes a fail-closed variable; every error reported in one pass; a bad bool or enum is a startup error rather than a silent default; autonomous-post misconfiguration names both variables; the autonomous-post ticker split off the ingest ticker; deferred-variable warnings; 92% covered | **done** |
-| 3 | `internal/core` lifecycle | `Service`/`Registry`/`Deps` and `WatchReady` ported; `IntentsGuilds` added, which makes custom emote output possible for the first time; bounded `Dispatcher` with drop accounting; `RunLoop` replacing nine background goroutines; ordered shutdown under one 8s budget; `stopSignal` and the shared WaitGroup deleted in favour of `ctx`; `math/rand/v2` replacing the shared generator; `core` at 94% coverage. Closes 3, 4, and the intent half of 7 | **done** |
-| 4 | `internal/text` and `internal/filter` | Both packages are leaves and neither logs; the filters return a reason and the caller decides what to record. Regexes hoisted to package scope, slur map becomes an ordered slice, `ContainsSlur` stops allocating a rewritten string to answer a yes/no question, `CleanSentence` takes an `EmojiResolver` instead of a session, per-call `text.Interner` replaces the global vocabulary. Found and recorded finding 27, and flipped `PEREGRINE_ENABLE_CLUSTERING` to default false as a result. Closes 2, 16, 22 | **done** |
-| 5 | `internal/safety` | Normalizer (case-fold, NFKD, strip marks and format characters, fold Cyrillic/Greek confusables and leet, collapse whitespace, join spaced single-letter runs, cap repeats); blocklist as data from `PEREGRINE_BLOCKLIST_PATH`, three categories, failing closed with every bad line reported by line number; `CheckLearn` **inside** `learnMessage` with an AST test that fails if it leaves; `CheckEmit` at the generation exit, silent on rejection; reject-not-launder made unexpressible; `PAUSE_ALL_WRITES`; rejection counters and logging that never records the offending text. `internal/safety` at 96%. Closes A1, A2, A5 and A4's mechanism. **Highest-value row** | **done** |
-| 6a | `internal/corpus`, `internal/storage`, `internal/dbtest`, `internal/maintenance` | The layer itself: composite-key codecs with a NUL assertion; the three KN indexes maintained incrementally; distinct-author counts as a presence set; `schema_version` refusing a pre-M6 corpus; `Reader`/`Writer` bound to a transaction so nothing outside storage can reach a `*bbolt.DB`; timestamp-only history keyed by fixed-width snowflake; counter-based trims; per-author purge; in-process backup and compaction. `dbtest` with no skip path. 30+ tests against a real bbolt file | **done** |
-| 6b | Switch the bot onto the seam | `internal/legacy` holds a `*storage.Store` and no longer imports bbolt, so it cannot name a bucket or start a transaction: `TestThisPackageCannotReachBbolt` pins that. Twelve bucket constants, `EnsureBuckets` and seven bucket helpers deleted; `getNextMap` and `isRecognizedName` take the `Reader` they were nesting inside; `learnMessage` writes through `LearnNgram`/`IncTopic`/`AddNameTopic`/`AddTopicWord`/`MarkSeen` and passes an empty author for the bot's own output so self-learning cannot bootstrap diversity; `cleanup.go` replaced by `internal/maintenance` with `-clean-db`, `-compact` and `-purge-author`; four local types replaced by `internal/corpus`; the clustering loop and its two dead consumers removed, with `PEREGRINE_ENABLE_CLUSTERING` becoming a deferred variable until M8. Found finding 28. Closes 1, 5, 10, 11, 18 and half of 12 | **done** |
-| 7a | `internal/markov`: the model and the sampler | The `Corpus` seam satisfied structurally by `*storage.Reader`; interpolated Kneser-Ney with `mu` replacing the unweighted shrink loop; log-space additive logits, every unbounded term squashed; temperature and top-k/top-p; injected randomness source so golden samples are reproducible without reintroducing a shared generator; author-diversity eligibility filter; `Creativity`, the `"<END>"` branch, the jitter, the per-candidate persona map and the three punctuation stubs deleted; `Reader.PrefixTotal` and a `count:topic_total` counter with a startup backfill; six dials promoted out of `deferredVars` and `PROMPT_RELEVANCE_BOOST` rescaled. Closes A6's read half and most of §5.1 | **done** |
-| 7b | The pipeline around the engine | Seed selection into `markov` as seven weighted tiers, with a bounded two-hop expansion replacing the two dead concept-cluster tiers; `findJumpWord` onto the same machinery instead of a second implementation; one consolidated persona layer whose post-pass picks its insertion point from a triangular draw; one short-skewed length model replacing three competing mechanisms, plus a bounded re-seed and a two-word silence floor found by reading golden samples; per-channel conversation memory with bounded eviction; co-occurrence sliding window closing the rest of finding 12. `clustering` deleted. Closes 12, 15, 27, G6, G7, G8 | **done** |
-| 8 | ~~`internal/clustering`~~ **dropped** | Clustering is deleted rather than rebuilt, for the reasons in finding 29. Its one defensible contribution, transitive association, becomes a bounded query-time two-hop tier in M7b's seed scorer. Findings 15 and 27 close as resolved by deletion, and `PEREGRINE_ENABLE_CLUSTERING` and `PEREGRINE_CLUSTERING_TICK` are removed rather than returned to `Config`. The row keeps its number so nobody reads a gap as an oversight and rebuilds the pass | **dropped** |
-| 9 | `internal/ingest` | Per-channel high-water cursors in a new `cursor` bucket, monotonic so a confused caller cannot rewind one; `afterID` paging, with the lookback demoted to a first-pass bootstrap bound and `SnowflakeAt` to anchor it; the count-then-fetch double scan deleted rather than replaced; `errgroup.SetLimit` at both fan-out levels from two variables that were deferred to this row. A `Learner` seam keeps `learnMessage` in legacy, so the historical path still goes through `CheckLearn`. 91% covered against a fake that implements Discord's `afterID` semantics. Closes 13, 14 | **done** |
-| 10a | `internal/discordguard` | Every outbound call through one type: explicit empty `Parse`/`Roles`/`Users` and `RepliedUser: false`, `CheckEmit` at the chokepoint instead of at the generation exit, `PAUSE_ALL_WRITES` covering reactions too, `PEREGRINE_IGNORE_CHANNELS`, and every error logged at a level matched to how benign the failure is. `TestNothingBypassesTheGuard` parses the package so a fourteenth send site cannot skip it. The per-message REST `s.Channel` NSFW lookup becomes `s.State.Channel`, failing closed. Closes 8 and A3, and clears the last blocker on `DEPLOY_ENABLED` | **done** |
-| 10b | The reactor split | `handleMessage` becomes a table of named steps with a consume contract, so a command stops the run instead of falling through into the reply and learn steps (finding 9). Self-learning keyed by the reply's own message ID rather than the user's, which was silently discarding one message per interaction (finding 6). `extractNamesFromMessage` memoized per message, down from three calls. `s.User("@me")` per reply replaced by the state cache, and a `MessageReactionRemove` routed through the guard. Two AST tests: only a command may consume, and the caller count now scans every file in the package. Closes 6, 9. **The step functions stay in `internal/legacy`; the move to `internal/plugins` rides with M11**, because the state they close over is the engagement features | **done** |
-| 11a | Word games, rewritten | `internal/wordgame`, replacing the root package. The game has an owner: a `Manager` holding every live puzzle behind one mutex where there were two, a **sweep** replacing up to three sleeping goroutines per game, and every literal from the handler promoted to configuration. The scramble cannot recurse to death and the dictionary refuses the words that made it. The leaderboard's mutex is unexported and its marshalling happens under it. The NTP weekly reset is gone (finding 17), and with it `beevik/ntp`. Word games default ON. Found finding 30 and untangled it. Closes 17, and the word-game half of §6 | **done** |
-| 11b | The rest of engagement | The image cache rekeyed to `<msgID> NUL <url>` with the author in the value, which is what makes A7's per-author cap, deleted-message rule and destination checks buildable at all; schema 2 with a narrow migration, the project's first, because the image cache is cheap to discard where the corpus is not. `internal/activity` replaces `getActiveChannels` and `countRecentMessages` outright: the two features that paged hundreds of REST calls per tick now read the gateway's own traffic, the word-game manager's duplicate activity map folds into it, and two hardcoded windows become variables. Authorization becomes a chokepoint with an AST test (19). The emote resolver gets its first end-to-end test, a decade-old shortcode path that nothing had exercised. Autonomous posting's default stays false, deliberately and for a stated reason. Closes 19, A7, the M11 half of 14, the rest of §6 | **done** |
-| 11c | The plugin move | **M10b's deferred half.** Five shared packages extracted first, because the reactor steps cannot move until what they share does: `internal/names`, `internal/learn`, `internal/generate` (with the conversation memory) and `internal/channels`, plus `corpus.StartOfWeekUTC` and `text.IsStopWord` collapsing three and two copies respectively. Then each step to `internal/plugins/{chat,aggro,images,games,autopost}` with the state it closes over, and registration to a `registerServices` function in `cmd/bot` where the ordering is visible. `internal/legacy` drops from 3,100 lines to 250. Two structural tests widened from one package to the whole module and both got stronger for it: the guard-bypass scan now permits **no** adapters anywhere, and the bbolt-import check moved into `internal/storage`, which is the package that owns the invariant. **Found a real hole in A6 while porting a fixture** (see finding 31) | **done** |
-| 12 | voicenotes: the plugin, over an Engine seam | `internal/plugins/voicenote` is a complete `core.Service`: a bounded queue, a context-bound worker, a placeholder posted before a job is queued (and no job when the placeholder is refused), a full queue that drops and says so rather than leaving "in progress" forever, and every message through the guard. The `Engine` interface is the seam, and **the only implementation that ships reports itself unavailable**: the one peregrine had needed a 465 MiB model and platform binaries that exist in no deployed environment, so the seam is what this repository can honestly own. The root `voicenotes/` package is deleted, and with it every CWD-relative path in the codebase. The flag on with no engine is a startup **warning** naming the seam, never silence. 96% covered. Closes 21 by deletion; the engine's own defects are catalogued in the package comment so an implementer does not write them again | **done** |
-| 12b | A transcription engine | Whatever implements `voicenote.Engine`. The package comment lists what it must not reproduce: a bare `http.Get` with no timeout, status check or size cap; `exec.Command` with no context; binary, model and scratch paths resolved against the working directory; a scratch filename built from the URL by hand. `PEREGRINE_WHISPER_MODEL`, `PEREGRINE_VOICENOTES_DIR` and `PEREGRINE_TRANSCRIPTION_TIMEOUT` are deferred to this row | |
-| 13 | health, backups, `legacy` deleted | **`internal/legacy` is gone.** Its last three behaviours become `internal/plugins/ingest` (the walk's three adapters plus the loop) and `internal/plugins/health`. `internal/plugins/backup` puts `Store.Backup` on a ticker with three retention rules, each of which is a way to lose everything: temp-then-rename, prune only files this service named, and never prune after a failed snapshot. The health report carries the four counters that existed for exactly this purpose and were read by nothing, as deltas as well as totals, and the latency probe reads `Session.HeartbeatLatency()` instead of making a REST call to time itself. The dead `cluster` bucket, its blob kind and the two blob methods that only clustering used are removed, six milestones after the feature | **done** |
-
-| 14 | Name awareness, and the jump | The machinery for talking about a person existed since M7a and was starved: the backfill wrote no associations at all (finding 33), mentions reached generation as opaque `<@123>` tokens, `GlobalName` was recorded nowhere, and the keyword path replaced the prompt with a fixed string, discarding the message on the path the bot is most used through. One `names.Spellings` answers what somebody is called, `names.Substitute` puts names where the markup was in the prompt **and** the corpus, and the author is merged into the association set inside `Learner.Message` so a third caller cannot get it wrong. A recognized name gets its own seed tier and `Weights.PromptName` rewards naming the person under discussion rather than any learned name. The seed ladder is respaced with bounded within-tier bonuses and one dead tier deleted (34), and `Jump` is bounded four ways because it was the single source of unreadable output (35). The golden harness resolves names, so the name path is visible to the only instrument that can judge it. Closes 33, 34, 35 | **done** |
-
-| 15 | The output instrument, and the seed ladder | §1 principle 7 and §5.5: the output bar written down, and the first tests that can fail when the engine gets worse in the direction every heuristic pushes it. A rewritten golden fixture of ~150 authored lines across ten authors and five named people, with associations written the way `learn.associate` writes them rather than hand-listed, and **shared idioms inside different sentences rather than shared sentences**, because the first version made recitation structurally unavoidable and the metric measured the fixture. Then four defects the samples exposed: the seed ladder becomes per-tier budgets, taking the name share from 4.57% to 33% and holding it steady across prompt lengths (36); the dead name-positional tier deleted with the pin that would have caught it and finding 34 both (37); `TrimDangling` stops licensing trailing prepositions and ungoverned pronouns, which was 30% of replies (38, 39); the backoff floor counts survivors of the author-diversity gate rather than candidates it is about to delete (40); and a seed may no longer open on a conjunction (41). Findings 42 to 46 are verified and carried forward | **done** |
-| 16 | The name and context logits | Finding 42's direct name-topic logit, finding 43's deletion of `PromptGravity` and `text.Similarity`, finding 44's `CurrentTopic` fix, and finding 45's persona splice bounds plus the harness change that makes styled name replies visible at all. Split from M15 deliberately: the seed decides what a sentence starts on and the logits decide where it goes, and merging them makes the golden diff unattributable | **done** |
-| 17 | The association re-walk | Finding 46. A one-shot pass reusing `internal/ingest` with two adapters, a `learn.Learner.Associations` entry point still behind `CheckLearn` with the AST test widened to every writing entry point rather than just `Message`, and its own cursor bucket. **Additive and time-bounded, not drop-and-rebuild**: only messages older than the finding-33 fix lack associations, so walking exactly those double-counts nothing, and an interruption is monotone progress instead of a corpus left worse than it started. A `names.Session` cache is a prerequisite, since `GuildMember` is an uncached REST call per mention | **done** |
-| 18 | Repair as a mechanism | Finding 46's second half. `assocfill` becomes `internal/plugins/repair` with a job table, so the next repair is a row rather than a plugin; per-job completion markers and a job-namespaced cursor bucket replace two single-purpose keys. `learn.Generation` is stamped in the corpus on first open, so a boundary is read rather than remembered, which deletes the fresh-corpus special case in `initialize`. `SetCursor` and its association copy collapse to one monotonic implementation (finding 28's shape in storage), `RepairState` becomes a named type so an unwritable state cannot be spelled, and the dead `OldestSeen` goes. The member cache moves to `internal/names` behind the interface that package already declares, gains a TTL and a bound, and is used by the **live** ingest path too, where `GuildMember` is an uncached REST GET per mention. `PEREGRINE_ASSOC_BACKFILL*` are startup errors naming their replacements rather than variables that quietly stopped being read | **done** |
-| 19 | Context, and two gates that can fail | Findings 47 to 50, then the capability. Criteria 7 and 8 in section 5.5: one gate measures what context adds and one measures what it risks, both set from a measurement. Three harness defects first, because the gates could not be written correctly over them: `sweepSamples` threw away prompt attribution, its styled and unstyled passes shared an RNG seed so half the sweep was a decorated duplicate, and the harness had no conversation memory at all, so the recency path would have printed nothing. `Sentence` takes a `Request`. `RecentContext` moves 0.25 to 0.45 from a sweep against the gates rather than from taste: prompt responsiveness 1.33 to 2.75, engagement 48.6% to 50.0%, wrong-person 16.7% to 11.1%, at no measurable cost to recitation or attractor share | **done** |
-
-| 20 | The tuning export | §10's five "revisit against real ingested text" decisions have been blocked on one thing since M7a: the only instrument that can judge output is the golden harness, and it runs against a synthetic fixture. `internal/tuning` is a stdlib-only wire format plus a rotating JSONL writer carrying backup's three retention rules; `markov.Trace` hangs off the caller-owned `Step` and `SeedInput` so the engine keeps no per-sentence state, and records the seed tier by NAME, how far the backoff went, and how often the author-diversity gate emptied the candidate set rather than merely trimmed it. `internal/plugins/tuning` is the service: a recorder that drops rather than blocking the reply path, a bounded map watching each sent reply for one window, and a `MESSAGE_REACTION_ADD` handler behind `IntentsGuildMessageReactions`, which is the first engagement signal this bot has ever had. Silence is recorded too, because the too-short rate is the number §10 is really about. Refused sends carry no text, matching `internal/safety`. `-tuning-report` aggregates an archive with no corpus, no token and no network, and refuses to average across a version or dial change it can see | **done** |
-
-| 21a | The leaderboard, and the presence line | `!leaderboard` resolved a display name for EVERY user in the week's stats before sorting anything, through an uncached `GuildMember` REST GET: on a busy server that is hundreds of sequential rate-limited requests to render twenty rows, and it keyed the board by resolved NAME, so two people with the same nickname merged into one row. Ranking moves into `wordgame.Rank` and is competition ranking computed from scores alone, so the viewer's position needs no name resolution at all and only the eleven rendered rows get one, memoized across both boards and backed by the M18 member cache this call site never received. That is what makes the eleventh slot possible: ranks 1 to 10, then the viewer's real rank under a divider, or a line saying they have none. Rendering becomes one embed through a new `Guard.SendEmbed` that runs `CheckEmit` over EVERY text field, because a nickname is user-controlled text and a rule applied to the description alone is a rule applied at thirteen of fourteen sites. `Guard.Presence` is the status line, content-gated (a corpus word is public output) and deliberately NOT pause-gated (`Unreact`'s asymmetry: a frozen status line makes a paused bot look dead), fed from the counts `health.reportStatus` already pays for. Found a FOURTH `StartOfWeekUTC`, in `internal/wordgame`, which M11c's collapse of three missed | **done** |
-
-| 21b | The word-game pass | Four changes, and the first is the reason the others were worth doing at all: `!wordgame` refused an unauthorized caller by returning, with no log line and no reply, which is indistinguishable from a broken bot. The case that mattered is the operator's: with `PEREGRINE_BOOTSTRAP_ADMIN_USER_ID` unset, `Authorized` fails closed and refuses **everyone** including the person who deployed it, so the refusal now names which of the two it was, and a guard-refused announcement says that too. That is finding 32's shape in a command rather than in the reply path: the bot staying quiet in the channel is the design, the operator being unable to tell why is the bug. Hints are a field on the `Game` swept by the sweep that already expires puzzles, so they cost no goroutine and inherit `RunLoop`'s panic isolation for free, and they EDIT the announcement rather than posting again. `!wordgame <word>` accepts only two tokens whose first is the command, which is what preserves `commandFor`'s whole-message property, and a planted word is held to `LoadDictionary`'s own rules through the same `usable`, because the two-distinct-letters rule is what stops `scramble` recursing and a word arriving by a route that skipped the loader would leave the scrambler's bound doing that alone. Streaks and records are `omitempty` fields on the persisted board, so an M11-era blob loads with zeroes rather than being refused: a week of wins is not re-derivable, unlike the corpus | **done** |
-
-| 22 | The scorer's scale, and the last two unseeded draws | Findings 51 and 52. `Step.Position` was a fraction of the length CAP while the corpus records position as a fraction of a MESSAGE, so every position-matching term ran in the bottom third of its own domain and `Connective`'s late-dampening branch was unreachable. It is `Length.Progress` now, a method rather than a line in each caller, because production and the harness had the same wrong copy. The length target and the persona post-pass were the two draws that never went through `markov.Source`, so `internal/generate` could not produce the same text twice under a seed and the visible half of the persona was unpinnable | **done** |
-
-| 23 | The corpus report, and the first real measurement | `-corpus-report` is the instrument section 10 has been blocked on since M7a: five of its open decisions say "revisit against real ingested text" and the only thing able to judge the engine ran against a 150-line synthetic fixture. `storage.OpenReadOnly` is the half that makes it safe to point at a corpus, because `storage.Open` creates buckets, stamps a version and can run the v2 migration that empties the image cache, and a mode that mutates what it was asked to measure has changed the thing it is describing. One sequential cursor pass over the composite-key n-gram bucket answers three questions at once in constant memory, since every edge sharing a prefix arrives contiguously. It reports **raw distributions and nothing else**: teaching a maintenance mode the scorer's formulas would couple it to `markov`'s constants and give the two a way to disagree, which is finding 28's shape, so it prints the admission curve at every candidate threshold and names which one is configured rather than printing a recommendation. Findings 53 to 56 are what the first run found, and three of M22's four open telemetry questions turned out to be answerable from the corpus alone. The end sentinel is reported as its own line because its count is exactly the message count, which otherwise reads as a double-count bug | **done** |
-
-| 24 | The count-aware author gate | Findings 54, 53 and 57. `PEREGRINE_MIN_DISTINCT_AUTHORS` at 2 refuses 93.8% of edges and leaves 0.93 admissible continuations per prefix at order 1, while the concentration it names has one instance at count 10 in the whole corpus. The gate keys on count as well as authors, because raw frequency is what makes poisoning work. **The harness then found that this was not enough and not the main lever**: admitting single-author edges at every order took recitation from 2.4% to 19.8% against a 10% bar, because a continuation reachable from a long context is somebody's sentence rather than shared vocabulary, so the allowance is capped at two-word contexts and the variety gain survives with recitation back at baseline (57). `admissible` is one predicate serving the sampler, the jump and the seed, because finding 31 was this control existing at one of three producers of words. The allowance requires at least one real author, so the bot's own output can never vouch for itself through the count clause. Finding 53 rides along as one exemption: the end sentinel is a topic-bucket entry whose count equals the message count, so `Significance` was paying it the saturated maximum at every step and the length model did not know there was a third mechanism arguing with it. On the real corpus the shipped gate admits 59.97% of edges against 21.10%, and leaves 53.24% of prefixes dead against 75.40% | **done** |
-
-| 25 | The gauntlet, the hint ladder and the repost | The word game worked and was dull: every round paid the same, so the only skill it expressed was being online and typing fast, and there was no decision in it anywhere. Three changes that are one change. A hint becomes a LADDER whose rungs uncover more of the answer and each cost a point, so waiting is a trade against guessing now and a hard word is worth more than an easy one; `PEREGRINE_WORDGAME_POINTS_BASE` at or below `HINT_LEVELS` is a startup error naming both, because a score that floors at one makes the last rungs free and the trade silently stops existing. Rungs REPOST rather than edit, reversing M21b with its reason answered: an edit arrives "where people are already looking" only while the card is still on screen, and in a busy channel it is not. The new card goes up **before** the old one comes down, because a refused send after a delete leaves a live puzzle with nothing to look at until it times out. `!wordgame <n>` queues a gauntlet that advances on the previous puzzle CONCLUDING, by solve or timeout, swept by the loop that already expires games so it costs no goroutine. `Authorized` widens to guild Administrator and stays ONE function, reading the state cache rather than a REST call and failing closed on a miss. Puzzles become embeds through the existing `SendEmbed`, whose gate already walks every text field; Components V2 is deliberately NOT adopted, because its flag disables embeds and would make a recursive component walker load-bearing safety code for a payoff (a button beside the text) that M26 has not built yet. Two defects found by the tests rather than by reading: `announce` abandoned the game on a refusal, which is right for a first card and deletes a live puzzle for a hint, and `DueHints` handed back live pointers at the wrong level, so a hint card rendered with no hint on it | **done** |
-
-| 26 | The slash command, and the interaction chokepoint | `/wordgame` is the first application command peregrine has ever registered, which settles half of section 10's open kill-switch question: the registration work is done and the surface exists. **The guard closed first, and it had to.** `InteractionRespond` was not in `TestNothingBypassesTheGuard`'s forbidden list, so adding a handler without adding it would have opened a speaking path that skips `CheckEmit`, `PAUSE_ALL_WRITES` and `PEREGRINE_IGNORE_CHANNELS` at once, which is the M10b `MessageReactionRemove` gap on a bigger surface. An interaction response is a send: ephemeral narrows who is harmed, not whether the bot said it. `Guard.Respond` and `RespondEmbed` are gated and mention-suppressed exactly like a channel send; `RegisterCommands` is deliberately NOT content or pause gated, because a command definition is the bot's own text and the pause is a mute rather than a deregistration, and refusing it during an incident would leave the commands registered anyway while breaking the next clean startup. A bulk overwrite rather than per-command creates, because it deletes what is no longer listed. **The ephemeral reply resolves a dilemma M21b could only pick a side of**: answering a non-admin in the channel advertises that the command exists, so the bang command refuses in silence, and the case that bit was the operator's own, whose command did nothing with the reason only in the log. Every exit answers the caller now, which is finding 32 inverted: silence in a channel is a design decision, an unanswered interaction is Discord showing the one person who was definitely paying attention a failure. The handler registers in `Init` for the reason `chat.Init` states, dispatches through `core.Dispatcher`, and reads permissions straight from the payload, so the interaction path makes no REST call at all and feeds the same one `Authorized`. `!wordgame` is not removed: a soft move, so the slash command is the blessed path rather than the only one | **done** |
-
-| 27 | The embed design pass | M25's cards had the right information and the wrong presentation: four embed slots (title, description, a field, footer) on what is really two facts, a heading saying "Word Scramble" above a word scramble, an instruction to unscramble the scrambled word, and a three-clause footer, in a server whose bot talks in lowercase. A card is **description only** now: the scramble is a header, the mask sits under it, and everything else collapses into one `-#` subtext line, which is two lines live and three when hinted. The four state colours are unchanged and are doing the work the deleted title used to. The countdown is what forces the layout rather than taste: Discord renders `<t:N:R>` in descriptions and field values only, never in a footer or title, so the part of the card that most wants to be small cannot use the small slot, and subtext is the only way to get footer-sized text into a description. The letter count drops once a rung lands, because the mask says it more directly and that is what keeps the subtext to one line as it gains counters. The copy goes deadpan lowercase, and the reason is the opposite of what "match the register" implies: this chrome repeats on every puzzle and a fixed joke stops being funny by the fourth time, so peregrine's chaos stays in the generated text, which varies. The leaderboard gets the same treatment with its **two inline fields and eleventh slot deliberately untouched**, because both were measured decisions: the columns stack on a phone where the code-block table they replaced scrolled off screen, and the divider plus the viewer's own row is the whole reason ranking is computed from scores alone. The real work was the tests: a dozen assertions pinned behaviour through prose (`Contains(post, "Unscramble")` is asking whether a puzzle went up), so the structural ones now read the embed's state colour and survive the next copy change, which this one proves will happen. A new test pins the card at two lines and three, description-only, one subtext line and it at the bottom | **done** |
-
-| 28 | The puzzle goes back to a chat message | M25 made the word game an embed and M27 made that embed compact; the feedback was that it is still **too disruptive**, and the feedback is right. An embed is a CARD: a coloured bar, a box, a chunk of visual weight saying "this is a notice" every time it appears. A word game is not a notice, it is a thing somebody said in the channel, and a bot posting a card every few minutes is a bot that keeps interrupting. **The formatting survives the container**, which is why this costs almost nothing: everything the description carried is markdown a normal message renders identically, and two parts work strictly better outside an embed, since headers and subtext are ordinary message markdown and the relative timestamp no longer has a footer or a title to be excluded from. What is genuinely lost is the state colour, and it turned out to be near-redundant: a mask only exists on a hinted puzzle, "hint 1/3" only appears once a rung has landed, and a message opening "nobody got" is not ambiguous about how it went. The header stays and is **more** load-bearing than before, not less: without a box to make the message findable in a scroll, the scramble being an H2 is the only thing that catches a skimming eye. The leaderboard stays an embed, because a weekly board IS a notice and its two-column layout is the thing that made it readable on a phone. The tests moved a third time and landed somewhere better than either previous home: M27 had put the structural assertions on the embed's colour, which was decoration the renderer happened to set, and they now read the message's payload (the header line, the mask, the rung counter), which is what the message exists to convey | **done** |
-
-| 29 | The run recap, and the call to action | Two asks and one bug found while serving them. `✨ unscramble ✨` is back above the scramble, lowercase, and it costs a line on every puzzle, so the shape test's budget moved from two and three to three and four **rather than the line being smuggled in against a stale number**: a budget nobody may change is a budget people route around. And a gauntlet now ends with a recap of what everybody took from it, which is the thing a run has that a lone puzzle does not. Every number in it is ordinary points already counted on the weekly board, so it is a report and not a second scoring economy: the recap is the match, the board is the season. The tally lives on the `Manager` beside the rest of the gauntlet state rather than growing a second home in the service, is bounded twice over (per channel, and by the round count inside that), stores the display name at win time because the render path has no resolver and should not acquire one, and is **taken rather than read**, so whoever prints it owns it and a run that ends without printing cannot leave it behind. It records against the GAME's own `Rounds` rather than asking whether a run is in flight, because `StartWord` deletes the queue when the last round starts and the obvious gate would have dropped the win that closes every single run. **The bug: a run whose last round timed out ended in silence**, because the closing message was sent from the win path only. That is finding 32's shape on the ending most likely to leave people wondering whether the bot broke, and both endings now go through one `finishRun` | **done** |
-| 30 | Word games get a settings command | Where puzzles run, whether they start on activity or on a timer, and how often, all lived only in the environment, so moving the game to another channel was editing `.env` and redeploying: the wrong lifetime for a setting an operator wants to change while people are in the channel. The three are a `BlobConfig` blob now, the way aggro persists its target, and `/wordgame-config` owns them. The environment still supplies the defaults, and Init **logs which of the two sources won**, because a stored value silently shadowing `PEREGRINE_WORDGAME_CHANNELS` is CLAUDE.md's knob-wired-to-nothing trap pointing the other way; `reset:true` writes the environment's values back over the stored ones. The interval poster gave up its own `core.Loop` and rides the sweep, because a Loop's period is fixed when it starts and a configurable interval and a dedicated ticker are incompatible: the cost is one sweep tick of resolution, five seconds against a five-minute minimum. Two things had to be got right rather than noticed later. The config command is deliberately **not** gated on the allowlist it edits, since the command that binds the channel you are standing in cannot require that channel to already be bound, and binding the wrong one would otherwise leave the feature unrecoverable from Discord. And **unbinding the last channel means anywhere**, which is the opposite of what the word sounds like, so the reply says so. A second command rather than more options on `/wordgame`, and no bang equivalent: `commandFor` takes exactly two tokens, and a settings answer wants to be ephemeral for the reason M21b states about refusals | **done** |
-| 31 | One corpus per guild | The bot kept ONE corpus for every guild it was in, so a phrase learned in one server was a generation candidate in another: a leak of one server's chat into somebody else's, and a register problem on top of it. Separate FILES rather than a guild dimension on every key, and the deciding reason is not the diff (ten key builders, six separator-free buckets, 35 Reader and 20 Writer methods, and `Bucket.Stats().KeyN` cannot be prefix-filtered) but what the two designs make possible: a prefix is isolation by CONVENTION, where a separate `*Store` per guild cannot name another guild's keys at all, which is the argument `Reader` already makes about nested transactions. `storage.Set` opens lazily, is bounded, stamps the learn generation on each corpus's first open, and REFUSES an empty guild, which is the DM decision and the trap the research found: ingest and repair wrap a REST message whose `GuildID` is empty, so anything reaching for `m.GuildID` would have filed every backfilled message under one key. `PEREGRINE_DB_PATH` became a DIRECTORY and kept its name, because a rename lets a stale value stop being read silently: an existing file is a startup error naming the new shape. Per guild now: leaderboards, M30's word-game settings, aggro targets (with the activity tracker's author map keyed by guild so a poke lands on somebody who is actually there), the image repost pool (the purest leak, since it needed no corpus read at all), repair state and boundaries (one pass per guild via `OnlyGuild`), and backup families (`markov-<guild>-<ts>.db`, `Keep` per guild: the old prune would have kept `Keep` files in TOTAL and the one-second timestamp would have collided). Two bugs found by the conversion rather than by reading: a closed `Set` would REOPEN a corpus for a goroutine still in flight, taking a flock nothing alive would release, and `chat.requester` dereferenced a nil state cache the moment test messages stopped being guildless | **done** |
-| 32 | The paginated local and global leaderboard | The board showed the top ten of one server and stopped, which after M31 left two questions it could not answer: where the eleventh to the thirtieth places are, and how a server compares to the others the bot is in. `/leaderboard` takes a `scope` and the board carries **prev and next buttons**. Three things about it are load-bearing. The button state rides in the `custom_id` (`lb:<scope>:<page>`), so there is no pending map to leak and a restart still answers a press on a board posted last week; the GUILD is deliberately NOT in it, against the plan's own sketch, because a component interaction already carries the guild it was pressed in and a second copy that could disagree is a way to render one server's board into another, which is the leak M31 exists to make unwritable. `Rank` gained a page and the eleventh slot now means "not on THIS page", so paging away from your own row does not hide it and paging onto it does not print it twice; ranks are computed over the whole field before the slice, or page two would renumber everybody from one. And the guard work came FIRST, the way M26 did it: `onInteraction` used to discard `InteractionMessageComponent`, and `Guard.UpdateEmbed` runs the same `CheckEmit`-over-every-text-field walk, pause switch, ignore list and explicit `AllowedMentions` as `SendEmbed`, because "the reader already had this message open" exempts nothing about what is going INTO it. Two things fell out of the work rather than being planned: discordgo's `MessageComponentData` type-ASSERTS, so an interaction whose type and data disagree panicked the goroutine that read it, and the display-name resolver moved from `chat` to `names.Display`, because the reactor had been carrying a member cache for one closure it passed downwards and a global board resolves people who are not in the caller's guild at all | **done** |
-| 33 | Admins can let others start games | Only a guild Administrator or the bootstrap admin could start a word game, so a server whose admins are rarely around had games that mostly did not start. `/wordgame-config` gained `allow` and `deny`, each a Discord mentionable (a role or a member), stored in the guild's settings blob. `MayStart` is `Authorized` OR a grant, and `Authorized` itself is unchanged: it stays the one authorization check and still fails closed, and the config command is still gated on it rather than on a grant, so a granted role can start games but cannot grant itself more. | **done** |
-| 34 | The status line stops walking the corpus | `Reader.Status` answered six of its nine fields with `Bucket.Stats().KeyN`, which walks every page in the bucket. Finding 11 caught that call once already, per message, and moved it to a ticker without making it cheap; on the production corpus the walk had reached **26 seconds every five minutes**, and the second-order cost is the one that mattered. bbolt is copy-on-write and cannot reclaim a page while a transaction that might still see it is open, so a read transaction of that length made the writer allocate fresh pages for 9% of every hour: the file grew, the next walk crossed more pages, the window widened. The status line was reporting corpus growth and causing some of it, and the visible symptom was a **1m34s** reply latency on messages landing inside the window against a sub-second median (finding 58). Six `meta` counters replace the walks, which is the pattern the other three fields already used, and every write site already had its existing-key signal in hand: `LearnNgram` computes `firstSighting`, `addAssoc` and `IncTopic` read the old value to add to it, the deletes collect victims into a slice. `backfillKeyCounts` seeds an existing corpus with one walk on one startup, modelled on `backfillTopicTotal`, and leaves an empty bucket's key absent so a fresh corpus is never walked. The test compares the counters against an actual walk of the same file after inserts, repeat writes, no-op deletes and a purge, because a counter consistent with itself can be consistently wrong; **it was written by mutation**, and two of the five broken versions it was supposed to catch passed the first fixture, which is how the multi-author edge and the second identical write pass got into it | **done** |
-| 35 | Wheel of Fortune, gold, and a lifetime wallet | A second game, and the first one people sign up for. `/wheel` opens a lobby card; players join with a button and play the match on that one card: spin, call a consonant, buy a vowel, solve, then a bonus round for the top bank with RSTLNE given. Letters and solves are typed into a modal. Gold is a third column on the weekly board and a lifetime wallet (`/wallet`), paid in one transaction when a match ends. Four engine properties are structural rather than remembered: a `Result` comes back exactly once, from the locked section that deletes the match, so gold cannot be paid twice; an error never changes anything; every turn action carries a Turn token, so a click aimed at a turn that timed out cannot land on the next one; and a wrong solve is never carried, so one blocklisted guess cannot make every repaint of the card fail the emit gate. The card is a card, the opposite of M28's call for puzzles, because a match is asked for and played on it. A press is answered with the repaint itself and a one-second sweep repaints everything else through the new `Guard.EditEmbed`; the card moves to the bottom only at a round boundary in a channel that has moved on from it. It lives in `games` because `games` owns the in-memory weekly board, the one place gold can be written without being overwritten. Five PRs: engine, guard, board column, the game, docs. A sixth, M35f, is the polish pass: an emoji-tile board, a letters tracker and one field per player, a recap between rounds so the answer and its solver are actually shown, reposts driven by conversation rather than round boundaries (a press on a replaced card still counts and is acknowledged), and a generated wheel strip as the embed image, which pins the card's width and lights the wedge a spin landed on. | **done** |
-| 38 | Generation measured on real text | `tools/replay` regenerates a tuning archive's prompts against a corpus snapshot under a seeded source and reports latency, attested bigrams, trigrams and 4-grams, the share of replies with no unattested trigram, and prompt-word reuse, which is the instrument section 10 kept asking for. Three findings came out of its first run: the scorer decoding a million association entries per step to read a hundred (finding 59, p90 705 ms to 25 ms, plus the container's memory limit sitting below the corpus), mid-sentence filler (finding 60), and walks stranded on bigrams (finding 61, clean replies 23% to 32%) | **done** |
 ---
 
-## 10. Open Decisions
+## 10. Open decisions
 
-- **`mu` and `D` need real values.** 0.25 and 0.75 are starting guesses. The right numbers are whatever makes golden samples read like the server, and the golden harness that can answer that exists as of M7a but has only a twenty-line synthetic corpus to work from. Revisit with real ingested text.
-- **The fourteen logit weights need the same treatment**, and for the same reason: `DefaultWeights` is a considered first guess, not a measurement.
-- **`PEREGRINE_TEMPERATURE` may want to be higher than 1.0.** Reading the M14 sweep, 1.6 gave noticeably more variety than the 1.0 default while staying legible, and 2.5 started to degrade (`the server is peak bird is doomed`). This is deliberately **not** a changed default: the golden fixture is twenty-six lines, a real corpus has orders of magnitude more candidates for a high temperature to spread over, and changing a default on the strength of a synthetic fixture is the exact mistake finding 29 recorded about a tuning constant nobody validated. It is one line in `.env` and a restart, so it belongs to the operator until there is a sweep over real ingested text.
-- ~~**`PEREGRINE_MIN_DISTINCT_AUTHORS` needs a real value.**~~ **Measured in M23, and the answer is that the shape of the control is wrong rather than its value.** At 2 it refuses 93.8% of edges and 76.3% of the mass, leaving 0.93 admissible continuations per prefix at order 1 and effectively none above it, while the concentration it defends against has exactly one instance in the corpus at count 10 and none at count 20 (finding 54). The interaction with a young corpus described here turns out not to be a transient: 19,387 messages in, the corpus is still "young" by this gate's standard, because the gate measures something a chat corpus produces very little of at any size. **Done in M24, and it needed a second dimension nobody had predicted.** Count-awareness alone doubled recitation, because a single-author edge at a long context is somebody's sentence rather than a rare phrase, so the allowance is capped by context length too (finding 57). At the shipped settings the real corpus goes from 21.10% of edges and 75.40% dead prefixes to 59.97% and 53.24%. The value of `MIN_DISTINCT_AUTHORS` itself is still 2 and is still not independently validated; what changed is that it is no longer the only thing standing between the engine and the corpus.
-- **Backing off to a one-word context produces grammatically disconnected joins, and that is the sparse-corpus tradeoff rather than a defect.** The golden samples show "bro what are you know what i am going to lose it": the author-diversity gate refuses every high-order continuation of "bro what are you", enumeration backs off, and "you know" is a perfectly well-attested bigram that reads as nonsense after "are". Penalizing low-order continuations harder would fix it and would cost variety and raise recitation, which are the two things §5.5 exists to protect. ~~**It is probably a fixture-size artifact:** the golden corpus is 150 messages, so high-order contexts rarely have two authors, and a real corpus has far more high-order coverage.~~ **Measured in M23: it is not an artifact, and the guess was wrong about the cause.** A real corpus does have far more high-order coverage, and the author-diversity gate refuses more of it, not less: 94.05% of order-2 prefixes and 98.74% of order-3 prefixes have no admissible continuation at all, so the backoff to a one-word context is not a fallback the engine reaches occasionally but the ordinary case (finding 54). The mechanism was read correctly and the blame was placed on sparsity rather than on the control. It is not a tuning question for the low orders; it is downstream of M24's gate.
-
-    **M24 improved it and deliberately did not remove it.** Dead prefixes fall from 75.40% to 53.24%, so the backoff reaches a one-word context far less often, and the golden samples show the effect directly: three identical draws for one prompt became three distinct ones. But the allowance is capped at two-word contexts precisely because lifting it further is what produces recitation, so the low-order join is now a **deliberate** price for principle 7 rather than an artifact of a control nobody had measured. That is the equilibrium M22 asked about, and it has a number on both sides of it now.
-- **The persona lexicon matches whole tokens and real chat inflects.** "cope" is in the lexicon and "coping" is what people write, so the bias silently misses the common form. Stemming is the wrong answer for a meme register; a hand-extended lexicon is probably the right one. M7b's persona layer decides.
-- ~~**Should a winning word-game guess be consumed?**~~ **Decided in M11b: no, and the behaviour stays as it is.** The oddity is real (the win path deletes the guess message, and learning something the bot then removed from the channel reads strangely) but it resolves the wrong way round. A guess is a real word a real person typed in conversation, which is exactly what the corpus is for; the deletion is cleanup of a puzzle exchange, not a judgement about the content. Consuming it would mean the bot stops learning from a legitimate message because of a housekeeping decision made elsewhere, which is the shape of finding 9 rather than a fix for it.
-- **`kn_pre` pruning policy.** Deferred until there is data, per §3.2.
-- **A kill switch reachable from Discord.** `PAUSE_ALL_WRITES` needs SSH and a restart, which is slow during exactly the incident it exists for. Merlin solved this with a slash command, but peregrine registers none today, so it would be new surface. Still open, and M11b narrowed it rather than deciding it: `authorized()` is now a single fail-closed chokepoint with a structural test, so the authorization half of a `!pause` command is already built and a second operator command no longer means a second copy of the check. `Gate.SetPaused` is the other half. ~~What remains genuinely undecided is whether a bang command is the right surface or whether it should be a real slash command, which is registration work peregrine has never done.~~ **Half answered in M26, and the answer is a slash command.** `/wordgame` registers a real application command, so the surface exists and the argument from novelty is spent: `Guard.Respond` gates an interaction response like any other send, `Guard.RegisterCommands` publishes the set, `TestNothingBypassesTheGuard` covers the interaction methods, and the handler pattern is one file another command can copy. What a pause command still needs is its own decision about scope, not new machinery. The ephemeral reply is the part that matters most for this one: a kill switch answering only the person who pulled it is exactly right, where a bang command would have to choose between announcing an incident to the channel and leaving the operator unsure whether it worked.
-- **Repository visibility.** Given the blocklist and this threat model, private is the better default. The blocklist stays out of the repo either way.
+- **`mu`, `D` and the logit weights need values measured on real text.** The defaults are
+  considered guesses; `tools/replay` is the instrument.
+- **`PEREGRINE_TEMPERATURE` may want to be higher than 1.0.** 1.6 read with more variety on the
+  golden fixture and 2.5 degraded. Not a changed default until a sweep on real text agrees.
+- **Low-order joins.** Backing off to a one-word context produces joins like "what are you know
+  what". It is the price of capping the one-author allowance at short contexts, which is what keeps
+  recitation down. Revisit only with a measurement on both sides.
+- **The persona lexicon matches whole tokens**, so "cope" misses "coping". Extend it with inflected
+  forms rather than stemming.
+- **`kn_pre` pruning.** Deferred until there is data (§3.2).
+- **A kill switch reachable from Discord.** `PAUSE_ALL_WRITES` needs SSH and a restart. The pieces
+  exist (`games.Service.Authorized`, `Gate.SetPaused`, slash commands through the guard, ephemeral
+  replies); what is undecided is its scope.
