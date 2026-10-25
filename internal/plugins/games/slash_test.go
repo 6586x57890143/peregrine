@@ -82,7 +82,7 @@ func TestARefusedSlashCommandAnswersPrivately(t *testing.T) {
 // makes no REST call and consults no cache.
 func TestAnAdministratorCanStartAPuzzleWithNoBootstrapAdmin(t *testing.T) {
 	opts := enabled()
-	opts.AdminUserID = ""
+	opts.AdminUserIDs = nil
 	s, guard, _, _ := fixtureDictOpts(t, opts)
 
 	s.handleInteraction(interaction(snowflake(500), discordgo.PermissionAdministrator))

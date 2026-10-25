@@ -395,7 +395,7 @@ func enabled() Options {
 		LeaderboardTick:     time.Hour,
 		SweepTick:           5 * time.Second,
 		ActiveChannelWindow: time.Hour,
-		AdminUserID:         snowflake(1),
+		AdminUserIDs:        []string{snowflake(1)},
 
 		// The PRODUCTION default from internal/config, verbatim, so these tests exercise what
 		// actually ships. A zero here would floor every solve at one point and quietly make the
@@ -414,7 +414,7 @@ func enabled() Options {
 // ID and the command becomes available to anyone.
 func TestAuthorizedFailsClosed(t *testing.T) {
 	opts := enabled()
-	opts.AdminUserID = ""
+	opts.AdminUserIDs = nil
 	s, _, _, _ := fixture(t, opts)
 
 	for _, id := range []string{"", snowflake(1), "anyone"} {
@@ -424,10 +424,10 @@ func TestAuthorizedFailsClosed(t *testing.T) {
 		}
 	}
 
-	opts.AdminUserID = snowflake(77)
+	opts.AdminUserIDs = []string{snowflake(77), snowflake(79)}
 	s2, _, _, _ := fixture(t, opts)
-	if !s2.Authorized(Requester{UserID: snowflake(77)}) {
-		t.Error("the configured admin was refused")
+	if !s2.Authorized(Requester{UserID: snowflake(77)}) || !s2.Authorized(Requester{UserID: snowflake(79)}) {
+		t.Error("a configured admin was refused")
 	}
 	if s2.Authorized(Requester{UserID: snowflake(78)}) {
 		t.Error("a non-admin was authorized")
@@ -446,7 +446,7 @@ func TestAuthorizedFailsClosed(t *testing.T) {
 // already trusts with Administrator is somebody the server has made that decision about.
 func TestAdministratorsMayStartGames(t *testing.T) {
 	opts := enabled()
-	opts.AdminUserID = "" // nobody is the bootstrap admin
+	opts.AdminUserIDs = nil // nobody is the bootstrap admin
 	s, _, _, _ := fixture(t, opts)
 
 	admin := Requester{UserID: snowflake(500), Permissions: discordgo.PermissionAdministrator}
@@ -1012,7 +1012,7 @@ func TestARefusedBoardIsNotRetriedAsPlainText(t *testing.T) {
 // rebind the channels.
 func TestGrantedRolesAndMembersMayStartGames(t *testing.T) {
 	opts := enabled()
-	opts.AdminUserID = "" // nobody is the bootstrap admin, so only grants can say yes
+	opts.AdminUserIDs = nil // nobody is the bootstrap admin, so only grants can say yes
 	s, _, _, _ := fixture(t, opts)
 
 	role := Requester{UserID: snowflake(600), Roles: []string{snowflake(900)}}

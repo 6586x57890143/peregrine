@@ -208,7 +208,7 @@ func registerServices(
 		SweepTick:           cfg.WordGameSweepTick,
 		ActiveChannelWindow: cfg.ActiveChannelWindow,
 		AllowChannels:       wordGameChannels,
-		AdminUserID:         cfg.AdminUserID,
+		AdminUserIDs:        cfg.AdminUserIDs,
 		PointsBase:          cfg.WordGamePointsBase,
 	})
 	autopostSvc := autopost.New(guard, speaker, memories, tracker, resolver, emoji, tuningSvc, autopost.Options{
