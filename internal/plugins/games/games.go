@@ -125,8 +125,8 @@ type Options struct {
 	// list is all interval mode had before PEREGRINE_WORDGAME_CHANNELS existed.
 	AllowChannels []string
 
-	// AdminUserID may run !wordgame. Empty refuses everyone who is not a guild administrator.
-	AdminUserID string
+	// AdminUserIDs may each run !wordgame. Empty refuses everyone who is not a guild administrator.
+	AdminUserIDs []string
 
 	// Wheel turns on /wheel and /wallet, M35. Separate from Enabled because the wheel is a
 	// separate game: an operator who switched the scramble off has said nothing about it.
@@ -476,7 +476,7 @@ type Requester struct {
 // and no behavioural test can cover the command nobody has written yet: that is the whole
 // argument the AST test pinning this exists to enforce.
 func (s *Service) Authorized(r Requester) bool {
-	if r.UserID != "" && r.UserID == s.opts.AdminUserID {
+	if r.UserID != "" && slices.Contains(s.opts.AdminUserIDs, r.UserID) {
 		return true
 	}
 	return r.Permissions&discordgo.PermissionAdministrator != 0
@@ -632,7 +632,7 @@ func (s *Service) startGauntlet(channelID string, n int) {
 // to use it, which is an invitation. The message is still consumed either way.
 func (s *Service) startOnRequest(guildID, channelID string, who Requester, arg string) {
 	if !s.MayStart(guildID, who) {
-		if s.opts.AdminUserID == "" {
+		if len(s.opts.AdminUserIDs) == 0 {
 			log.Printf("[WORDGAME] !wordgame in %s was refused because "+
 				"PEREGRINE_BOOTSTRAP_ADMIN_USER_ID is unset, the caller is not a guild "+
 				"administrator, and no role or member has been granted it with "+

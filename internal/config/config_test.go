@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -479,15 +480,18 @@ func TestAdminUserIDFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cfg.AdminUserID != "" {
-		t.Fatalf("AdminUserID = %q, want empty by default", cfg.AdminUserID)
+	if len(cfg.AdminUserIDs) != 0 {
+		t.Fatalf("AdminUserIDs = %q, want empty by default", cfg.AdminUserIDs)
 	}
-	// The call site is `cfg.AdminUserID != "" && author == cfg.AdminUserID`. This
-	// asserts the property that makes that correct: an empty configured ID never
-	// equals a real Discord snowflake, so the guard cannot be satisfied by an
-	// unset variable even if a caller forgets the emptiness check.
-	if cfg.AdminUserID == "175928847299117063" {
-		t.Error("an unset admin ID must not match any real user ID")
+
+	// Several, comma separated, are each the break glass.
+	t.Setenv("PEREGRINE_BOOTSTRAP_ADMIN_USER_ID", " 175928847299117063, 175928847299117064 ,")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !slices.Equal(cfg.AdminUserIDs, []string{"175928847299117063", "175928847299117064"}) {
+		t.Errorf("AdminUserIDs = %q", cfg.AdminUserIDs)
 	}
 }
 

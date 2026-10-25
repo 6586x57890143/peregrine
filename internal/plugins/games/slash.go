@@ -378,7 +378,7 @@ func (s *Service) handleInteraction(i *discordgo.Interaction) {
 
 	who := interactionRequester(i)
 	if !s.MayStart(i.GuildID, who) {
-		if s.opts.AdminUserID == "" {
+		if len(s.opts.AdminUserIDs) == 0 {
 			log.Printf("[WORDGAME] /%s in %s was refused because "+
 				"PEREGRINE_BOOTSTRAP_ADMIN_USER_ID is unset, the caller is not a guild "+
 				"administrator, and no role or member has been granted it with /%s, so the "+
@@ -581,7 +581,7 @@ func componentID(i *discordgo.Interaction) string {
 func (s *Service) handleConfig(i *discordgo.Interaction) {
 	who := interactionRequester(i)
 	if !s.Authorized(who) {
-		if s.opts.AdminUserID == "" {
+		if len(s.opts.AdminUserIDs) == 0 {
 			log.Printf("[WORDGAME] /%s in %s was refused because "+
 				"PEREGRINE_BOOTSTRAP_ADMIN_USER_ID is unset and the caller is not a guild "+
 				"administrator, so the check fails closed and refuses everyone.",

@@ -38,7 +38,7 @@ import (
 type Config struct {
 	// Credentials and identity.
 	Token       string // DISCORD_BOT_TOKEN
-	AdminUserID string // PEREGRINE_BOOTSTRAP_ADMIN_USER_ID
+	AdminUserIDs []string // PEREGRINE_BOOTSTRAP_ADMIN_USER_ID, comma separated: the break glass
 	LogLevel    string // LOG_LEVEL
 
 	// Storage.
@@ -339,7 +339,7 @@ func Load() (*Config, error) {
 	l := &loader{}
 	cfg := &Config{
 		Token:       os.Getenv("DISCORD_BOT_TOKEN"),
-		AdminUserID: l.str("PEREGRINE_BOOTSTRAP_ADMIN_USER_ID", ""),
+		AdminUserIDs: l.csv("PEREGRINE_BOOTSTRAP_ADMIN_USER_ID"),
 		LogLevel:    l.enum("LOG_LEVEL", "info", "debug", "info", "warn", "error"),
 
 		// The relative default is kept because it is what a `go run ./cmd/bot`
