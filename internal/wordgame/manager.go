@@ -176,6 +176,7 @@ type Manager struct {
 	mu      sync.Mutex
 	games   map[string]*Game     // channel ID -> live game
 	started map[string]time.Time // channel ID -> when a game last started there
+	recent  map[string][]string  // channel ID -> last words, oldest first; evicted with started
 	pending []PendingDelete
 
 	// The gauntlet: how many puzzles a channel is still owed, and the earliest the next one
@@ -247,6 +248,7 @@ func NewManager(dict *Dictionary, src Source, counter Counter, opts Options) *Ma
 	return &Manager{
 		games:   map[string]*Game{},
 		started: map[string]time.Time{},
+		recent:  map[string][]string{},
 		queued:  map[string]int{},
 		rounds:  map[string]int{},
 		tally:   map[string]map[string]Standing{},
@@ -311,8 +313,14 @@ func (m *Manager) StartWord(channelID, word string) (*Game, error) {
 	}
 
 	if !planted {
-		word = m.dict.words[m.src.IntN(len(m.dict.words))]
+		word = m.drawWord(channelID)
 	}
+	history := m.recent[channelID]
+	if len(history) == recentWordWindow {
+		copy(history, history[1:])
+		history = history[:recentWordWindow-1]
+	}
+	m.recent[channelID] = append(history, strings.ToLower(word))
 	now := m.now()
 	g := &Game{
 		Word:      word,
@@ -362,6 +370,35 @@ func (m *Manager) StartWord(channelID, word string) (*Game, error) {
 	}
 
 	return g, nil
+}
+
+const recentWordWindow = 100
+
+// drawWord samples words absent from the channel's last 100 games. If a small
+// dictionary exhausts that pool, only the least recently used words are eligible.
+// Explicitly planted words also count as history, but may be repeated by request.
+// History is in memory and resets on restart. Caller holds the lock.
+func (m *Manager) drawWord(channelID string) string {
+	lastSeen := make(map[string]int, recentWordWindow)
+	for i, word := range m.recent[channelID] {
+		lastSeen[word] = i
+	}
+	oldest := recentWordWindow
+	var candidates []string
+	for _, word := range m.dict.words {
+		index, seen := lastSeen[strings.ToLower(word)]
+		if !seen {
+			index = -1
+		}
+		if index < oldest {
+			oldest = index
+			candidates = candidates[:0]
+		}
+		if index == oldest {
+			candidates = append(candidates, word)
+		}
+	}
+	return candidates[m.src.IntN(len(candidates))]
 }
 
 // Announced records the message ID of a game's announcement and returns the one it replaced.
@@ -686,6 +723,7 @@ func (m *Manager) evictOldestCooldown(protect string) {
 	}
 	if oldestID != "" {
 		delete(m.started, oldestID)
+		delete(m.recent, oldestID)
 	}
 }
 
