@@ -495,6 +495,30 @@ func TestAForbiddenChannelIsSkippedQuietly(t *testing.T) {
 	}
 }
 
+// TestAForbiddenChannelIsNotAskedAgain. A pass runs every ten minutes, and each read of a
+// channel the bot can't see is a refused request toward the invalid request limit the
+// IP shares with every bot on it, so a refused channel is skipped for a day.
+func TestAForbiddenChannelIsNotAskedAgain(t *testing.T) {
+	now := time.Now()
+	f, c, l := fixture(msg(now.Add(-5*time.Minute), 1, "hello"))
+	f.messagesErr = &discordgo.RESTError{
+		Response: &http.Response{StatusCode: http.StatusForbidden},
+	}
+	in := New(f, c, l, nil, opts())
+	for range 3 {
+		if _, err := in.Run(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for ch, n := range f.calls {
+		if n != 1 {
+			t.Errorf("channel %s read %d times in three passes, want 1", ch, n)
+		}
+	}
+}
+
 // TestAFailingChannelDoesNotStopTheOthers. errgroup cancels its context on the first
 // error, so returning one from a channel worker would abandon every other channel. The
 // workers swallow theirs deliberately.

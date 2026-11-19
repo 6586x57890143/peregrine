@@ -46,6 +46,7 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
@@ -150,7 +151,17 @@ type Ingester struct {
 	learner Learner
 	log     *slog.Logger
 	opts    Options
+
+	// shut, under mu, is the channels Discord refused to read (403, 404)
+	// and until when a pass skips them. A pass runs every ten minutes, and
+	// without this every channel the bot can't see costs a refused request
+	// each time, toward the invalid request limit foundry's IP shares.
+	mu   sync.Mutex
+	shut map[string]time.Time
 }
+
+// shutFor is how long a channel that refused a read is skipped.
+const shutFor = 24 * time.Hour
 
 func New(s Session, c Cursors, l Learner, log *slog.Logger, opts Options) *Ingester {
 	if log == nil {
@@ -259,6 +270,12 @@ func (in *Ingester) guild(ctx context.Context, guildID, guildName string) Stats 
 // channel reads everything after a channel's cursor and learns it.
 func (in *Ingester) channel(ctx context.Context, ch *discordgo.Channel, guildID string) Stats {
 	var st Stats
+	in.mu.Lock()
+	until, shut := in.shut[ch.ID]
+	in.mu.Unlock()
+	if shut && time.Now().Before(until) {
+		return st
+	}
 
 	after, err := in.cursors.Cursor(guildID, ch.ID)
 	if err != nil {
@@ -289,7 +306,14 @@ func (in *Ingester) channel(ctx context.Context, ch *discordgo.Channel, guildID 
 		// so a channel is learned in the order it was said.
 		batch, err := in.session.ChannelMessages(ch.ID, in.opts.PageSize, "", after, "")
 		if err != nil {
-			if !forbidden(err) {
+			if forbidden(err) {
+				in.mu.Lock()
+				if in.shut == nil {
+					in.shut = map[string]time.Time{}
+				}
+				in.shut[ch.ID] = time.Now().Add(shutFor)
+				in.mu.Unlock()
+			} else {
 				in.log.Warn("fetch messages failed", "channel", ch.Name, "err", err)
 				st.Errors++
 			}
