@@ -2,10 +2,13 @@ package core
 
 import (
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
+
+	"github.com/6586x57890143/peregrine/internal/discordguard"
 )
 
 // NewSession builds the single shared *discordgo.Session.
@@ -45,6 +48,11 @@ func NewSession(token string) (*discordgo.Session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create session: %w", err)
 	}
+	// Every REST call counts toward Discord's invalid request limit for the
+	// IP foundry's four bots share; the brake stops peregrine short of it.
+	s.Client.Transport = discordguard.Brake(s.Client.Transport, func(n int) {
+		slog.Error("discord: braked, too many refused requests; holding off so the ip isn't banned", "count", n)
+	})
 	s.Identify.Intents = discordgo.IntentsGuilds |
 		discordgo.IntentsGuildMessages |
 		discordgo.IntentsGuildMessageReactions |

@@ -3,6 +3,7 @@ package discordguard
 import (
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -1028,5 +1029,28 @@ func TestAcknowledgeRespectsTheIgnoreList(t *testing.T) {
 	g := newGuard(f, allowAll{}, "c1")
 	if g.Acknowledge(&discordgo.Interaction{ChannelID: "c1"}) || len(f.responses) != 0 {
 		t.Error("acknowledged a press in an ignored channel")
+	}
+}
+
+// TestARefusedChannelIsLeftAlone. Anyone can say "bird" in a channel where the bot may
+// read but not send, and each reply there was a 403 toward the invalid request limit
+// foundry's bots share. After one 403 the channel is left alone for refuseFor.
+func TestARefusedChannelIsLeftAlone(t *testing.T) {
+	f := &fakeSession{sendErr: &discordgo.RESTError{Response: &http.Response{StatusCode: http.StatusForbidden}}}
+	g := newGuard(f, allowAll{})
+	for range 5 {
+		g.Send("chan", "caw")
+	}
+	if len(f.sends) != 1 {
+		t.Fatalf("%d sends reached Discord after a 403, want 1", len(f.sends))
+	}
+	if g.React("chan", "m1", "x") {
+		t.Error("a reaction went out in a refused channel")
+	}
+	f.sendErr = &discordgo.RESTError{Response: &http.Response{StatusCode: http.StatusInternalServerError}}
+	g.Send("other", "caw")
+	g.Send("other", "caw")
+	if len(f.sends) != 3 {
+		t.Errorf("a 500 shut a channel: %d sends", len(f.sends))
 	}
 }
