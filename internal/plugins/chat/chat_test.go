@@ -18,6 +18,7 @@ import (
 
 	"github.com/bwmarrin/discordgo"
 
+	"github.com/6586x57890143/peregrine/internal/channels"
 	"github.com/6586x57890143/peregrine/internal/corpus"
 	"github.com/6586x57890143/peregrine/internal/dbtest"
 	"github.com/6586x57890143/peregrine/internal/generate"
@@ -166,6 +167,7 @@ func fixture(t *testing.T) (*Service, *storage.Store, *fakeGuard, *fakeGames, *f
 		Aggro:    &fakeAggro{},
 		Images:   imgs,
 		Games:    games,
+		Channels: rooms{"c1": {ID: "c1", GuildID: testGuild, Text: true}, "staff": {ID: "staff", GuildID: testGuild, Text: true, Private: true}},
 		Options:  chatOptions(),
 	})
 	s.botID = snowflake(1)
@@ -935,5 +937,30 @@ func TestMemoryStoresNamesRatherThanMentionMarkup(t *testing.T) {
 		if strings.HasPrefix(token, "<@") {
 			t.Errorf("conversation memory stored raw mention markup: %q", token)
 		}
+	}
+}
+
+// rooms is a channels.Resolver over a map.
+type rooms map[string]channels.Info
+
+func (r rooms) Channel(id string) (channels.Info, bool) { i, ok := r[id]; return i, ok }
+
+// TestAPrivateChannelIsNotLearned. What only some members could read would come back out
+// of the bot in a channel everyone reads; so would an unknown channel's, so it fails closed.
+func TestAPrivateChannelIsNotLearned(t *testing.T) {
+	s, store, _, _, _, _ := fixture(t)
+	for _, ch := range []string{"staff", "unknown"} {
+		r := message("the staff are planning the purge tonight")
+		r.m.ChannelID = ch
+		r.flags["TEXT"] = true
+		r.mentioned, r.mentionedSet = nil, true
+		s.stepLearn(r)
+	}
+	var n uint64
+	if err := store.View(func(rd *storage.Reader) error { n = rd.MessagesLearned(); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("learned %d messages from channels the server can't read", n)
 	}
 }
