@@ -103,6 +103,62 @@ type Learner struct {
 	// a test can build a second one.
 	mentionOnce sync.Once
 	mention     *regexp.Regexp
+
+	// fresh, under freshMu, is each author's count of words new to the corpus
+	// today. See novel.
+	freshMu sync.Mutex
+	fresh   map[string]freshDay
+}
+
+type freshDay struct {
+	day int64
+	n   int
+}
+
+// What one member can grow the corpus by. Every word new to it adds a
+// topic key, n-grams up to MaxNGram and co-occurrences, so a stream of
+// random-word walls grew the file by half a megabyte a message, past the
+// container's memory and onto the disk every bot on the host shares.
+// Ordinary chat brings a few new words a message; a wall of invented ones
+// is dropped whole, and past a mature corpus's daily allowance an author's
+// messages wait for tomorrow.
+const (
+	maxNewPerMessage = 40
+	maxNewPerDay     = 300
+)
+
+// matureCorpus is the words learned before the daily allowance applies, so
+// a new server's first backfill learns its history whole. A var for tests.
+var matureCorpus uint64 = 50_000
+
+// novel is whether a message bringing n new words may be learned from
+// author, and counts them against the author's day when it may.
+func (l *Learner) novel(w *storage.Writer, authorID string, n int) bool {
+	if n > maxNewPerMessage {
+		return false
+	}
+	if n == 0 || authorID == "" || w.TotalTopicCount() < matureCorpus {
+		return true
+	}
+	day := time.Now().Unix() / 86400
+	l.freshMu.Lock()
+	defer l.freshMu.Unlock()
+	if l.fresh == nil {
+		l.fresh = map[string]freshDay{}
+	}
+	f := l.fresh[authorID]
+	if f.day != day {
+		if len(l.fresh) > 10_000 {
+			clear(l.fresh)
+		}
+		f = freshDay{day: day}
+	}
+	if f.n+n > maxNewPerDay {
+		return false
+	}
+	f.n += n
+	l.fresh[authorID] = f
+	return true
 }
 
 // New returns a Learner. The gate must not be nil: an absent gate would mean an
@@ -183,6 +239,16 @@ func (l *Learner) Message(w *storage.Writer, msg, msgID string, author names.Use
 		return fmt.Errorf("dedup check for message %s: %w", msgID, err)
 	}
 	if seen {
+		return nil
+	}
+
+	newWords := map[string]struct{}{}
+	for _, word := range words[:len(words)-1] {
+		if lw := text.LowerExceptURLs(word); w.TopicCount(lw) == 0 {
+			newWords[lw] = struct{}{}
+		}
+	}
+	if !l.novel(w, author.UserID, len(newWords)) {
 		return nil
 	}
 

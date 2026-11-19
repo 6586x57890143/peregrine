@@ -312,6 +312,23 @@ func TestPromptWordsAreExemptFromAttestation(t *testing.T) {
 	}
 }
 
+// TestAPromptLinkIsNotExempt. The exemption is for echoing words; a link, an emote or a
+// shortcode one author taught once is not a word, and exempting it was how two messages got
+// the bot to post any link or picture under its own name every time.
+func TestAPromptLinkIsNotExempt(t *testing.T) {
+	for _, tok := range []string{"https://example.com/x.png", "<:pic:175928847299117063>", ":pic:"} {
+		f := newFake()
+		f.learn(3, "teacher", "bird "+tok+" lol")
+
+		g := New(f, Params{MaxNGram: 3, MinDistinctAuthors: 2}, DefaultSource{})
+		for range 50 {
+			if got := g.Seed(SeedInput{PromptWords: []string{tok}}); got == tok {
+				t.Fatalf("seeded from %q, which one author taught", tok)
+			}
+		}
+	}
+}
+
 // The four bounds on Jump, one test each. All of them exist because of live output: every
 // unreadable line the bot posted broke at a jump seam, and the chain-generated ones read
 // fine. A jump appends a word out of the co-occurrence indexes, so it has no n-gram
