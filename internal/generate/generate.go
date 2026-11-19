@@ -263,6 +263,15 @@ func (g *Generator) Sentence(req Request) (string, Outcome, error) {
 	// fell through to FirstPrefix exactly as it does for an empty prompt. It was a token that
 	// looked like it did something.
 	prompt, roast, emoji := req.Prompt, req.Roast, req.Emoji
+	// A shortcode resolves against the guild being answered only. Resolved
+	// across every guild the bot is in, a member who owns another of them
+	// could teach :name: and have it come out as their own emote, any
+	// picture at all, in this one.
+	if g, ok := emoji.(interface {
+		InGuild(guildID string) interface{ ResolveEmoji(string) (string, bool) }
+	}); ok {
+		emoji = g.InGuild(req.GuildID)
+	}
 	promptWords := text.Tokenize(prompt)
 
 	ctx := newContext(req)
