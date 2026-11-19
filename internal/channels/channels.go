@@ -43,6 +43,36 @@ type Info struct {
 	// Text reports whether this is a guild text channel. A voice channel can carry
 	// messages in Discord's data model and is not somewhere the bot should be talking.
 	Text bool
+
+	// Private is a channel the server's members at large can't read. See Hidden.
+	Private bool
+}
+
+// Hidden is whether ch is shut to @everyone: its @everyone overwrite denies View
+// Channel, or it is a private thread. What is said there is not the server's
+// voice, and learned, it can come back out of the bot in a channel everyone reads.
+// parent is a thread's channel, or nil.
+//
+// ponytail: reads the @everyone overwrite only, which is how Discord makes a
+// channel private. A server whose @everyone role can't view anything, opening
+// channels through a member role instead, reads as all public; check the
+// guild's @everyone role too if that is ever seen.
+func Hidden(ch, parent *discordgo.Channel) bool {
+	if ch == nil {
+		return true
+	}
+	if ch.Type == discordgo.ChannelTypeGuildPrivateThread {
+		return true
+	}
+	if ch.IsThread() {
+		return Hidden(parent, nil)
+	}
+	for _, o := range ch.PermissionOverwrites {
+		if o != nil && o.Type == discordgo.PermissionOverwriteTypeRole && o.ID == ch.GuildID && o.Deny&discordgo.PermissionViewChannel != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // NotSafeForWork reports whether the channel is flagged NSFW or named as such.
@@ -72,12 +102,17 @@ func (r stateResolver) Channel(id string) (Info, bool) {
 	if err != nil || ch == nil {
 		return Info{}, false
 	}
+	var parent *discordgo.Channel
+	if ch.IsThread() {
+		parent, _ = r.s.State.Channel(ch.ParentID)
+	}
 	return Info{
 		ID:      ch.ID,
 		Name:    ch.Name,
-		NSFW:    ch.NSFW,
+		NSFW:    ch.NSFW || (parent != nil && parent.NSFW),
 		GuildID: ch.GuildID,
 		Text:    ch.Type == discordgo.ChannelTypeGuildText,
+		Private: Hidden(ch, parent),
 	}, true
 }
 

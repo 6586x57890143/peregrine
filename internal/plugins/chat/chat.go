@@ -43,6 +43,7 @@ import (
 
 	"github.com/bwmarrin/discordgo"
 
+	"github.com/6586x57890143/peregrine/internal/channels"
 	"github.com/6586x57890143/peregrine/internal/core"
 	"github.com/6586x57890143/peregrine/internal/generate"
 	"github.com/6586x57890143/peregrine/internal/learn"
@@ -142,6 +143,7 @@ type Options struct {
 // Service is the reactor.
 type Service struct {
 	session  *discordgo.Session
+	channels channels.Resolver
 	corpora  storage.Corpora
 	gate     *safety.Gate
 	guard    Guard
@@ -191,6 +193,9 @@ type Deps struct {
 	Games    Games
 	Voice    Voice
 	Recorder Recorder
+	// Channels looks up where a message was said, to learn only what the whole
+	// server could read. Nil reads the session's state cache.
+	Channels channels.Resolver
 
 	Options Options
 }
@@ -201,11 +206,15 @@ func New(d Deps) *Service {
 	if recorder == nil {
 		recorder = noRecorder{}
 	}
+	chans := d.Channels
+	if chans == nil {
+		chans = channels.FromSession(d.Session)
+	}
 	return &Service{
 		session: d.Session, corpora: d.Corpora, gate: d.Gate, guard: d.Guard,
 		learner: d.Learner, speaker: d.Speaker, memories: d.Memories, emoji: d.Emoji,
 		activity: d.Activity, aggro: d.Aggro, images: d.Images, games: d.Games,
-		voice: d.Voice, recorder: recorder, opts: d.Options,
+		voice: d.Voice, recorder: recorder, opts: d.Options, channels: chans,
 	}
 }
 
@@ -368,7 +377,10 @@ var steps = []step{
 // handle runs the reactor over one message.
 func (s *Service) handle(m *discordgo.MessageCreate) {
 	r := &reaction{m: m, start: time.Now(), flags: map[string]bool{}}
-	log.Printf("[MSG] from %s: %q", m.Author.Username, m.Content)
+	// What people said stays out of the log: it is chat from every channel the bot
+	// reads, private ones included, and logs are kept and copied far more freely
+	// than the corpus.
+	log.Printf("[MSG] %s in %s, %d chars", m.ID, m.ChannelID, len(m.Content))
 
 	for _, st := range steps {
 		if st.fn(s, r) {
@@ -909,6 +921,12 @@ func (s *Service) stepLearn(r *reaction) bool {
 		return false
 	}
 	m := r.m
+	// Only what the whole server could read is learned. A private or NSFW channel's
+	// words would otherwise come back out in a reply anyone sees. A state-cache miss
+	// learns nothing, as images does.
+	if ch, ok := s.channels.Channel(m.ChannelID); !ok || ch.Private || ch.NotSafeForWork() {
+		return false
+	}
 	mentioned := s.mentions(r)
 
 	// The corpus this guild's text belongs in, resolved ONCE for the whole step.

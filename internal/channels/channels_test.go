@@ -241,3 +241,29 @@ func TestBusiestReadsItsAllowlistPerGuildToo(t *testing.T) {
 			"says nothing about this one", got)
 	}
 }
+
+// TestHidden. A channel is private when its @everyone overwrite denies View Channel, a
+// private thread always is, and a public thread is as private as its channel.
+func TestHidden(t *testing.T) {
+	deny := &discordgo.PermissionOverwrite{ID: "g", Type: discordgo.PermissionOverwriteTypeRole, Deny: discordgo.PermissionViewChannel}
+	other := &discordgo.PermissionOverwrite{ID: "mods", Type: discordgo.PermissionOverwriteTypeRole, Deny: discordgo.PermissionViewChannel}
+	open := &discordgo.Channel{ID: "c", GuildID: "g", Type: discordgo.ChannelTypeGuildText, PermissionOverwrites: []*discordgo.PermissionOverwrite{other}}
+	staff := &discordgo.Channel{ID: "s", GuildID: "g", Type: discordgo.ChannelTypeGuildText, PermissionOverwrites: []*discordgo.PermissionOverwrite{deny}}
+	thread := &discordgo.Channel{ID: "t", GuildID: "g", Type: discordgo.ChannelTypeGuildPublicThread, ParentID: "s"}
+	for name, c := range map[string]struct {
+		ch, parent *discordgo.Channel
+		want       bool
+	}{
+		"open":                   {open, nil, false},
+		"staff":                  {staff, nil, true},
+		"thread in staff":        {thread, staff, true},
+		"thread in open":         {thread, open, false},
+		"private thread":         {&discordgo.Channel{Type: discordgo.ChannelTypeGuildPrivateThread}, open, true},
+		"unknown":                {nil, nil, true},
+		"thread, parent unknown": {thread, nil, true},
+	} {
+		if got := channels.Hidden(c.ch, c.parent); got != c.want {
+			t.Errorf("%s: Hidden = %v, want %v", name, got, c.want)
+		}
+	}
+}

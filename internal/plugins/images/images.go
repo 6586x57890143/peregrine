@@ -127,6 +127,10 @@ func (s *Service) Capture(channelID, messageID, authorID, content string, attach
 		log.Printf("[INFO] Skipping image cache for NSFW-flagged or named channel #%s", ch.Name)
 		return
 	}
+	if ch.Private {
+		// An image from a channel shut to @everyone could be reposted where everyone reads.
+		return
+	}
 
 	var candidates []string
 	for _, att := range attachments {

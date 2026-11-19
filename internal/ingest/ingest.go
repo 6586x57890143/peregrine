@@ -51,6 +51,8 @@ import (
 
 	"github.com/bwmarrin/discordgo"
 	"golang.org/x/sync/errgroup"
+
+	chans "github.com/6586x57890143/peregrine/internal/channels"
 )
 
 // Session is the slice of discordgo this package reads. *discordgo.Session satisfies it.
@@ -251,6 +253,11 @@ func (in *Ingester) guild(ctx context.Context, guildID, guildName string) Stats 
 
 	for _, ch := range channels {
 		if ch == nil || ch.Type != discordgo.ChannelTypeGuildText {
+			continue
+		}
+		// What only some could read, or NSFW, is not learned. Nor read: asking
+		// is a refused request when the bot can't see it either.
+		if ch.NSFW || chans.Hidden(ch, nil) {
 			continue
 		}
 		channel := ch

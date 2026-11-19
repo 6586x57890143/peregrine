@@ -310,8 +310,8 @@ func (l *Learner) Message(w *storage.Writer, msg, msgID string, author names.Use
 
 	// The history size comes from a counter rather than Bucket.Stats(), which walked every
 	// page in the bucket once per message to fill this one log field (finding 11).
-	log.Printf("[LEARNED] msg=%q | words=%d | ngrams=%d | history=%d | names=%d | took=%s",
-		msg, len(words), total, w.HistoryCount(), len(canonicalNames), time.Since(start))
+	log.Printf("[LEARNED] msg=%s | words=%d | ngrams=%d | history=%d | names=%d | took=%s",
+		msgID, len(words), total, w.HistoryCount(), len(canonicalNames), time.Since(start))
 
 	return nil
 }
