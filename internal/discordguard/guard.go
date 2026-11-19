@@ -46,8 +46,12 @@
 package discordguard
 
 import (
+	"errors"
 	"log/slog"
+	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 )
@@ -113,6 +117,37 @@ type Guard struct {
 	// "not in there", not "not in reply to a message in there", and a check in the
 	// reply path only would have been the weaker of the two readings.
 	ignoreChannels map[string]struct{}
+
+	// refused, under mu, is the channels where Discord answered 403 (the bot
+	// can't send, embed or react there) and until when they are left alone.
+	// Without it every "bird" in such a channel is another 403, which anyone
+	// can repeat toward Discord's invalid request limit: 10,000 in 10 minutes
+	// bans the IP, and every bot on foundry with it.
+	mu      sync.Mutex
+	refused map[string]time.Time
+}
+
+// refuseFor is how long a channel that answered 403 is left alone.
+const refuseFor = time.Hour
+
+// note marks channelID refused when err is Discord's 403.
+func (g *Guard) note(channelID string, err error) {
+	var re *discordgo.RESTError
+	if !errors.As(err, &re) || re.Response == nil || re.Response.StatusCode != http.StatusForbidden {
+		return
+	}
+	now := time.Now()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.refused == nil {
+		g.refused = map[string]time.Time{}
+	}
+	for ch, until := range g.refused {
+		if now.After(until) {
+			delete(g.refused, ch)
+		}
+	}
+	g.refused[channelID] = now.Add(refuseFor)
 }
 
 // New builds a Guard. A nil logger discards.
@@ -197,6 +232,7 @@ func (g *Guard) SendReply(channelID, content string, ref *discordgo.MessageRefer
 		// deleted mid-flight) was indistinguishable from one that worked: the bot
 		// appeared to ignore people at random with nothing in the log to say why.
 		g.log.Error("discord send failed", "channel", channelID, "err", err)
+		g.note(channelID, err)
 		return nil, false
 	}
 	return msg, true
@@ -235,6 +271,7 @@ func (g *Guard) SendEmbed(channelID string, embed *discordgo.MessageEmbed,
 	})
 	if err != nil {
 		g.log.Error("discord embed send failed", "channel", channelID, "err", err)
+		g.note(channelID, err)
 		return nil, false
 	}
 	return msg, true
@@ -419,6 +456,7 @@ func (g *Guard) React(channelID, messageID, emoji string) bool {
 	}
 	if err := g.session.MessageReactionAdd(channelID, messageID, emoji); err != nil {
 		g.log.Info("discord reaction failed", "channel", channelID, "message", messageID, "err", err)
+		g.note(channelID, err)
 		return false
 	}
 	return true
@@ -683,6 +721,13 @@ func (g *Guard) permit(channelID, content, op string) bool {
 func (g *Guard) ignored(channelID, op string) bool {
 	if _, ok := g.ignoreChannels[channelID]; ok {
 		g.log.Debug("channel is on the ignore list", "channel", channelID, "op", op)
+		return true
+	}
+	g.mu.Lock()
+	until, ok := g.refused[channelID]
+	g.mu.Unlock()
+	if ok && time.Now().Before(until) {
+		g.log.Debug("channel refused the bot lately", "channel", channelID, "op", op)
 		return true
 	}
 	return false
