@@ -462,3 +462,27 @@ func TestGenerationIsReproducibleUnderASeededSource(t *testing.T) {
 			"by a deterministic path rather than by the seed: %q", len(a), a[0])
 	}
 }
+
+// scoped records which guild a reply's emotes were scoped to.
+type scoped struct{ guild *string }
+
+func (s scoped) ResolveEmoji(string) (string, bool) { return "", false }
+
+func (s scoped) InGuild(guildID string) interface{ ResolveEmoji(string) (string, bool) } {
+	*s.guild = guildID
+	return s
+}
+
+// TestEmotesAreScopedToTheGuildAnswered. Resolved across every guild the bot is in, a member
+// who owns another could have their :shortcode: come out as their own emote here.
+func TestEmotesAreScopedToTheGuildAnswered(t *testing.T) {
+	s, l, g := fixture(t, defaults())
+	teach(t, s, l, "u1", 100, "the bird is loose in the server again")
+	var got string
+	if _, _, err := g.Sentence(Request{GuildID: "g1", Prompt: "the bird is", Emoji: scoped{&got}}); err != nil {
+		t.Fatal(err)
+	}
+	if got != "g1" {
+		t.Fatalf("emotes scoped to %q, want g1", got)
+	}
+}

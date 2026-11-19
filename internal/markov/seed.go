@@ -649,7 +649,11 @@ func (g *Generator) drawAttestedSeed(cands *seedCands, prompt map[string]struct{
 		if seed == "" {
 			return ""
 		}
-		if _, fromPrompt := prompt[seed]; fromPrompt {
+		// A prompt word is exempt from attestation so a reply can echo what
+		// it answers, but not a link or an emote: exempt, one message teaching
+		// "bird https://..." was enough for every reply to it to post the
+		// link, unfurled, under the bot's name.
+		if _, fromPrompt := prompt[seed]; fromPrompt && !carries(seed) {
 			return won(seed)
 		}
 		// A multi-word seed is a stored prefix, and its own continuations are what the
@@ -970,4 +974,15 @@ func SeedTopic(seed string) string {
 		return words[len(words)-1]
 	}
 	return ""
+}
+
+// carries is whether seed holds something that takes a reader somewhere or
+// shows them a picture: a link, an emote or a :shortcode:.
+func carries(seed string) bool {
+	for _, tok := range strings.Fields(seed) {
+		if _, sc := text.Shortcode(tok); sc || text.IsURL(tok) || text.IsEmote(tok) {
+			return true
+		}
+	}
+	return false
 }

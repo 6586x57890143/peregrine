@@ -146,7 +146,16 @@ type EmojiResolver interface {
 	ResolveEmoji(name string) (string, bool)
 }
 
-type sessionEmoji struct{ s *discordgo.Session }
+type sessionEmoji struct {
+	s *discordgo.Session
+	// guild, when set, is the one guild whose emotes resolve.
+	guild string
+}
+
+// InGuild is the resolver for guildID's own emotes alone.
+func (e sessionEmoji) InGuild(guildID string) interface{ ResolveEmoji(string) (string, bool) } {
+	return sessionEmoji{s: e.s, guild: guildID}
+}
 
 // ResolveEmoji returns the <:name:id> form of a guild emote, or false.
 //
@@ -159,6 +168,9 @@ func (e sessionEmoji) ResolveEmoji(name string) (string, bool) {
 		return "", false
 	}
 	for _, guild := range e.s.State.Guilds {
+		if e.guild != "" && guild.ID != e.guild {
+			continue
+		}
 		for _, emoji := range guild.Emojis {
 			if emoji.Name == name {
 				return emoji.MessageFormat(), true
